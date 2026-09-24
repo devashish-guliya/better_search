@@ -1,5 +1,6 @@
-//! Phase 1 prototype: build the index, print memory and timing stats, then search.
+//! Command-line prototype: build or load the index, keep it live, print stats, search.
 
+mod live;
 mod memory;
 mod synthetic;
 mod walk;
@@ -7,21 +8,33 @@ mod walk;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bs_index::{Index, IndexBuilder};
-use bs_query::{Query, search};
+use bs_query::{Query, Session, search};
+
+use live::Shared;
 
 const USAGE: &str = "\
 Usage:
-  bs [DRIVE...]          Index fixed NTFS drives (all if none given). Needs admin.
+  bs [DRIVE...]          Index fixed NTFS drives (all if none given) and keep the index
+                         live while running. Needs admin. The index is saved to
+                         %LOCALAPPDATA%\\better_search\\index.bin so the next start is instant.
   bs --walk <FOLDER>     Index a folder by walking it. No admin needed.
   bs --synthetic <N>     Index N generated fake entries, for benchmarking.
 
 Options:
   --bench                Run a fixed set of timed queries and exit.
+  --rescan               Ignore the saved index and scan the drives again.
   -n <COUNT>             Number of results to show (default 20).
   -h, --help             Show this help.
+
+While searching:
+  :changes               Show the latest file changes picked up live.
+  :stats                 Show index size and memory use.
+  :save                  Save the index now.
+  :q                     Quit (the index is saved first).
 
 Examples:
   bs                     bs C D          bs --walk %USERPROFILE%
@@ -36,6 +49,7 @@ enum Source {
 struct Args {
     source: Source,
     bench: bool,
+    rescan: bool,
     limit: usize,
 }
 
@@ -43,11 +57,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
     let mut drives = Vec::new();
     let mut source = None;
     let mut bench = false;
+    let mut rescan = false;
     let mut limit = 20;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--bench" => bench = true,
+            "--rescan" => rescan = true,
             "-n" => {
                 let value = args.next().ok_or("-n needs a number")?;
                 limit = value
@@ -85,6 +101,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
     Ok(Some(Args {
         source,
         bench,
+        rescan,
         limit,
     }))
 }
@@ -103,24 +120,37 @@ fn main() -> ExitCode {
     };
 
     let started = Instant::now();
-    let index = match build_index(&args.source) {
-        Ok(index) => index,
+    let live = matches!(args.source, Source::Ntfs(_));
+    let (index, saved) = match build_index(&args.source, args.rescan) {
+        Ok(result) => result,
         Err(msg) => {
             eprintln!("error: {msg}");
             return ExitCode::FAILURE;
         }
     };
-    print_stats(&index, started.elapsed());
+    print_stats(&index, Some(started.elapsed()));
 
+    let shared = Arc::new(Shared::new(index));
+    if saved {
+        live::mark_saved(&shared);
+    }
     if args.bench {
-        run_bench(&index, args.limit);
+        run_bench(&shared.index.read().unwrap(), args.limit);
     } else {
-        interactive(&index, args.limit);
+        if live {
+            live::start_background(&shared);
+            println!("Live updates are on: new, renamed and deleted files show up right away.");
+        }
+        interactive(&shared, args.limit, live);
+    }
+    if live {
+        shared.stop();
+        live::save_shared(&shared);
     }
     ExitCode::SUCCESS
 }
 
-fn build_index(source: &Source) -> Result<Index, String> {
+fn build_index(source: &Source, rescan: bool) -> Result<(Index, bool), String> {
     let mut builder = IndexBuilder::new();
     match source {
         Source::Ntfs(requested) => {
@@ -132,9 +162,7 @@ fn build_index(source: &Source) -> Result<Index, String> {
             if letters.is_empty() {
                 return Err("no fixed NTFS drives found".into());
             }
-            for letter in letters {
-                index_ntfs_volume(&mut builder, letter)?;
-            }
+            return live::load_or_scan(&letters, rescan);
         }
         Source::Walk(folder) => {
             let t = Instant::now();
@@ -157,64 +185,28 @@ fn build_index(source: &Source) -> Result<Index, String> {
             );
         }
     }
-    let t = Instant::now();
-    let index = builder.finish();
-    println!("Finalized index in {}", fmt_duration(t.elapsed()));
-    Ok(index)
+    Ok((builder.finish(), false))
 }
 
-fn index_ntfs_volume(builder: &mut IndexBuilder, letter: char) -> Result<(), String> {
-    let t = Instant::now();
-    let volume = bs_ntfs::Volume::open(letter).map_err(|e| {
-        if e.kind() == io::ErrorKind::PermissionDenied {
-            format!(
-                "cannot open drive {letter}: without administrator rights.\n\
-                 Open a terminal with \"Run as administrator\" and try again,\n\
-                 or use --walk <FOLDER> to test without admin."
-            )
-        } else {
-            format!("cannot open drive {letter}: {e}")
-        }
-    })?;
-    let journal = volume.journal();
-
-    builder.begin_volume(&format!("{letter}:"), bs_ntfs::ROOT_RECORD);
-    let mut count = 0usize;
-    let result = volume.enumerate(|record| {
-        count += 1;
-        builder.push_utf16(
-            record.record_number(),
-            record.parent_record_number(),
-            record.name,
-            record.is_dir(),
-            record.is_hidden_or_system(),
-        );
-    });
-    builder.end_volume();
-    result.map_err(|e| format!("reading drive {letter}: failed: {e}"))?;
-
-    let journal = match journal {
-        Some(j) => format!("journal id {:#x}, next USN {}", j.journal_id, j.next_usn),
-        None => "change journal not active".to_owned(),
-    };
-    println!(
-        "{letter}:  {} entries in {}  ({journal})",
-        fmt_count(count),
-        fmt_duration(t.elapsed())
-    );
-    Ok(())
-}
-
-fn print_stats(index: &Index, elapsed: Duration) {
-    let entries = index.len();
+fn print_stats(index: &Index, elapsed: Option<Duration>) {
+    let entries = index.live_len();
     let usage = index.memory_usage();
     let per_entry = |bytes: usize| bytes as f64 / entries.max(1) as f64;
     println!();
-    println!(
-        "Indexed {} files and folders in {}",
-        fmt_count(entries),
-        fmt_duration(elapsed)
-    );
+    match elapsed {
+        Some(t) => println!(
+            "Ready: {} files and folders in {}",
+            fmt_count(entries),
+            fmt_duration(t)
+        ),
+        None => println!("{} files and folders", fmt_count(entries)),
+    }
+    if index.deleted_len() > 0 {
+        println!(
+            "  deleted, awaiting cleanup: {}",
+            fmt_count(index.deleted_len())
+        );
+    }
     println!(
         "  unique names:    {} ({:.0}% of entries)",
         fmt_count(index.names().len()),
@@ -226,10 +218,11 @@ fn print_stats(index: &Index, elapsed: Duration) {
         per_entry(usage.total())
     );
     println!(
-        "    names {} · entries {} · change lookup {}",
+        "    names {} · entries {} · change lookup {} · name lookup {}",
         fmt_bytes(usage.name_bytes),
         fmt_bytes(usage.entry_bytes),
-        fmt_bytes(usage.lookup_bytes)
+        fmt_bytes(usage.lookup_bytes),
+        fmt_bytes(usage.interner_bytes)
     );
     if let Some(mem) = memory::process_memory() {
         println!(
@@ -242,9 +235,10 @@ fn print_stats(index: &Index, elapsed: Duration) {
     println!();
 }
 
-fn interactive(index: &Index, limit: usize) {
+fn interactive(shared: &Shared, limit: usize, live: bool) {
     println!("Type to search. Separate words to require all of them. Empty line or :q to quit.");
     let stdin = io::stdin();
+    let mut session = Session::new();
     let mut line = String::new();
     loop {
         print!("search> ");
@@ -255,15 +249,35 @@ fn interactive(index: &Index, limit: usize) {
         }
         // PowerShell prefixes piped input with a UTF-8 byte order mark.
         let input = line.trim_start_matches('\u{feff}').trim();
-        if input.is_empty() || input == ":q" || input == ":quit" {
-            break;
+        match input {
+            "" | ":q" | ":quit" => break,
+            ":stats" => {
+                print_stats(&shared.index.read().unwrap(), None);
+                continue;
+            }
+            ":changes" => {
+                let changes = shared.recent_changes();
+                if changes.is_empty() {
+                    println!("     no changes yet");
+                }
+                for change in changes {
+                    println!("     {change}");
+                }
+                continue;
+            }
+            ":save" if live => {
+                live::save_shared(shared);
+                continue;
+            }
+            _ => {}
         }
         let Some(query) = Query::parse(input) else {
             continue;
         };
 
+        let index = shared.index.read().unwrap();
         let t = Instant::now();
-        let result = search(index, &query, limit);
+        let result = session.search(&index, &query, limit);
         let search_time = t.elapsed();
 
         let t = Instant::now();
@@ -279,6 +293,7 @@ fn interactive(index: &Index, limit: usize) {
             })
             .collect();
         let path_time = t.elapsed();
+        drop(index);
 
         for (i, (score, path)) in rows.iter().enumerate() {
             println!("{:>3}. [{score:>4}] {path}", i + 1);
@@ -290,6 +305,18 @@ fn interactive(index: &Index, limit: usize) {
             fmt_duration(path_time)
         );
     }
+}
+
+fn median_time(runs: usize, mut f: impl FnMut()) -> (Duration, Duration, Duration) {
+    let mut times: Vec<Duration> = (0..runs)
+        .map(|_| {
+            let t = Instant::now();
+            f();
+            t.elapsed()
+        })
+        .collect();
+    times.sort();
+    (times[0], times[runs / 2], times[runs - 1])
 }
 
 fn run_bench(index: &Index, limit: usize) {
@@ -306,6 +333,7 @@ fn run_bench(index: &Index, limit: usize) {
         "x9qz",
     ];
     const RUNS: usize = 15;
+    println!("Fresh searches (as if pasted in one go):");
     println!(
         "{:<14} {:>12} {:>10} {:>10} {:>10}",
         "query", "matches", "min", "median", "max"
@@ -313,26 +341,57 @@ fn run_bench(index: &Index, limit: usize) {
     for &text in QUERIES {
         let query = Query::parse(text).expect("benchmark queries are not empty");
         let matches = search(index, &query, limit).total_matches;
-        let mut times: Vec<Duration> = (0..RUNS)
-            .map(|_| {
-                let t = Instant::now();
-                std::hint::black_box(search(index, &query, limit));
-                t.elapsed()
-            })
-            .collect();
-        times.sort();
+        let (min, median, max) = median_time(RUNS, || {
+            std::hint::black_box(search(index, &query, limit));
+        });
         println!(
             "{:<14} {:>12} {:>10} {:>10} {:>10}",
             format!("\"{text}\""),
             fmt_count(matches),
-            fmt_duration(times[0]),
-            fmt_duration(times[RUNS / 2]),
-            fmt_duration(times[RUNS - 1])
+            fmt_duration(min),
+            fmt_duration(median),
+            fmt_duration(max)
         );
+    }
+
+    // Each keystroke re-filters the previous results, as the search box will.
+    const TYPED: &[&str] = &["notepad", "readme", "invoice 2024", "config.json"];
+    println!();
+    println!("Typing letter by letter (median per keystroke):");
+    for &word in TYPED {
+        let prefixes: Vec<&str> = word
+            .char_indices()
+            .skip(1)
+            .map(|(i, _)| &word[..i])
+            .chain([word])
+            .collect();
+        let prefixes: Vec<&str> = prefixes
+            .into_iter()
+            .filter(|p| !p.trim().is_empty())
+            .collect();
+        let mut per_key = vec![Vec::with_capacity(RUNS); prefixes.len()];
+        for _ in 0..RUNS {
+            let mut session = Session::new();
+            for (k, prefix) in prefixes.iter().enumerate() {
+                let query = Query::parse(prefix).expect("prefixes are not empty");
+                let t = Instant::now();
+                std::hint::black_box(session.search(index, &query, limit));
+                per_key[k].push(t.elapsed());
+            }
+        }
+        let cells: Vec<String> = prefixes
+            .iter()
+            .zip(&mut per_key)
+            .map(|(prefix, times)| {
+                times.sort();
+                format!("{prefix:?} {}", fmt_duration(times[RUNS / 2]))
+            })
+            .collect();
+        println!("  {}", cells.join(" · "));
     }
 }
 
-fn fmt_count(n: usize) -> String {
+pub(crate) fn fmt_count(n: usize) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
@@ -344,12 +403,12 @@ fn fmt_count(n: usize) -> String {
     out
 }
 
-fn fmt_bytes(bytes: usize) -> String {
+pub(crate) fn fmt_bytes(bytes: usize) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     format!("{:.1} MB", bytes as f64 / MB)
 }
 
-fn fmt_duration(d: Duration) -> String {
+pub(crate) fn fmt_duration(d: Duration) -> String {
     let ms = d.as_secs_f64() * 1000.0;
     if ms >= 1000.0 {
         format!("{:.2} s", ms / 1000.0)
@@ -374,11 +433,12 @@ mod tests {
 
     #[test]
     fn parses_options() {
-        let args = parse(&["--synthetic", "1_000", "--bench", "-n", "5"])
+        let args = parse(&["--synthetic", "1_000", "--bench", "--rescan", "-n", "5"])
             .unwrap()
             .unwrap();
         assert!(matches!(args.source, Source::Synthetic(1000)));
         assert!(args.bench);
+        assert!(args.rescan);
         assert_eq!(args.limit, 5);
     }
 

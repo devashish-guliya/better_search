@@ -2,46 +2,30 @@
 //!
 //! The search runs in two parallel passes:
 //! 1. Score every *unique* name once (repeated names like `index.js` are checked once).
-//!    For ASCII queries this does not visit names one by one: it scans the packed name
-//!    buffer for the query's rarest byte with SIMD and only scores names around hits.
+//!    Names are stored lowercased back to back, so for ASCII queries this is one SIMD
+//!    substring scan over the whole buffer; only names containing a hit get scored.
 //! 2. Walk all entries, look up the score of their name, adjust it by location, and keep
 //!    only the best `limit` hits per thread. The full match list is never materialized,
 //!    so memory stays small even when millions of entries match.
+//!
+//! [`Session`] adds type-ahead narrowing: when a query only adds characters to the
+//! previous one, only the names that matched before are checked again.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use bs_index::{Index, Location, NameTable, flags};
-use memchr::memmem::Finder;
+use memchr::memmem::{self, Finder};
 use rayon::prelude::*;
 
 /// A parsed query: whitespace-separated terms that must all appear in the name.
 pub struct Query {
     terms: Vec<Finder<'static>>,
     needle_len: usize,
+    /// All terms are ASCII, so names can be compared in their stored lowercased form.
     ascii: bool,
-    /// Present when every term is ASCII, enabling the fast buffer scan.
-    anchor: Option<Anchor>,
-}
-
-/// The term byte used to find candidate names quickly.
-struct Anchor {
-    term: usize,
-    /// Position of the rare byte inside the term.
-    offset: usize,
-    lower: u8,
-    upper: u8,
-}
-
-/// Bytes ordered from most to least common in file names; later means rarer.
-const COMMON_BYTES: &[u8] = b"ea.itonsrlcdmpg_u-hb 1f20y3v4w5k6789xjqz";
-
-fn rarity(b: u8) -> usize {
-    let b = b.to_ascii_lowercase();
-    COMMON_BYTES
-        .iter()
-        .position(|&c| c == b)
-        .unwrap_or(COMMON_BYTES.len())
+    /// Term used to scan the name buffer: the longest, as it produces the fewest hits.
+    scan_term: usize,
 }
 
 impl Query {
@@ -55,32 +39,29 @@ impl Query {
         }
         let needle_len = terms.iter().map(|f| f.needle().len()).sum();
         let ascii = terms.iter().all(|t| t.needle().is_ascii());
-        let anchor = if ascii {
-            terms
-                .iter()
-                .enumerate()
-                .flat_map(|(term, f)| {
-                    f.needle()
-                        .iter()
-                        .enumerate()
-                        .map(move |(offset, &b)| (term, offset, b))
-                })
-                .max_by_key(|&(_, _, b)| rarity(b))
-                .map(|(term, offset, b)| Anchor {
-                    term,
-                    offset,
-                    lower: b.to_ascii_lowercase(),
-                    upper: b.to_ascii_uppercase(),
-                })
-        } else {
-            None
-        };
+        let scan_term = (0..terms.len())
+            .max_by_key(|&i| terms[i].needle().len())
+            .unwrap_or(0);
         Some(Self {
             terms,
             needle_len,
             ascii,
-            anchor,
+            scan_term,
         })
+    }
+
+    /// True when every name matching `self` also matches a query made of `previous`
+    /// terms: each previous term is contained in one of ours.
+    fn narrows(&self, previous: &[Vec<u8>]) -> bool {
+        previous.iter().all(|old| {
+            self.terms
+                .iter()
+                .any(|new| memmem::find(new.needle(), old).is_some())
+        })
+    }
+
+    fn term_bytes(&self) -> Vec<Vec<u8>> {
+        self.terms.iter().map(|t| t.needle().to_vec()).collect()
     }
 }
 
@@ -97,22 +78,81 @@ pub struct SearchResult {
     pub total_matches: usize,
 }
 
+/// One-off search. Use [`Session`] for searches that follow the user's typing.
+pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
+    let scores = score_names(index.names(), query, None);
+    if !scores.par_iter().any(|&s| s != 0) {
+        return SearchResult {
+            hits: Vec::new(),
+            total_matches: 0,
+        };
+    }
+    rank(index, &scores, limit)
+}
+
+/// Remembers which names matched the previous query so the next keystroke only has to
+/// re-check those. Automatically starts over when the index changes.
+#[derive(Default)]
+pub struct Session {
+    last: Option<LastSearch>,
+}
+
+struct LastSearch {
+    generation: u64,
+    terms: Vec<Vec<u8>>,
+    matched_names: Vec<u32>,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn search(&mut self, index: &Index, query: &Query, limit: usize) -> SearchResult {
+        let candidates = self
+            .last
+            .as_ref()
+            .filter(|last| last.generation == index.generation() && query.narrows(&last.terms))
+            .map(|last| last.matched_names.as_slice());
+        let scores = score_names(index.names(), query, candidates);
+        let matched_names: Vec<u32> = match candidates {
+            Some(previous) => previous
+                .iter()
+                .copied()
+                .filter(|&id| scores[id as usize] != 0)
+                .collect(),
+            None => scores
+                .par_iter()
+                .enumerate()
+                .filter(|&(_, &s)| s != 0)
+                .map(|(id, _)| id as u32)
+                .collect(),
+        };
+        let result = if matched_names.is_empty() {
+            SearchResult {
+                hits: Vec::new(),
+                total_matches: 0,
+            }
+        } else {
+            rank(index, &scores, limit)
+        };
+        self.last = Some(LastSearch {
+            generation: index.generation(),
+            terms: query.term_bytes(),
+            matched_names,
+        });
+        result
+    }
+}
+
 const EXACT: i32 = 100;
 const EXACT_STEM: i32 = 90;
 const PREFIX: i32 = 70;
 const WORD_START: i32 = 50;
 const SUBSTRING: i32 = 30;
 
-pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
-    let name_scores = score_names(index.names(), query);
-
-    if name_scores.iter().all(|&s| s == 0) {
-        return SearchResult {
-            hits: Vec::new(),
-            total_matches: 0,
-        };
-    }
-
+/// Pass 2: turns per-name scores into the best entries.
+fn rank(index: &Index, name_scores: &[u8], limit: usize) -> SearchResult {
     const CHUNK: usize = 1 << 14;
     let name_ids = index.name_ids();
     let entry_flags = index.flags();
@@ -126,7 +166,7 @@ pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
                 let base = (chunk * CHUNK) as u32;
                 for (k, (&name_id, &f)) in ids.iter().zip(fl).enumerate() {
                     let name_score = name_scores[name_id as usize];
-                    if name_score != 0 {
+                    if name_score != 0 && f & flags::DELETED == 0 {
                         let entry = base + k as u32;
                         // Volume roots ("C:") are not useful results.
                         if index.parent(entry).is_some() {
@@ -138,71 +178,66 @@ pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
             },
         )
         .reduce(|| TopK::new(limit), TopK::merge);
-
     top.into_result()
 }
 
-/// Returns one score per unique name; 0 means no match.
-fn score_names(names: &NameTable, query: &Query) -> Vec<u8> {
-    const NAMES_PER_CHUNK: usize = 1 << 14;
+/// Pass 1: one score per unique name; 0 means no match. With `candidates`, only those
+/// names are checked and all others score 0.
+fn score_names(names: &NameTable, query: &Query, candidates: Option<&[u32]>) -> Vec<u8> {
     let mut scores = vec![0u8; names.len()];
+    if let Some(candidates) = candidates {
+        let scored: Vec<(u32, u8)> = candidates
+            .par_iter()
+            .with_min_len(4096)
+            .map_init(Vec::new, |buf, &id| (id, score_name(names, id, buf, query)))
+            .collect();
+        for (id, score) in scored {
+            scores[id as usize] = score;
+        }
+        return scores;
+    }
+
+    const NAMES_PER_CHUNK: usize = 1 << 14;
     scores
         .par_chunks_mut(NAMES_PER_CHUNK)
         .enumerate()
-        .for_each_init(
-            || Vec::with_capacity(256),
-            |buf, (chunk, out)| {
-                let first = chunk * NAMES_PER_CHUNK;
-                match &query.anchor {
-                    Some(anchor) => scan_chunk(names, first, out, query, anchor, buf),
-                    None => {
-                        for (k, score) in out.iter_mut().enumerate() {
-                            *score = score_name(names.bytes((first + k) as u32), buf, query);
-                        }
-                    }
+        .for_each_init(Vec::new, |buf, (chunk, out)| {
+            let first = chunk * NAMES_PER_CHUNK;
+            if query.ascii {
+                scan_chunk(names, first, out, query, buf);
+            } else {
+                for (k, score) in out.iter_mut().enumerate() {
+                    *score = score_name(names, (first + k) as u32, buf, query);
                 }
-            },
-        );
+            }
+        });
     scores
 }
 
-/// Finds candidate names in `out.len()` consecutive names starting at `first` by jumping
-/// between occurrences of the anchor byte, then fully scores only those candidates.
-fn scan_chunk(
-    names: &NameTable,
-    first: usize,
-    out: &mut [u8],
-    query: &Query,
-    anchor: &Anchor,
-    buf: &mut Vec<u8>,
-) {
+/// Scans `out.len()` consecutive names starting at `first` as one block of bytes and
+/// scores only the names that contain the scan term.
+fn scan_chunk(names: &NameTable, first: usize, out: &mut [u8], query: &Query, buf: &mut Vec<u8>) {
     let offsets = &names.offsets()[first..=first + out.len()];
     let base = offsets[0] as usize;
-    let hay = &names.buffer()[base..offsets[out.len()] as usize];
-    let needle = query.terms[anchor.term].needle();
+    let hay = &names.folded_buffer()[base..offsets[out.len()] as usize];
+    let finder = &query.terms[query.scan_term];
+    let needle_len = finder.needle().len();
     let mut local = 0usize;
     let mut pos = 0usize;
     while pos < hay.len() {
-        let found = if anchor.lower == anchor.upper {
-            memchr::memchr(anchor.lower, &hay[pos..])
-        } else {
-            memchr::memchr2(anchor.lower, anchor.upper, &hay[pos..])
+        let Some(found) = finder.find(&hay[pos..]) else {
+            break;
         };
-        let Some(found) = found else { break };
         let p = pos + found;
         while offsets[local + 1] as usize - base <= p {
             local += 1;
         }
-        let name_start = offsets[local] as usize - base;
         let name_end = offsets[local + 1] as usize - base;
-        let candidate = p
-            .checked_sub(anchor.offset)
-            .filter(|&s| s >= name_start && s + needle.len() <= name_end)
-            .is_some_and(|s| hay[s..s + needle.len()].eq_ignore_ascii_case(needle));
-        if candidate {
-            out[local] = score_name(&hay[name_start..name_end], buf, query);
+        if p + needle_len <= name_end {
+            out[local] = score_name(names, (first + local) as u32, buf, query);
             pos = name_end;
         } else {
+            // The hit runs into the next name.
             pos = p + 1;
         }
     }
@@ -225,19 +260,19 @@ fn final_score(name_score: u8, entry_flags: u8) -> i32 {
 }
 
 /// Scores one name against the query. Returns 0 when it does not match.
-fn score_name(name: &[u8], lower: &mut Vec<u8>, query: &Query) -> u8 {
+fn score_name(names: &NameTable, id: u32, buf: &mut Vec<u8>, query: &Query) -> u8 {
     let mut total = 0;
-    if query.ascii && name.is_ascii() {
-        // ASCII name and query: compare case-insensitively in place, no lowercase copy.
+    if query.ascii {
+        let folded = names.folded(id);
+        let start = names.range(id).start;
+        let upper = |i: usize| names.is_upper(start + i);
         for term in &query.terms {
             let needle = term.needle();
             let mut best = 0;
-            if needle.len() <= name.len() {
-                for pos in 0..=name.len() - needle.len() {
-                    if name[pos].eq_ignore_ascii_case(&needle[0])
-                        && name[pos..pos + needle.len()].eq_ignore_ascii_case(needle)
-                    {
-                        best = best.max(classify(name, pos, needle.len()));
+            if needle.len() <= folded.len() {
+                for pos in memchr::memchr_iter(needle[0], &folded[..=folded.len() - needle.len()]) {
+                    if &folded[pos..pos + needle.len()] == needle {
+                        best = best.max(classify(folded, pos, needle.len(), upper));
                         if best >= PREFIX {
                             break;
                         }
@@ -249,20 +284,17 @@ fn score_name(name: &[u8], lower: &mut Vec<u8>, query: &Query) -> u8 {
             }
             total += best;
         }
-        return finish_score(total, name, query);
+        return finish_score(total, folded, query);
     }
 
-    // Unicode lowercasing can change byte lengths, so the lowercased copy is used both
-    // for matching and for the word-start check.
-    lower.clear();
-    match std::str::from_utf8(name) {
-        Ok(s) => lower.extend_from_slice(s.to_lowercase().as_bytes()),
-        Err(_) => lower.extend(name.iter().map(u8::to_ascii_lowercase)),
-    }
+    // Non-ASCII query: full Unicode lowercasing, which can change byte lengths, so the
+    // lowercased copy is used for matching and word starts (camelCase is not detected).
+    buf.clear();
+    buf.extend_from_slice(names.get(id).to_lowercase().as_bytes());
     for term in &query.terms {
         let mut best = 0;
-        for pos in term.find_iter(lower) {
-            best = best.max(classify(lower, pos, term.needle().len()));
+        for pos in term.find_iter(buf) {
+            best = best.max(classify(buf, pos, term.needle().len(), |_| false));
             if best >= PREFIX {
                 break;
             }
@@ -272,40 +304,41 @@ fn score_name(name: &[u8], lower: &mut Vec<u8>, query: &Query) -> u8 {
         }
         total += best;
     }
-    finish_score(total, lower, query)
+    finish_score(total, buf, query)
 }
 
-fn classify(name: &[u8], pos: usize, needle_len: usize) -> i32 {
+/// `lower` is the lowercased name; `upper(i)` tells whether byte `i` was uppercase.
+fn classify(lower: &[u8], pos: usize, needle_len: usize, upper: impl Fn(usize) -> bool) -> i32 {
     if pos == 0 {
-        if needle_len == name.len() {
+        return if needle_len == lower.len() {
             EXACT
         } else {
             PREFIX
-        }
-    } else if is_word_start(name, pos) {
-        WORD_START
-    } else {
-        SUBSTRING
+        };
     }
+    let prev = lower[pos - 1];
+    let cur = lower[pos];
+    let word_start = (prev.is_ascii() && !prev.is_ascii_alphanumeric())
+        || (prev.is_ascii_lowercase() && !upper(pos - 1) && cur.is_ascii_lowercase() && upper(pos))
+        || (prev.is_ascii_digit() && cur.is_ascii_alphabetic())
+        || (prev.is_ascii_alphabetic() && cur.is_ascii_digit());
+    if word_start { WORD_START } else { SUBSTRING }
 }
 
-/// Turns summed term scores into the final name score. `name` may be in any case.
-fn finish_score(total: i32, name: &[u8], query: &Query) -> u8 {
+/// Turns summed term scores into the final name score. `lower` is the lowercased name.
+fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
     let mut score = total / query.terms.len() as i32;
 
     if let [term] = query.terms.as_slice() {
         let n = term.needle().len();
-        if score == PREFIX && name.get(n) == Some(&b'.') && !name[n + 1..].contains(&b'.') {
+        if score == PREFIX && lower.get(n) == Some(&b'.') && !lower[n + 1..].contains(&b'.') {
             score = EXACT_STEM;
         }
     }
 
-    if let Some(dot) = memchr::memrchr(b'.', name) {
-        let ext = &name[dot + 1..];
-        let is = |candidates: &[&[u8]]| candidates.iter().any(|c| ext.eq_ignore_ascii_case(c));
-        if is(&[b"exe", b"lnk", b"url", b"appref-ms"]) {
-            score += 10;
-        } else if is(&[
+    if let Some(dot) = memchr::memrchr(b'.', lower) {
+        const BOOSTED: &[&[u8]] = &[b"exe", b"lnk", b"url", b"appref-ms"];
+        const DEMOTED: &[&[u8]] = &[
             b"dll",
             b"mui",
             b"tmp",
@@ -315,23 +348,18 @@ fn finish_score(total: i32, name: &[u8], query: &Query) -> u8 {
             b"manifest",
             b"pf",
             b"pyc",
-        ]) {
+        ];
+        let ext = &lower[dot + 1..];
+        if BOOSTED.contains(&ext) {
+            score += 10;
+        } else if DEMOTED.contains(&ext) {
             score -= 10;
         }
     }
 
-    let extra = name.len().saturating_sub(query.needle_len);
+    let extra = lower.len().saturating_sub(query.needle_len);
     score -= (extra / 4).min(15) as i32;
     score.clamp(1, 255) as u8
-}
-
-fn is_word_start(name: &[u8], pos: usize) -> bool {
-    let prev = name[pos - 1];
-    let cur = name[pos];
-    (prev.is_ascii() && !prev.is_ascii_alphanumeric())
-        || (prev.is_ascii_lowercase() && cur.is_ascii_uppercase())
-        || (prev.is_ascii_digit() && cur.is_ascii_alphabetic())
-        || (prev.is_ascii_alphabetic() && cur.is_ascii_digit())
 }
 
 /// Keeps the `limit` best hits. Ties go to the lower entry index so results are
@@ -391,13 +419,13 @@ impl TopK {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bs_index::IndexBuilder;
+    use bs_index::{Change, IndexBuilder};
 
     fn index_of(paths: &[&str]) -> Index {
         // Builds folders on demand from backslash-separated paths under "T:".
         let mut b = IndexBuilder::new();
         b.begin_volume("T:", 0);
-        let mut known: Vec<(String, u64)> = Vec::new();
+        let mut known = std::collections::HashMap::new();
         let mut next = 1u64;
         for path in paths {
             let parts: Vec<&str> = path.split('\\').collect();
@@ -406,13 +434,12 @@ mod tests {
             for (i, part) in parts.iter().enumerate() {
                 prefix.push('\\');
                 prefix.push_str(part);
-                let is_dir = i + 1 < parts.len();
-                if let Some((_, id)) = known.iter().find(|(p, _)| *p == prefix) {
-                    parent = *id;
+                if let Some(&id) = known.get(&prefix) {
+                    parent = id;
                     continue;
                 }
-                b.push(next, parent, part, is_dir, false);
-                known.push((prefix.clone(), next));
+                b.push(next, parent, part, i + 1 < parts.len(), false);
+                known.insert(prefix.clone(), next);
                 parent = next;
                 next += 1;
             }
@@ -427,6 +454,13 @@ mod tests {
             .hits
             .iter()
             .map(|h| index.full_path(h.entry))
+            .collect()
+    }
+
+    fn naive_scores(names: &NameTable, query: &Query) -> Vec<u8> {
+        let mut buf = Vec::new();
+        (0..names.len() as u32)
+            .map(|id| score_name(names, id, &mut buf, query))
             .collect()
     }
 
@@ -468,6 +502,16 @@ mod tests {
     }
 
     #[test]
+    fn uppercase_runs_are_not_camel_case_word_starts() {
+        // "PDFViewer": "viewer" follows "F", which is uppercase, so it is a plain substring.
+        let index = index_of(&["a\\PDFViewer", "a\\pdfViewer"]);
+        let q = Query::parse("viewer").unwrap();
+        let hits = search(&index, &q, 10).hits;
+        assert_eq!(index.full_path(hits[0].entry), "T:\\a\\pdfViewer");
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
     fn all_terms_must_match() {
         let index = index_of(&[
             "x\\budget 2024.xlsx",
@@ -484,6 +528,7 @@ mod tests {
     fn matches_non_ascii_names() {
         let index = index_of(&["docs\\Résumé.pdf"]);
         assert_eq!(paths(&index, "RÉSUMÉ", 10), vec!["T:\\docs\\Résumé.pdf"]);
+        assert_eq!(paths(&index, "sum", 10), vec!["T:\\docs\\Résumé.pdf"]);
     }
 
     #[test]
@@ -521,7 +566,14 @@ mod tests {
     }
 
     #[test]
-    fn fast_scan_agrees_with_per_name_scoring() {
+    fn skips_deleted_entries() {
+        let mut index = index_of(&["d\\old.txt", "d\\new.txt"]);
+        index.apply(0, Change::Delete { record: 2 });
+        index.end_batch();
+        assert_eq!(paths(&index, "txt", 10), vec!["T:\\d\\new.txt"]);
+    }
+
+    fn mixed_index() -> Index {
         let words = [
             "Report",
             "photo",
@@ -540,20 +592,82 @@ mod tests {
             })
             .collect();
         let refs: Vec<&str> = files.iter().map(String::as_str).collect();
-        let index = index_of(&refs);
+        index_of(&refs)
+    }
+
+    #[test]
+    fn buffer_scan_agrees_with_scoring_every_name() {
+        let index = mixed_index();
         for text in [
-            "e", "rep", "PHOTO", "x data", "qz", ".txt", "tx", "otes2", "zzz",
+            "e", "rep", "PHOTO", "x data", "qz", ".txt", "tx", "otes2", "zzz", "ée",
         ] {
-            let fast = Query::parse(text).unwrap();
-            assert!(fast.anchor.is_some());
-            let mut slow = Query::parse(text).unwrap();
-            slow.anchor = None;
+            let q = Query::parse(text).unwrap();
             assert_eq!(
-                score_names(index.names(), &fast),
-                score_names(index.names(), &slow),
+                score_names(index.names(), &q, None),
+                naive_scores(index.names(), &q),
                 "query {text:?}"
             );
         }
+    }
+
+    #[test]
+    fn session_narrowing_matches_fresh_searches() {
+        let index = mixed_index();
+        let mut session = Session::new();
+        let typed = [
+            "r",
+            "re",
+            "rep",
+            "repo",
+            "repor",
+            "report",
+            "report p",
+            "report ph",
+            "report",
+            "x",
+            "x d",
+            "zz",
+        ];
+        for text in typed {
+            let q = Query::parse(text).unwrap();
+            let narrowed = session.search(&index, &q, 25);
+            let fresh = search(&index, &q, 25);
+            assert_eq!(
+                narrowed.total_matches, fresh.total_matches,
+                "query {text:?}"
+            );
+            assert_eq!(narrowed.hits, fresh.hits, "query {text:?}");
+        }
+    }
+
+    #[test]
+    fn session_starts_over_when_index_changes() {
+        let mut index = index_of(&["d\\alpha.txt"]);
+        let mut session = Session::new();
+        let q = Query::parse("al").unwrap();
+        assert_eq!(session.search(&index, &q, 10).total_matches, 1);
+        index.apply(
+            0,
+            Change::Upsert {
+                record: 50,
+                parent_record: 1,
+                name: "alpine.txt",
+                is_dir: false,
+                hidden: false,
+            },
+        );
+        index.end_batch();
+        let q = Query::parse("alp").unwrap();
+        assert_eq!(session.search(&index, &q, 10).total_matches, 2);
+    }
+
+    #[test]
+    fn narrowing_rule() {
+        let q = Query::parse("report 2024").unwrap();
+        assert!(q.narrows(&[b"rep".to_vec()]));
+        assert!(q.narrows(&[b"202".to_vec(), b"port".to_vec()]));
+        assert!(!q.narrows(&[b"reports".to_vec()]));
+        assert!(!q.narrows(&[b"x".to_vec()]));
     }
 
     #[test]

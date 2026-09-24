@@ -1,5 +1,7 @@
-//! Reads the complete file and folder list of NTFS volumes straight from the file system
-//! with `FSCTL_ENUM_USN_DATA`, which is far faster than walking directories.
+//! Reads NTFS volumes directly:
+//! - the complete file and folder list with `FSCTL_ENUM_USN_DATA`, which is far faster
+//!   than walking directories;
+//! - the change journal with `FSCTL_READ_USN_JOURNAL`, to keep an index up to date.
 //!
 //! Opening a volume needs administrator rights.
 
@@ -22,17 +24,48 @@ pub const ROOT_RECORD: u64 = 5;
 
 // CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 44, METHOD_NEITHER, FILE_ANY_ACCESS)
 const FSCTL_ENUM_USN_DATA: u32 = 0x0009_00B3;
+// CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 46, METHOD_NEITHER, FILE_ANY_ACCESS)
+const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00BB;
 // CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 61, METHOD_BUFFERED, FILE_ANY_ACCESS)
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00F4;
 const DRIVE_FIXED: u32 = 3;
 
 const ENUM_BUFFER_BYTES: usize = 1 << 20;
+const JOURNAL_BUFFER_BYTES: usize = 64 * 1024;
+
+/// `USN_REASON_*` flags: why a change journal record was written.
+pub mod reason {
+    pub const FILE_CREATE: u32 = 0x0000_0100;
+    pub const FILE_DELETE: u32 = 0x0000_0200;
+    pub const RENAME_OLD_NAME: u32 = 0x0000_1000;
+    pub const RENAME_NEW_NAME: u32 = 0x0000_2000;
+    pub const BASIC_INFO_CHANGE: u32 = 0x0000_8000;
+    pub const HARD_LINK_CHANGE: u32 = 0x0001_0000;
+}
+
+/// Only changes that affect names, locations or attributes; content writes are skipped.
+const JOURNAL_REASON_MASK: u32 = reason::FILE_CREATE
+    | reason::FILE_DELETE
+    | reason::RENAME_OLD_NAME
+    | reason::RENAME_NEW_NAME
+    | reason::BASIC_INFO_CHANGE
+    | reason::HARD_LINK_CHANGE;
 
 #[repr(C)]
 struct MftEnumDataV0 {
     start_file_reference_number: u64,
     low_usn: i64,
     high_usn: i64,
+}
+
+#[repr(C)]
+struct ReadUsnJournalDataV0 {
+    start_usn: i64,
+    reason_mask: u32,
+    return_only_on_close: u32,
+    timeout: u64,
+    bytes_to_wait_for: u64,
+    usn_journal_id: u64,
 }
 
 #[repr(C)]
@@ -47,11 +80,25 @@ struct UsnJournalDataV0 {
     allocation_delta: u64,
 }
 
-/// State of a volume's change journal, needed later to resume live updates.
+/// State of a volume's change journal.
 #[derive(Clone, Copy, Debug)]
 pub struct JournalInfo {
+    /// Changes whenever the journal is deleted and recreated.
     pub journal_id: u64,
+    /// Oldest position still available; older positions have been overwritten.
+    pub first_usn: i64,
+    /// Position the next change will be written at.
     pub next_usn: i64,
+}
+
+/// What a record means for an index of names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChangeKind {
+    /// The file or folder exists with this name, parent and attributes.
+    Upsert,
+    Delete,
+    /// The old name of a rename; the record with the new name follows.
+    Skip,
 }
 
 /// One file or folder as reported by NTFS.
@@ -59,6 +106,9 @@ pub struct Record<'a> {
     pub file_reference: u64,
     pub parent_reference: u64,
     pub attributes: u32,
+    /// `USN_REASON_*` flags; always 0 in a full enumeration.
+    pub reason: u32,
+    pub usn: i64,
     pub name: &'a [u16],
 }
 
@@ -79,6 +129,18 @@ impl Record<'_> {
     pub fn is_hidden_or_system(&self) -> bool {
         self.attributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
     }
+
+    pub fn change_kind(&self) -> ChangeKind {
+        if self.reason & reason::FILE_DELETE != 0 {
+            ChangeKind::Delete
+        } else if self.reason & reason::RENAME_OLD_NAME != 0
+            && self.reason & reason::RENAME_NEW_NAME == 0
+        {
+            ChangeKind::Skip
+        } else {
+            ChangeKind::Upsert
+        }
+    }
 }
 
 pub fn record_number(file_reference: u64) -> u64 {
@@ -87,6 +149,47 @@ pub fn record_number(file_reference: u64) -> u64 {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+struct VolumeInfo {
+    serial: u32,
+    file_system: String,
+}
+
+fn volume_info(letter: char) -> io::Result<VolumeInfo> {
+    let root = wide(&format!("{letter}:\\"));
+    let mut serial = 0u32;
+    let mut fs_name = [0u16; 32];
+    // SAFETY: `root` is NUL-terminated; unused outputs are null; buffer sizes are correct.
+    let ok = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            null_mut(),
+            0,
+            &mut serial,
+            null_mut(),
+            null_mut(),
+            fs_name.as_mut_ptr(),
+            fs_name.len() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
+    Ok(VolumeInfo {
+        serial,
+        file_system: String::from_utf16_lossy(&fs_name[..len]),
+    })
+}
+
+/// Serial number of the volume, used to notice when a drive letter now points at a
+/// different disk.
+pub fn volume_serial(letter: char) -> io::Result<u32> {
+    volume_info(letter).map(|info| info.serial)
 }
 
 /// Drive letters of all fixed (non-removable) NTFS volumes.
@@ -99,33 +202,17 @@ pub fn fixed_ntfs_volumes() -> Vec<char> {
         .filter(|&letter| {
             let root = wide(&format!("{letter}:\\"));
             // SAFETY: `root` is a NUL-terminated UTF-16 string.
-            if unsafe { GetDriveTypeW(root.as_ptr()) } != DRIVE_FIXED {
-                return false;
-            }
-            let mut fs_name = [0u16; 32];
-            // SAFETY: optional outputs are null; `fs_name` length is passed correctly.
-            let ok = unsafe {
-                GetVolumeInformationW(
-                    root.as_ptr(),
-                    null_mut(),
-                    0,
-                    null_mut(),
-                    null_mut(),
-                    null_mut(),
-                    fs_name.as_mut_ptr(),
-                    fs_name.len() as u32,
-                )
-            };
-            let len = fs_name
-                .iter()
-                .position(|&c| c == 0)
-                .unwrap_or(fs_name.len());
-            ok != 0 && String::from_utf16_lossy(&fs_name[..len]) == "NTFS"
+            let drive_type = unsafe { GetDriveTypeW(root.as_ptr()) };
+            drive_type == DRIVE_FIXED
+                && volume_info(letter).is_ok_and(|info| info.file_system == "NTFS")
         })
         .collect()
 }
 
 /// An open handle to a volume such as `\\.\C:`.
+///
+/// Calls on one handle run one at a time, so a thread blocked waiting for journal
+/// changes should use its own `Volume`.
 pub struct Volume {
     handle: HANDLE,
 }
@@ -174,6 +261,7 @@ impl Volume {
         };
         (ok != 0).then_some(JournalInfo {
             journal_id: data.usn_journal_id,
+            first_usn: data.first_usn,
             next_usn: data.next_usn,
         })
     }
@@ -218,6 +306,56 @@ impl Volume {
             input.start_file_reference_number = read_u64(&buffer, 0);
             parse_records(&buffer[8..returned], &mut name, &mut on_record);
         }
+    }
+
+    /// Reads change journal records starting at `start_usn` and returns the position to
+    /// continue from. With `wait`, blocks until at least one new change exists.
+    ///
+    /// Any error means the index can no longer be trusted to be complete (the journal
+    /// was deleted, recreated, or `start_usn` was already overwritten) and the volume
+    /// needs a full rescan.
+    pub fn read_journal(
+        &self,
+        journal_id: u64,
+        start_usn: i64,
+        wait: bool,
+        buffer: &mut Vec<u8>,
+        mut on_record: impl FnMut(&Record<'_>),
+    ) -> io::Result<i64> {
+        buffer.resize(JOURNAL_BUFFER_BYTES, 0);
+        let input = ReadUsnJournalDataV0 {
+            start_usn,
+            reason_mask: JOURNAL_REASON_MASK,
+            return_only_on_close: 0,
+            timeout: 0,
+            bytes_to_wait_for: u64::from(wait),
+            usn_journal_id: journal_id,
+        };
+        let mut returned = 0u32;
+        // SAFETY: input and output buffers are valid for the sizes passed.
+        let ok = unsafe {
+            DeviceIoControl(
+                self.handle,
+                FSCTL_READ_USN_JOURNAL,
+                (&raw const input).cast::<c_void>(),
+                size_of::<ReadUsnJournalDataV0>() as u32,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                buffer.len() as u32,
+                &mut returned,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let returned = returned as usize;
+        if returned < 8 {
+            return Ok(start_usn);
+        }
+        let next_usn = read_u64(buffer, 0) as i64;
+        let mut name = Vec::with_capacity(256);
+        parse_records(&buffer[8..returned], &mut name, &mut on_record);
+        Ok(next_usn)
     }
 }
 
@@ -266,6 +404,8 @@ fn parse_records(data: &[u8], name: &mut Vec<u16>, on_record: &mut impl FnMut(&R
                 on_record(&Record {
                     file_reference: read_u64(record, 8),
                     parent_reference: read_u64(record, 16),
+                    usn: read_u64(record, 24) as i64,
+                    reason: read_u32(record, 40),
                     attributes: read_u32(record, 52),
                     name: name.as_slice(),
                 });
@@ -279,7 +419,7 @@ fn parse_records(data: &[u8], name: &mut Vec<u16>, on_record: &mut impl FnMut(&R
 mod tests {
     use super::*;
 
-    fn usn_record(file_ref: u64, parent_ref: u64, attrs: u32, name: &str) -> Vec<u8> {
+    fn usn_record(file_ref: u64, parent_ref: u64, attrs: u32, reason: u32, name: &str) -> Vec<u8> {
         let name: Vec<u8> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
         let len = (USN_RECORD_V2_HEADER + name.len()).next_multiple_of(8);
         let mut r = vec![0u8; len];
@@ -287,6 +427,8 @@ mod tests {
         r[4..6].copy_from_slice(&2u16.to_le_bytes());
         r[8..16].copy_from_slice(&file_ref.to_le_bytes());
         r[16..24].copy_from_slice(&parent_ref.to_le_bytes());
+        r[24..32].copy_from_slice(&777i64.to_le_bytes());
+        r[40..44].copy_from_slice(&reason.to_le_bytes());
         r[52..56].copy_from_slice(&attrs.to_le_bytes());
         r[56..58].copy_from_slice(&(name.len() as u16).to_le_bytes());
         r[58..60].copy_from_slice(&(USN_RECORD_V2_HEADER as u16).to_le_bytes());
@@ -300,12 +442,14 @@ mod tests {
             0x0003_0000_0000_0040,
             0x0005_0000_0000_0005,
             FILE_ATTRIBUTE_DIRECTORY,
+            0,
             "Users",
         );
         data.extend(usn_record(
             0x0001_0000_0000_0041,
             0x0003_0000_0000_0040,
             FILE_ATTRIBUTE_HIDDEN,
+            reason::FILE_CREATE,
             "ntuser.dat",
         ));
         let mut seen = Vec::new();
@@ -315,24 +459,61 @@ mod tests {
                 r.parent_record_number(),
                 r.is_dir(),
                 r.is_hidden_or_system(),
+                r.reason,
+                r.usn,
                 String::from_utf16_lossy(r.name),
             ));
         });
         assert_eq!(
             seen,
             vec![
-                (0x40, ROOT_RECORD, true, false, "Users".to_owned()),
-                (0x41, 0x40, false, true, "ntuser.dat".to_owned()),
+                (0x40, ROOT_RECORD, true, false, 0, 777, "Users".to_owned()),
+                (
+                    0x41,
+                    0x40,
+                    false,
+                    true,
+                    reason::FILE_CREATE,
+                    777,
+                    "ntuser.dat".to_owned()
+                ),
             ]
         );
     }
 
     #[test]
     fn stops_on_truncated_record() {
-        let mut data = usn_record(0x41, 5, 0, "a.txt");
+        let mut data = usn_record(0x41, 5, 0, 0, "a.txt");
         data.truncate(data.len() - 4);
         let mut count = 0;
         parse_records(&data, &mut Vec::new(), &mut |_: &Record<'_>| count += 1);
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn classifies_changes() {
+        let kind = |reason: u32| {
+            let mut kind = None;
+            parse_records(
+                &usn_record(0x41, 5, 0, reason, "a"),
+                &mut Vec::new(),
+                &mut |r: &Record<'_>| {
+                    kind = Some(r.change_kind());
+                },
+            );
+            kind.unwrap()
+        };
+        assert_eq!(kind(reason::FILE_CREATE), ChangeKind::Upsert);
+        assert_eq!(kind(reason::RENAME_NEW_NAME), ChangeKind::Upsert);
+        assert_eq!(kind(reason::BASIC_INFO_CHANGE), ChangeKind::Upsert);
+        assert_eq!(kind(reason::RENAME_OLD_NAME), ChangeKind::Skip);
+        assert_eq!(
+            kind(reason::FILE_CREATE | reason::FILE_DELETE),
+            ChangeKind::Delete
+        );
+        assert_eq!(
+            kind(reason::RENAME_OLD_NAME | reason::FILE_DELETE),
+            ChangeKind::Delete
+        );
     }
 }

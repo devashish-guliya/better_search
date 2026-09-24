@@ -8,3 +8,4 @@ publish.workspace = true
 
 [dependencies]
 hashbrown = "0.17.1"
+zstd = "0.14.0"
