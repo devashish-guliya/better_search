@@ -1,0 +1,12 @@
+[package]
+name = "bs-query"
+description = "Parallel ranked search over the file name index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bs-index = { version = "0.1.0", path = "../index" }
+memchr = "2.8.3"
+rayon = "1.12.0"
