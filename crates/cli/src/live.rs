@@ -17,6 +17,9 @@ use crate::{fmt_bytes, fmt_count, fmt_duration};
 
 const LOG_LINES: usize = 50;
 const SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Same size Windows uses for the journal it creates on the system drive.
+const JOURNAL_MAX_BYTES: u64 = 32 << 20;
+const JOURNAL_GROW_BYTES: u64 = 8 << 20;
 
 /// Index plus what the background threads report.
 pub struct Shared {
@@ -84,7 +87,18 @@ fn open_volumes(letters: &[char]) -> Result<Vec<OpenVolume>, String> {
             })?;
             let serial =
                 bs_ntfs::volume_serial(letter).map_err(|e| format!("drive {letter}: {e}"))?;
-            let journal = volume.journal();
+            let journal = volume.journal().or_else(|| {
+                match bs_ntfs::create_journal(letter, JOURNAL_MAX_BYTES, JOURNAL_GROW_BYTES) {
+                    Ok(()) => {
+                        println!("Turned on the change journal of drive {letter}:");
+                        volume.journal()
+                    }
+                    Err(e) => {
+                        println!("Could not turn on the change journal of drive {letter}: ({e})");
+                        None
+                    }
+                }
+            });
             Ok(OpenVolume {
                 letter,
                 volume,
@@ -168,8 +182,10 @@ fn scan(volumes: &[OpenVolume]) -> Result<Index, String> {
         let t = Instant::now();
         builder.begin_volume(&format!("{letter}:"), bs_ntfs::ROOT_RECORD);
         let mut count = 0usize;
+        let mut indexing = Duration::ZERO;
         let result = open.volume.enumerate(|record| {
             count += 1;
+            let started = Instant::now();
             builder.push_utf16(
                 record.record_number(),
                 record.parent_record_number(),
@@ -177,17 +193,24 @@ fn scan(volumes: &[OpenVolume]) -> Result<Index, String> {
                 record.is_dir(),
                 record.is_hidden_or_system(),
             );
+            indexing += started.elapsed();
         });
+        let read = t.elapsed().saturating_sub(indexing);
+        let t_links = Instant::now();
         builder.end_volume();
+        let linking = t_links.elapsed();
         result.map_err(|e| format!("reading drive {letter}: failed: {e}"))?;
         let journal = match open.journal {
             Some(_) => "live updates on",
             None => "no change journal, live updates off",
         };
         println!(
-            "{letter}:  {} entries in {}  ({journal})",
+            "{letter}:  {} entries in {}  (read {} · add {} · link {}; {journal})",
             fmt_count(count),
-            fmt_duration(t.elapsed())
+            fmt_duration(t.elapsed()),
+            fmt_duration(read),
+            fmt_duration(indexing),
+            fmt_duration(linking)
         );
     }
     let mut index = builder.finish();

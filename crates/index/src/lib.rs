@@ -195,6 +195,22 @@ impl NameTable {
         self.upper.shrink_to_fit();
         self.offsets.shrink_to_fit();
     }
+
+    /// Makes room for one more name of `bytes` bytes without doubling the buffers.
+    fn reserve_small(&mut self, bytes: usize) {
+        reserve_small(&mut self.folded, bytes);
+        reserve_small(&mut self.upper, bytes / 64 + 2);
+        reserve_small(&mut self.offsets, 1);
+    }
+}
+
+/// Grows `v` by a small fraction instead of the default doubling. Live updates add a
+/// few entries at a time to arrays holding millions, and doubling would briefly need
+/// twice the memory and then keep it.
+fn reserve_small<T>(v: &mut Vec<T>, additional: usize) {
+    if v.capacity() - v.len() < additional {
+        v.reserve_exact(additional.max(v.len() / 64 + 1024));
+    }
 }
 
 /// Finds existing names so repeated names are stored once. Hashes the lowercased
@@ -273,6 +289,8 @@ impl Volume {
     fn set_record(&mut self, record: u64, entry: u32) {
         let at = record as usize;
         if at >= self.record_lookup.len() {
+            let missing = at + 1 - self.record_lookup.len();
+            reserve_small(&mut self.record_lookup, missing);
             self.record_lookup.resize(at + 1, NO_PARENT);
         }
         self.record_lookup[at] = entry;
@@ -511,6 +529,7 @@ impl Index {
                         }
                         let moved = !same_name || self.parents[e] != parent;
                         if !same_name {
+                            self.names.reserve_small(name.len());
                             self.name_ids[e] =
                                 self.interner.intern(&mut self.names, name.as_bytes());
                         }
@@ -524,6 +543,10 @@ impl Index {
                     }
                     None => {
                         let entry = self.name_ids.len() as u32;
+                        self.names.reserve_small(name.len());
+                        reserve_small(&mut self.name_ids, 1);
+                        reserve_small(&mut self.parents, 1);
+                        reserve_small(&mut self.flags, 1);
                         let name_id = self.interner.intern(&mut self.names, name.as_bytes());
                         self.name_ids.push(name_id);
                         self.parents.push(parent);
@@ -1067,6 +1090,27 @@ mod tests {
         );
         assert_eq!(index.location(entry), Location::UserContent);
         assert!(index.generation() > g);
+    }
+
+    #[test]
+    fn live_changes_do_not_double_memory() {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 5);
+        for i in 0..200_000u64 {
+            b.push(100 + i, 5, &format!("file number {i}.txt"), false, false);
+        }
+        b.end_volume();
+        let mut index = b.finish();
+        let before = index.memory_usage();
+        for i in 0..10u64 {
+            index.apply(0, upsert(1_000_000 + i, 5, &format!("new {i}.txt"), false));
+        }
+        index.apply(0, upsert(100, 5, "renamed.txt", false));
+        index.end_batch();
+        let after = index.memory_usage();
+        let grown = |a: usize, b: usize| b as f64 / a as f64;
+        assert!(grown(before.name_bytes, after.name_bytes) < 1.1);
+        assert!(grown(before.entry_bytes, after.entry_bytes) < 1.1);
     }
 
     #[test]

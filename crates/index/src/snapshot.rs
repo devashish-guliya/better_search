@@ -283,6 +283,7 @@ fn read_bytes(r: &mut impl Read) -> Result<Vec<u8>, SnapshotError> {
     if out.len() != len {
         return Err(SnapshotError::Invalid("truncated"));
     }
+    out.shrink_to_fit();
     Ok(out)
 }
 
@@ -303,6 +304,8 @@ fn read_u32s(r: &mut impl Read) -> Result<Vec<u32>, SnapshotError> {
         );
         left -= n;
     }
+    // The capacity was capped up front against corrupt lengths, so growth overshot.
+    out.shrink_to_fit();
     Ok(out)
 }
 
@@ -323,6 +326,7 @@ fn read_u64s(r: &mut impl Read) -> Result<Vec<u64>, SnapshotError> {
         );
         left -= n;
     }
+    out.shrink_to_fit();
     Ok(out)
 }
 

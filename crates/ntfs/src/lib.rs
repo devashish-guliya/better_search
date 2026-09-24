@@ -10,7 +10,7 @@ use std::io;
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_HANDLE_EOF, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM,
@@ -28,6 +28,8 @@ const FSCTL_ENUM_USN_DATA: u32 = 0x0009_00B3;
 const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00BB;
 // CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 61, METHOD_BUFFERED, FILE_ANY_ACCESS)
 const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00F4;
+// CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 57, METHOD_NEITHER, FILE_ANY_ACCESS)
+const FSCTL_CREATE_USN_JOURNAL: u32 = 0x0009_00E7;
 const DRIVE_FIXED: u32 = 3;
 
 const ENUM_BUFFER_BYTES: usize = 1 << 20;
@@ -207,6 +209,56 @@ pub fn fixed_ntfs_volumes() -> Vec<char> {
                 && volume_info(letter).is_ok_and(|info| info.file_system == "NTFS")
         })
         .collect()
+}
+
+#[repr(C)]
+struct CreateUsnJournalData {
+    maximum_size: u64,
+    allocation_delta: u64,
+}
+
+/// Turns on the change journal of a volume, or resizes an existing one. Windows keeps
+/// the journal at roughly `maximum_size` bytes by dropping the oldest records.
+pub fn create_journal(letter: char, maximum_size: u64, allocation_delta: u64) -> io::Result<()> {
+    let path = wide(&format!(r"\\.\{letter}:"));
+    // SAFETY: `path` is NUL-terminated; other pointer arguments are allowed to be null.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let volume = Volume { handle };
+    let input = CreateUsnJournalData {
+        maximum_size,
+        allocation_delta,
+    };
+    let mut returned = 0u32;
+    // SAFETY: the input buffer and its size match; no output buffer.
+    let ok = unsafe {
+        DeviceIoControl(
+            volume.handle,
+            FSCTL_CREATE_USN_JOURNAL,
+            (&raw const input).cast::<c_void>(),
+            size_of::<CreateUsnJournalData>() as u32,
+            null_mut(),
+            0,
+            &mut returned,
+            null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// An open handle to a volume such as `\\.\C:`.
