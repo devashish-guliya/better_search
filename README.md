@@ -6,6 +6,9 @@ The current prototype is a command-line tool. It reads the file list of NTFS dri
 builds a compact in-memory index and searches it. It then follows the NTFS change journal
 so the index stays current, and saves a compressed snapshot so the next start is instant.
 
+The full design record (decisions, what is settled, and the plan for the next phases) is
+in [docs/PROJECT.md](docs/PROJECT.md).
+
 ## Layout
 
 | Crate | Purpose |
