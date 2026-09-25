@@ -61,13 +61,24 @@ drive), so their snapshot stays valid too.
 
 ### Clutter folders
 
-By default the contents of folders no ordinary user searches are left out: `node_modules`,
-`.git`, Python and Rust package folders, and inside system or app-data areas also caches,
-temp folders, logs and Windows component stores such as `WinSxS`. The folders themselves
-stay searchable. New files are only added when their folder is in the index, so files
+By default the contents of folders no ordinary user searches are left out. The folders
+themselves stay searchable. Three kinds of rules decide what is clutter, without any setup:
+
+- **Tool-only names**, skipped anywhere: `node_modules`, `.git`, `__pycache__`, `.venv`,
+  `.gradle`, `.next`, `.dart_tool`, `.terraform` and similar.
+- **Common names confirmed by a project file** next to them: `target` next to `Cargo.toml`,
+  `bin` and `obj` next to a `.csproj` or `.sln`, `build` or `dist` next to `package.json`,
+  Unity's `Library` next to `Assets` and `ProjectSettings`, and so on. A `target` folder
+  anywhere else is indexed normally.
+- **Folders that label themselves**: a folder containing `CACHEDIR.TAG` (a standard cache
+  marker), `pyvenv.cfg` (a Python virtual environment) or `CMakeCache.txt` (a CMake build).
+
+Inside system or app-data areas, caches, temp folders, logs and Windows component stores
+such as `WinSxS` are skipped too. If a project file or label appears after the folder, the
+folder's contents are removed at that point. New files are only added when their folder is in the index, so files
 created inside skipped folders stay out, and a folder moved into a skipped folder leaves
 the index together with its contents. The full list is in
-`crates/index/src/lib.rs` (`SKIP_ANYWHERE`, `SKIP_IN_NOISY`).
+`crates/index/src/lib.rs` (`SKIP_ANYWHERE`, `SKIP_IN_NOISY`, `SKIP_IN_PROJECT`).
 
 After 60 seconds without a search the index is allowed to leave RAM; the first search after
 that reads it back in.

@@ -12,7 +12,7 @@ pub mod snapshot;
 
 use std::ops::Range;
 
-use hashbrown::{DefaultHashBuilder, HashTable};
+use hashbrown::{DefaultHashBuilder, HashMap, HashSet, HashTable};
 use std::hash::BuildHasher;
 
 /// Parent value of volume root entries.
@@ -38,7 +38,7 @@ pub mod flags {
 
 /// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
 /// change so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 1;
+pub const SKIP_RULES_VERSION: u32 = 2;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -362,6 +362,9 @@ pub struct Index {
     locations_dirty: bool,
     /// A folder left the index, so entries below it must go too.
     orphans_possible: bool,
+    /// Folders whose contents gained a project marker or a project-rule folder in this
+    /// batch; their rules are re-checked in [`Self::end_batch`].
+    marker_parents: Vec<u32>,
     batch_changed: bool,
 }
 
@@ -563,7 +566,7 @@ impl Index {
                     basic |= flags::HIDDEN;
                 }
 
-                let (entry, applied) = match existing {
+                let (entry, applied, placed) = match existing {
                     Some(entry) => {
                         let e = entry as usize;
                         let same_name = self
@@ -587,7 +590,7 @@ impl Index {
                             // Descendants may now be in a different location class.
                             self.locations_dirty = true;
                         }
-                        (entry, Applied::Updated(entry))
+                        (entry, Applied::Updated(entry), moved)
                     }
                     None => {
                         let entry = self.name_ids.len() as u32;
@@ -602,18 +605,28 @@ impl Index {
                             .records
                             .recent
                             .insert(record as u32, entry);
-                        (entry, Applied::Created(entry))
+                        (entry, Applied::Created(entry), true)
                     }
                 };
                 let inherited = Location::from_flags(self.flags[parent as usize]);
                 let location = own_location(self, entry, inherited);
                 let e = entry as usize;
                 self.flags[e] = (self.flags[e] & !flags::LOCATION_MASK) | location.to_bits();
-                if matches!(applied, Applied::Created(_))
-                    && self.skip_rules != 0
-                    && skips_contents(self, entry)
-                {
-                    self.flags[e] |= flags::SKIPPED;
+                // Only new entries, renames and moves can change which rules apply.
+                if placed && self.skip_rules != 0 {
+                    if self.flags[e] & flags::SKIPPED == 0 && skip_rule(self, entry, 0, 0).is_some()
+                    {
+                        self.flags[e] |= flags::SKIPPED;
+                        if matches!(applied, Applied::Updated(_)) {
+                            self.orphans_possible = true;
+                        }
+                    }
+                    // Rules that depend on folder contents are checked in end_batch.
+                    if marker_bits(self, entry) != 0
+                        || (is_dir && is_project_rule_name(self.name_folded(entry)))
+                    {
+                        self.marker_parents.push(parent);
+                    }
                 }
                 self.batch_changed = true;
                 applied
@@ -624,6 +637,9 @@ impl Index {
     /// Finishes a group of changes: fixes up locations if folders moved and bumps
     /// the generation if anything changed.
     pub fn end_batch(&mut self) {
+        if !self.marker_parents.is_empty() {
+            self.apply_marker_rules();
+        }
         if self.orphans_possible {
             self.remove_orphans();
             self.orphans_possible = false;
@@ -651,9 +667,9 @@ impl Index {
         self.batch_changed = true;
     }
 
-    /// Marks entries below deleted folders as deleted too. Windows deletes the contents
-    /// of a folder before the folder, but a folder moved out of the index takes its
-    /// contents along.
+    /// Marks entries below deleted or skipped folders as deleted. Windows deletes the
+    /// contents of a folder before the folder, but a folder moved out of the index takes
+    /// its contents along, and a folder that becomes skipped loses its contents.
     fn remove_orphans(&mut self) {
         const UNKNOWN: u8 = 0;
         const ALIVE: u8 = 1;
@@ -670,8 +686,10 @@ impl Index {
                 current = self.parent(e);
             }
             while let Some(e) = stack.pop() {
-                let dead =
-                    self.is_deleted(e) || self.parent(e).is_some_and(|p| state[p as usize] == DEAD);
+                let dead = self.is_deleted(e)
+                    || self.parent(e).is_some_and(|p| {
+                        state[p as usize] == DEAD || self.flags[p as usize] & flags::SKIPPED != 0
+                    });
                 state[e as usize] = if dead { DEAD } else { ALIVE };
             }
         }
@@ -812,6 +830,7 @@ impl Index {
             generation: self.generation + 1,
             locations_dirty: self.locations_dirty,
             orphans_possible: false,
+            marker_parents: Vec::new(),
             batch_changed: false,
         }
     }
@@ -824,6 +843,8 @@ impl Index {
         const KEPT: u8 = 1;
         const INSIDE: u8 = 2;
         self.skip_rules = SKIP_RULES_VERSION;
+        let markers = self.markers_of(|_| true);
+        let bits = |e: u32| markers.get(&e).copied().unwrap_or(0);
         // For skipped folders and everything inside them: the rule that applied.
         let mut rule_of = vec![0u8; self.len()];
         let mut state = vec![UNKNOWN; self.len()];
@@ -847,7 +868,8 @@ impl Index {
                         INSIDE
                     }
                     None => {
-                        if let Some(rule) = skip_rule(self, e) {
+                        let siblings = self.parent(e).map_or(0, bits);
+                        if let Some(rule) = skip_rule(self, e, bits(e), siblings) {
                             self.flags[e as usize] |= flags::SKIPPED;
                             rule_of[e as usize] = rule as u8;
                         }
@@ -856,8 +878,9 @@ impl Index {
                 };
             }
         }
+        drop(markers);
         let mut removed = 0;
-        let mut by_rule = vec![0usize; RULE_ROOT_SYSTEM + 1];
+        let mut by_rule = vec![0usize; RULE_COUNT];
         for (e, &s) in state.iter().enumerate() {
             if s == INSIDE && self.flags[e] & flags::DELETED == 0 {
                 self.flags[e] |= flags::DELETED;
@@ -879,6 +902,64 @@ impl Index {
         SkipReport { removed, by_rule }
     }
 
+    /// Marker bits per folder, for folders where `wanted(folder)` is true and that
+    /// directly contain at least one marker.
+    fn markers_of(&self, wanted: impl Fn(u32) -> bool) -> HashMap<u32, u16> {
+        let mut markers = HashMap::new();
+        for e in 0..self.len() as u32 {
+            let parent = self.parents[e as usize];
+            if parent == NO_PARENT || self.is_deleted(e) || !wanted(parent) {
+                continue;
+            }
+            let bits = marker_bits(self, e);
+            if bits != 0 {
+                *markers.entry(parent).or_insert(0) |= bits;
+            }
+        }
+        markers
+    }
+
+    /// Re-checks project and self-labelled folder rules for folders whose contents
+    /// changed in this batch. A marker such as `Cargo.toml` may arrive after the
+    /// `target` folder next to it, or a folder may get the `CACHEDIR.TAG` label later.
+    fn apply_marker_rules(&mut self) {
+        let pending: HashSet<u32> = std::mem::take(&mut self.marker_parents)
+            .into_iter()
+            .filter(|&p| !self.is_deleted(p) && self.flags[p as usize] & flags::SKIPPED == 0)
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        let markers = self.markers_of(|p| pending.contains(&p));
+        let bits = |e: u32| markers.get(&e).copied().unwrap_or(0);
+        let mut to_skip: Vec<u32> = markers
+            .iter()
+            .filter(|&(_, &b)| b & marker::SELF_LABELS != 0)
+            .map(|(&p, _)| p)
+            .collect();
+        for e in 0..self.len() as u32 {
+            let parent = self.parents[e as usize];
+            if parent != NO_PARENT
+                && pending.contains(&parent)
+                && self.flags[e as usize] & (flags::DELETED | flags::SKIPPED) == 0
+                && self.is_dir(e)
+                && is_project_rule_name(self.name_folded(e))
+            {
+                to_skip.push(e);
+            }
+        }
+        for e in to_skip {
+            let siblings = self.parent(e).map_or(0, bits);
+            if self.flags[e as usize] & flags::SKIPPED == 0
+                && skip_rule(self, e, bits(e), siblings).is_some()
+            {
+                self.flags[e as usize] |= flags::SKIPPED;
+                self.orphans_possible = true;
+                self.batch_changed = true;
+            }
+        }
+    }
+
     fn from_parts(parts: Parts) -> Self {
         let deleted = parts
             .flags
@@ -898,6 +979,7 @@ impl Index {
             generation: 0,
             locations_dirty: false,
             orphans_possible: false,
+            marker_parents: Vec::new(),
             batch_changed: false,
         }
     }
@@ -1110,6 +1192,7 @@ impl IndexBuilder {
             generation: 0,
             locations_dirty: false,
             orphans_possible: false,
+            marker_parents: Vec::new(),
             batch_changed: false,
         };
         assign_locations(&mut index);
@@ -1186,23 +1269,159 @@ const USER_CONTENT: &[&[u8]] = &[
     b"onedrive",
 ];
 
-// Folders whose contents are never indexed when clutter is skipped.
+// Folders whose contents are never indexed when clutter is skipped. Only names that
+// tools use and people do not.
 const SKIP_ANYWHERE: &[&[u8]] = &[
-    b"node_modules",
-    b"bower_components",
+    // Version control
     b".git",
     b".svn",
     b".hg",
+    b".bzr",
+    // JavaScript
+    b"node_modules",
+    b"bower_components",
+    b"jspm_packages",
+    b".npm",
+    b".yarn",
+    b".pnpm-store",
+    b".next",
+    b".nuxt",
+    b".svelte-kit",
+    b".angular",
+    b".parcel-cache",
+    b".turbo",
+    b".expo",
+    // Python
     b"__pycache__",
     b"site-packages",
     b".venv",
+    b".tox",
+    b".nox",
+    b".pytest_cache",
+    b".mypy_cache",
+    b".ruff_cache",
+    b".ipynb_checkpoints",
+    b".conda",
+    // JVM and Android
     b".gradle",
     b".m2",
-    b".npm",
+    b".ivy2",
+    b".android",
+    b".cxx",
+    b".externalnativebuild",
+    // .NET and Visual Studio
     b".nuget",
+    b".vs",
+    // Rust, Dart and Flutter, Haskell
     b".rustup",
+    b".cargo",
+    b".dart_tool",
+    b".pub-cache",
+    b".stack-work",
+    // C and C++
+    b"cmakefiles",
+    b"vcpkg_installed",
+    // Infrastructure tools
+    b".terraform",
+    b".serverless",
+    // General caches
     b".cache",
 ];
+
+// Project marker bits: which kinds of project a folder holds, judged by the files
+// directly inside it.
+mod marker {
+    pub const RUST: u16 = 1;
+    pub const DOTNET: u16 = 1 << 1;
+    pub const GRADLE: u16 = 1 << 2;
+    pub const CMAKE: u16 = 1 << 3;
+    pub const NODE: u16 = 1 << 4;
+    pub const COMPOSER: u16 = 1 << 5;
+    pub const GO: u16 = 1 << 6;
+    pub const FLUTTER: u16 = 1 << 7;
+    pub const PODS: u16 = 1 << 8;
+    pub const UNREAL: u16 = 1 << 9;
+    pub const UNITY_ASSETS: u16 = 1 << 10;
+    pub const UNITY_SETTINGS: u16 = 1 << 11;
+    /// Derived: both Unity folders are present (see [`super::project_kinds`]).
+    pub const UNITY: u16 = 1 << 12;
+    // The folder labels itself as disposable.
+    pub const CACHEDIR_TAG: u16 = 1 << 13;
+    pub const PYVENV: u16 = 1 << 14;
+    pub const CMAKE_CACHE: u16 = 1 << 15;
+    pub const SELF_LABELS: u16 = CACHEDIR_TAG | PYVENV | CMAKE_CACHE;
+}
+
+/// What `entry` says about the folder it is in.
+fn marker_bits(index: &Index, entry: u32) -> u16 {
+    let name = index.name_folded(entry);
+    if index.is_dir(entry) {
+        return match name {
+            b"assets" => marker::UNITY_ASSETS,
+            b"projectsettings" => marker::UNITY_SETTINGS,
+            _ => 0,
+        };
+    }
+    match name {
+        b"cargo.toml" => marker::RUST,
+        b"build.gradle" | b"build.gradle.kts" | b"settings.gradle" | b"settings.gradle.kts" => {
+            marker::GRADLE
+        }
+        b"cmakelists.txt" => marker::CMAKE,
+        b"package.json" => marker::NODE,
+        b"composer.json" => marker::COMPOSER,
+        b"go.mod" => marker::GO,
+        b"pubspec.yaml" => marker::FLUTTER,
+        b"podfile" => marker::PODS,
+        b"cachedir.tag" => marker::CACHEDIR_TAG,
+        b"pyvenv.cfg" => marker::PYVENV,
+        b"cmakecache.txt" => marker::CMAKE_CACHE,
+        _ if [&b".csproj"[..], b".vbproj", b".fsproj", b".sln"]
+            .iter()
+            .any(|ext| name.ends_with(ext)) =>
+        {
+            marker::DOTNET
+        }
+        _ if name.ends_with(b".uproject") => marker::UNREAL,
+        _ => 0,
+    }
+}
+
+/// Marker bits with derived kinds filled in.
+fn project_kinds(bits: u16) -> u16 {
+    let unity = marker::UNITY_ASSETS | marker::UNITY_SETTINGS;
+    if bits & unity == unity {
+        bits | marker::UNITY
+    } else {
+        bits
+    }
+}
+
+// Folders with common names whose contents are skipped only when the folder next to
+// them marks a project that produces them (e.g. `target` next to `Cargo.toml`).
+const SKIP_IN_PROJECT: &[(&[u8], u16)] = &[
+    (b"target", marker::RUST),
+    (b"bin", marker::DOTNET),
+    (b"obj", marker::DOTNET | marker::UNITY),
+    (b"packages", marker::DOTNET),
+    (
+        b"build",
+        marker::GRADLE | marker::CMAKE | marker::NODE | marker::FLUTTER,
+    ),
+    (b"dist", marker::NODE),
+    (b"out", marker::NODE),
+    (b"vendor", marker::COMPOSER | marker::GO),
+    (b"pods", marker::PODS),
+    (b"library", marker::UNITY),
+    (b"temp", marker::UNITY),
+    (b"logs", marker::UNITY),
+    (b"intermediate", marker::UNREAL),
+    (b"deriveddatacache", marker::UNREAL),
+];
+
+fn is_project_rule_name(name: &[u8]) -> bool {
+    SKIP_IN_PROJECT.iter().any(|&(n, _)| n == name)
+}
 
 // Folders whose contents are skipped only inside system or app-data areas (entries
 // with the Noisy location), where names like "cache" or "temp" are never user files.
@@ -1241,22 +1460,37 @@ const SKIP_IN_NOISY: &[&[u8]] = &[
     b"package cache",
 ];
 
-/// Rule number used for system folders at drive roots; the lists above use lower ones.
-const RULE_ROOT_SYSTEM: usize = SKIP_ANYWHERE.len() + SKIP_IN_NOISY.len();
+// Rule numbers: the lists above in order, then the fixed rules below.
+const RULE_IN_NOISY: usize = SKIP_ANYWHERE.len();
+const RULE_IN_PROJECT: usize = RULE_IN_NOISY + SKIP_IN_NOISY.len();
+const RULE_ROOT_SYSTEM: usize = RULE_IN_PROJECT + SKIP_IN_PROJECT.len();
+const RULE_CACHEDIR_TAG: usize = RULE_ROOT_SYSTEM + 1;
+const RULE_PYVENV: usize = RULE_ROOT_SYSTEM + 2;
+const RULE_CMAKE_CACHE: usize = RULE_ROOT_SYSTEM + 3;
+const RULE_COUNT: usize = RULE_ROOT_SYSTEM + 4;
+const _: () = assert!(RULE_COUNT <= u8::MAX as usize);
 
 fn rule_name(rule: usize) -> String {
-    let bytes = if rule < SKIP_ANYWHERE.len() {
-        SKIP_ANYWHERE[rule]
-    } else if rule < RULE_ROOT_SYSTEM {
-        SKIP_IN_NOISY[rule - SKIP_ANYWHERE.len()]
-    } else {
-        b"$... and System Volume Information at drive roots"
-    };
-    String::from_utf8_lossy(bytes).into_owned()
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    match rule {
+        r if r < RULE_IN_NOISY => text(SKIP_ANYWHERE[r]),
+        r if r < RULE_IN_PROJECT => text(SKIP_IN_NOISY[r - RULE_IN_NOISY]),
+        r if r < RULE_ROOT_SYSTEM => {
+            format!(
+                "{} in projects",
+                text(SKIP_IN_PROJECT[r - RULE_IN_PROJECT].0)
+            )
+        }
+        RULE_ROOT_SYSTEM => "$... and System Volume Information at drive roots".into(),
+        RULE_CACHEDIR_TAG => "folders with CACHEDIR.TAG".into(),
+        RULE_PYVENV => "Python virtual environments".into(),
+        _ => "CMake build folders".into(),
+    }
 }
 
-/// Which rule, if any, leaves out the contents of folder `entry`.
-fn skip_rule(index: &Index, entry: u32) -> Option<usize> {
+/// Which rule, if any, leaves out the contents of folder `entry`. `own` and `siblings`
+/// are the marker bits of the folder's own contents and of its parent's contents.
+fn skip_rule(index: &Index, entry: u32, own: u16, siblings: u16) -> Option<usize> {
     if !index.is_dir(entry) {
         return None;
     }
@@ -1269,17 +1503,28 @@ fn skip_rule(index: &Index, entry: u32) -> Option<usize> {
     if let Some(i) = SKIP_ANYWHERE.iter().position(|&n| n == name) {
         return Some(i);
     }
-    if index.location(parent) == Location::Noisy {
-        return SKIP_IN_NOISY
-            .iter()
-            .position(|&n| n == name)
-            .map(|i| SKIP_ANYWHERE.len() + i);
+    if index.location(parent) == Location::Noisy
+        && let Some(i) = SKIP_IN_NOISY.iter().position(|&n| n == name)
+    {
+        return Some(RULE_IN_NOISY + i);
+    }
+    let kinds = project_kinds(siblings);
+    if let Some(i) = SKIP_IN_PROJECT
+        .iter()
+        .position(|&(n, needs)| n == name && kinds & needs != 0)
+    {
+        return Some(RULE_IN_PROJECT + i);
+    }
+    if own & marker::CACHEDIR_TAG != 0 {
+        return Some(RULE_CACHEDIR_TAG);
+    }
+    if own & marker::PYVENV != 0 {
+        return Some(RULE_PYVENV);
+    }
+    if own & marker::CMAKE_CACHE != 0 {
+        return Some(RULE_CMAKE_CACHE);
     }
     None
-}
-
-fn skips_contents(index: &Index, entry: u32) -> bool {
-    skip_rule(index, entry).is_some()
 }
 
 fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
@@ -1774,6 +2019,144 @@ mod tests {
         index.apply(0, upsert(64, 21, "main.js", false));
         index.end_batch();
         find(&index, "C:\\code\\app\\main.js");
+    }
+
+    /// C:\rust\{Cargo.toml, target\debug\app.exe, src\main.rs}
+    /// C:\notes\target\plan.txt          (no Cargo.toml: kept)
+    /// C:\web\{package.json, dist\app.js, build\x.js}
+    /// C:\Music\Library\song.mp3         (no Unity project: kept)
+    /// C:\game\{Assets\, ProjectSettings\, Library\a.asset}
+    /// C:\env\{pyvenv.cfg, Lib\x.py}
+    /// C:\data\cache\{CACHEDIR.TAG, blob}
+    /// C:\cs\{App.csproj, bin\App.dll, obj\x.json}
+    fn project_sample() -> Index {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 5);
+        b.push(10, 5, "rust", true, false);
+        b.push(11, 10, "Cargo.toml", false, false);
+        b.push(12, 10, "target", true, false);
+        b.push(13, 12, "debug", true, false);
+        b.push(14, 13, "app.exe", false, false);
+        b.push(15, 10, "src", true, false);
+        b.push(16, 15, "main.rs", false, false);
+        b.push(20, 5, "notes", true, false);
+        b.push(21, 20, "target", true, false);
+        b.push(22, 21, "plan.txt", false, false);
+        b.push(30, 5, "web", true, false);
+        b.push(31, 30, "package.json", false, false);
+        b.push(32, 30, "dist", true, false);
+        b.push(33, 32, "app.js", false, false);
+        b.push(34, 30, "build", true, false);
+        b.push(35, 34, "x.js", false, false);
+        b.push(40, 5, "Music", true, false);
+        b.push(41, 40, "Library", true, false);
+        b.push(42, 41, "song.mp3", false, false);
+        b.push(50, 5, "game", true, false);
+        b.push(51, 50, "Assets", true, false);
+        b.push(52, 50, "ProjectSettings", true, false);
+        b.push(53, 50, "Library", true, false);
+        b.push(54, 53, "a.asset", false, false);
+        b.push(60, 5, "env", true, false);
+        b.push(61, 60, "pyvenv.cfg", false, false);
+        b.push(62, 60, "Lib", true, false);
+        b.push(63, 62, "x.py", false, false);
+        b.push(70, 5, "data", true, false);
+        b.push(71, 70, "cache", true, false);
+        b.push(72, 71, "CACHEDIR.TAG", false, false);
+        b.push(73, 71, "blob", false, false);
+        b.push(80, 5, "cs", true, false);
+        b.push(81, 80, "App.csproj", false, false);
+        b.push(82, 80, "bin", true, false);
+        b.push(83, 82, "App.dll", false, false);
+        b.push(84, 80, "obj", true, false);
+        b.push(85, 84, "x.json", false, false);
+        b.end_volume();
+        b.finish()
+    }
+
+    #[test]
+    fn project_folders_are_skipped_only_next_to_their_marker() {
+        let mut index = project_sample();
+        let report = index.skip_clutter();
+        for gone in [
+            "C:\\rust\\target\\debug",
+            "C:\\web\\dist\\app.js",
+            "C:\\web\\build\\x.js",
+            "C:\\game\\Library\\a.asset",
+            "C:\\env\\pyvenv.cfg",
+            "C:\\env\\Lib\\x.py",
+            "C:\\data\\cache\\blob",
+            "C:\\cs\\bin\\App.dll",
+            "C:\\cs\\obj\\x.json",
+        ] {
+            assert!(try_find(&index, gone).is_none(), "{gone} should be skipped");
+        }
+        for kept in [
+            "C:\\rust\\target",
+            "C:\\rust\\src\\main.rs",
+            "C:\\notes\\target\\plan.txt",
+            "C:\\Music\\Library\\song.mp3",
+            "C:\\env",
+            "C:\\data\\cache",
+            "C:\\game\\Assets",
+        ] {
+            find(&index, kept);
+        }
+        let names: Vec<&str> = report.by_rule.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"target in projects"), "{names:?}");
+        assert!(names.contains(&"Python virtual environments"), "{names:?}");
+        assert!(names.contains(&"folders with CACHEDIR.TAG"), "{names:?}");
+    }
+
+    #[test]
+    fn late_markers_skip_existing_folders() {
+        let mut index = project_sample();
+        index.skip_clutter();
+        // A cloned project: `target` with contents exists before `Cargo.toml` arrives.
+        index.apply(0, upsert(100, 5, "clone", true));
+        index.apply(0, upsert(101, 100, "target", true));
+        index.apply(0, upsert(102, 101, "out.rlib", false));
+        index.end_batch();
+        find(&index, "C:\\clone\\target\\out.rlib");
+        index.apply(0, upsert(103, 100, "Cargo.toml", false));
+        index.end_batch();
+        assert!(try_find(&index, "C:\\clone\\target\\out.rlib").is_none());
+        find(&index, "C:\\clone\\target");
+        // Later files inside it stay out.
+        assert_eq!(
+            index.apply(0, upsert(104, 101, "more.rlib", false)),
+            Applied::Unchanged
+        );
+        // A folder labels itself as a cache after it already has files.
+        index.apply(0, upsert(110, 5, "tool-cache", true));
+        index.apply(0, upsert(111, 110, "entry", false));
+        index.end_batch();
+        find(&index, "C:\\tool-cache\\entry");
+        index.apply(0, upsert(112, 110, "CACHEDIR.TAG", false));
+        index.end_batch();
+        assert!(try_find(&index, "C:\\tool-cache\\entry").is_none());
+        find(&index, "C:\\tool-cache");
+    }
+
+    #[test]
+    fn new_project_folders_and_renames_are_skipped() {
+        let mut index = project_sample();
+        index.skip_clutter();
+        // A new `out` folder next to package.json, created together with a file in it.
+        index.apply(0, upsert(120, 30, "out", true));
+        index.apply(0, upsert(121, 120, "page.html", false));
+        index.end_batch();
+        find(&index, "C:\\web\\out");
+        assert!(try_find(&index, "C:\\web\\out\\page.html").is_none());
+        // A normal folder renamed to node_modules loses its contents.
+        index.apply(0, upsert(15, 10, "node_modules", true));
+        index.end_batch();
+        find(&index, "C:\\rust\\node_modules");
+        assert!(try_find(&index, "C:\\rust\\node_modules\\main.rs").is_none());
+        // Everything is still consistent after compaction.
+        index.compact();
+        find(&index, "C:\\rust\\node_modules");
+        find(&index, "C:\\notes\\target\\plan.txt");
     }
 
     #[test]
