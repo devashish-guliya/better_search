@@ -145,7 +145,6 @@ fn main() -> ExitCode {
         run_bench(&shared.index.read().unwrap(), args.limit);
     } else {
         if live {
-            live::save_on_exit(&shared);
             live::start_background(&shared);
             println!("Live updates are on: new, renamed and deleted files show up right away.");
         }
@@ -231,10 +230,11 @@ fn print_stats(index: &Index, elapsed: Option<Duration>) {
         per_entry(usage.total())
     );
     println!(
-        "    names {} · entries {} · change lookup {}",
+        "    names {} · entries {} · change lookup {} · name lookup {}",
         fmt_bytes(usage.name_bytes),
         fmt_bytes(usage.entry_bytes),
-        fmt_bytes(usage.lookup_bytes)
+        fmt_bytes(usage.lookup_bytes),
+        fmt_bytes(usage.interner_bytes)
     );
     if let Some(mem) = memory::process_memory() {
         println!(

@@ -9,10 +9,10 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::{Index, NO_PARENT, NameTable, Parts, SKIPPED_RECORD, SyncPoint, Volume};
+use crate::{Index, NO_PARENT, NameTable, Parts, RecordMap, SyncPoint, Volume};
 
 const MAGIC: &[u8; 4] = b"BSIX";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const COMPRESSION_LEVEL: i32 = 3;
 /// Refuse absurd lengths from a corrupt file instead of trying to allocate them.
 const MAX_LEN: u64 = 1 << 32;
@@ -90,7 +90,16 @@ impl Index {
                 }
                 None => w.write_all(&[0])?,
             }
-            write_u32s_delta(w, &v.record_lookup)?;
+            write_u32(w, v.records.first_entry)?;
+            write_u32s_delta(w, &v.records.sorted)?;
+            let mut recent: Vec<(u32, u32)> =
+                v.records.recent.iter().map(|(&r, &e)| (r, e)).collect();
+            recent.sort_unstable();
+            write_u64(w, recent.len() as u64)?;
+            for (record, entry) in recent {
+                write_u32(w, record)?;
+                write_u32(w, entry)?;
+            }
         }
         Ok(())
     }
@@ -147,13 +156,25 @@ fn read_body(r: &mut impl Read) -> Result<Index, SnapshotError> {
             }),
             _ => return Err(SnapshotError::Invalid("volume sync tag")),
         };
-        let record_lookup = read_u32s_delta(r)?;
+        let first_entry = read_u32(r)?;
+        let sorted = read_u32s_delta(r)?;
+        let recent_len = read_len(r)?;
+        let mut recent = hashbrown::HashMap::with_capacity(recent_len.min(1 << 20));
+        for _ in 0..recent_len {
+            let record = read_u32(r)?;
+            let entry = read_u32(r)?;
+            recent.insert(record, entry);
+        }
         volumes.push(Volume {
             label,
             root,
             root_record,
             sync,
-            record_lookup,
+            records: RecordMap {
+                first_entry,
+                sorted,
+                recent,
+            },
         });
     }
 
@@ -217,9 +238,10 @@ fn validate(
         if v.root as usize >= entries || parents[v.root as usize] != NO_PARENT {
             return Err(invalid("volume root"));
         }
-        if v.record_lookup
-            .iter()
-            .any(|&e| e != NO_PARENT && e != SKIPPED_RECORD && e as usize >= entries)
+        let m = &v.records;
+        if m.first_entry as usize + m.sorted.len() > entries
+            || m.sorted.windows(2).any(|w| w[0] >= w[1])
+            || m.recent.values().any(|&e| e as usize >= entries)
         {
             return Err(invalid("volume records"));
         }
@@ -429,14 +451,11 @@ mod tests {
         );
         loaded.end_batch();
         find(&loaded, "C:\\code\\index.js");
-        assert_eq!(loaded.unmerged_names(), 1);
-        loaded.compact();
         assert_eq!(
             loaded.names().len(),
             names,
-            "duplicate name should be merged"
+            "existing name should be reused"
         );
-        find(&loaded, "C:\\code\\index.js");
     }
 
     #[test]

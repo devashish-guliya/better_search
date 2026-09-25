@@ -44,9 +44,13 @@ In the interactive prompt, type a query to search. Commands:
 | `:save` | Write the snapshot now |
 
 Searches always use the live in-memory index. The snapshot on disk only makes the next
-start fast, so it is written rarely: once an hour if something changed, on exit, and when
-the console is closed or Windows logs off or shuts down. Changes made since the last save
-are replayed from the NTFS change journal on the next start.
+start fast, so it is written rarely: once an hour if something changed, and on a normal
+quit. Nothing is written when Windows shuts down; changes made since the last save are
+replayed from the NTFS change journal on the next start.
+
+Deleted and renamed files leave some unused space in the index. Once that reaches about
+2% of the index, it is rebuilt into a clean copy in the background during the next save.
+Searches keep running on the old copy until the new one is swapped in.
 
 The snapshot is stored at `%LOCALAPPDATA%\better_search\index.bin`. It is thrown away and
 the drives are read again if a drive's serial number or journal changed, if too many
@@ -60,7 +64,9 @@ drive), so their snapshot stays valid too.
 By default the contents of folders no ordinary user searches are left out: `node_modules`,
 `.git`, Python and Rust package folders, and inside system or app-data areas also caches,
 temp folders, logs and Windows component stores such as `WinSxS`. The folders themselves
-stay searchable. New files created inside them are left out too. The full list is in
+stay searchable. New files are only added when their folder is in the index, so files
+created inside skipped folders stay out, and a folder moved into a skipped folder leaves
+the index together with its contents. The full list is in
 `crates/index/src/lib.rs` (`SKIP_ANYWHERE`, `SKIP_IN_NOISY`).
 
 After 60 seconds without a search the index is allowed to leave RAM; the first search after

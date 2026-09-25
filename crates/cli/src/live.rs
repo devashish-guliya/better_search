@@ -31,8 +31,10 @@ pub struct Shared {
     pub index: RwLock<Index>,
     log: Mutex<VecDeque<String>>,
     saved_generation: Mutex<Option<u64>>,
-    /// Held while saving so the saver thread and the exit handler never write at once.
-    save_lock: Mutex<()>,
+    /// Held by whoever changes or saves the index. Writers take it before the write
+    /// lock, so while a compaction or save holds a read lock for a while, no writer is
+    /// queued on the RwLock, and a queued writer would make new searches wait.
+    maintenance: Mutex<()>,
     last_search: Mutex<Instant>,
     trimmed: AtomicBool,
     stop: AtomicBool,
@@ -44,7 +46,7 @@ impl Shared {
             index: RwLock::new(index),
             log: Mutex::new(VecDeque::new()),
             saved_generation: Mutex::new(None),
-            save_lock: Mutex::new(()),
+            maintenance: Mutex::new(()),
             last_search: Mutex::new(Instant::now()),
             trimmed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
@@ -401,29 +403,6 @@ pub fn start_background(shared: &Arc<Shared>) {
         .expect("spawning a thread");
 }
 
-static EXIT_TARGET: std::sync::OnceLock<Arc<Shared>> = std::sync::OnceLock::new();
-
-/// Saves the index when the console window is closed, Ctrl+C is pressed, or Windows
-/// logs off or shuts down, then exits.
-pub fn save_on_exit(shared: &Arc<Shared>) {
-    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
-
-    unsafe extern "system" fn handler(_event: u32) -> windows_sys::core::BOOL {
-        if let Some(shared) = EXIT_TARGET.get() {
-            shared.stop();
-            save_shared(shared);
-        }
-        std::process::exit(0);
-    }
-
-    if EXIT_TARGET.set(Arc::clone(shared)).is_ok() {
-        // SAFETY: `handler` is a valid function for the whole life of the process.
-        unsafe {
-            SetConsoleCtrlHandler(Some(handler), 1);
-        }
-    }
-}
-
 fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
     let letter = label.chars().next().unwrap_or('?');
     let volume = match Volume::open(letter) {
@@ -468,6 +447,7 @@ fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
             continue;
         }
 
+        let _maintenance = shared.maintenance.lock().unwrap();
         let mut index = shared.index.write().unwrap();
         let mut lines = Vec::new();
         for r in &pending {
@@ -535,19 +515,23 @@ fn save(index: &Index, path: &std::path::Path) -> bool {
     }
 }
 
-/// Compacts and saves if anything changed since the last save, then lets the index
-/// leave RAM again if nobody is searching.
+/// Saves if anything changed since the last save, compacting first when enough garbage
+/// has built up, then lets the index leave RAM again if nobody is searching. Searches
+/// are never blocked: the compacted copy is built next to the live index and swapped in.
 pub fn save_shared(shared: &Shared) {
-    let _saving = shared.save_lock.lock().unwrap();
+    let _maintenance = shared.maintenance.lock().unwrap();
     let generation = shared.index.read().unwrap().generation();
     if *shared.saved_generation.lock().unwrap() == Some(generation) {
         return;
     }
-    {
-        let mut index = shared.index.write().unwrap();
-        if index.deleted_len() > 0 || index.unmerged_names() > 0 {
-            index.compact();
-        }
+    let needs_compaction = shared.index.read().unwrap().needs_compaction();
+    if needs_compaction {
+        let t = Instant::now();
+        let fresh = shared.index.read().unwrap().compacted();
+        let old = std::mem::replace(&mut *shared.index.write().unwrap(), fresh);
+        // Freed outside the lock so searches do not wait for it.
+        drop(old);
+        shared.push_log(format!("compacted index in {}", fmt_duration(t.elapsed())));
     }
     // Saving only needs read access, so searches keep working meanwhile.
     let index = shared.index.read().unwrap();

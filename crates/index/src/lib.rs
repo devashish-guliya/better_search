@@ -36,10 +36,6 @@ pub mod flags {
     pub const SKIPPED: u8 = 1 << 5;
 }
 
-/// Record lookup value for records inside a skipped folder. Their entries do not exist,
-/// but new files created under them must be recognized as skipped too.
-const SKIPPED_RECORD: u32 = u32::MAX - 1;
-
 /// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
 /// change so saved indexes built with the old rules are rebuilt.
 pub const SKIP_RULES_VERSION: u32 = 1;
@@ -232,6 +228,24 @@ impl Interner {
             .insert_unique(hash, id, |&id| hasher.hash_one(names.folded(id)));
         id
     }
+
+    fn rebuild(names: &NameTable) -> Self {
+        let mut interner = Self::default();
+        interner.table.reserve(names.len(), |_| 0);
+        for id in 0..names.len() as u32 {
+            let hash = interner.hasher.hash_one(names.folded(id));
+            let hasher = &interner.hasher;
+            interner
+                .table
+                .insert_unique(hash, id, |&id| hasher.hash_one(names.folded(id)));
+        }
+        interner
+    }
+
+    fn heap_bytes(&self) -> usize {
+        // One u32 slot plus one control byte per bucket.
+        self.table.capacity() * (size_of::<u32>() + 1)
+    }
 }
 
 /// Where the index last caught up with a volume's change journal.
@@ -251,31 +265,46 @@ pub struct Volume {
     pub root_record: u64,
     /// Present when the volume can be kept up to date from a change journal.
     pub sync: Option<SyncPoint>,
-    /// Maps a source id (for NTFS, the MFT record number) to its entry index.
-    record_lookup: Vec<u32>,
+    /// Finds the entry of a source id (for NTFS, the MFT record number).
+    records: RecordMap,
 }
 
 impl Volume {
+    /// Entry for `record`. May be an entry marked deleted and not yet compacted away.
     pub fn entry_for_record(&self, record: u64) -> Option<u32> {
-        let entry = *self.record_lookup.get(usize::try_from(record).ok()?)?;
-        (entry != NO_PARENT && entry != SKIPPED_RECORD).then_some(entry)
-    }
-
-    fn is_skipped_record(&self, record: u64) -> bool {
-        usize::try_from(record)
-            .ok()
-            .and_then(|r| self.record_lookup.get(r))
-            == Some(&SKIPPED_RECORD)
-    }
-
-    fn set_record(&mut self, record: u64, entry: u32) {
-        let at = record as usize;
-        if at >= self.record_lookup.len() {
-            let missing = at + 1 - self.record_lookup.len();
-            reserve_small(&mut self.record_lookup, missing);
-            self.record_lookup.resize(at + 1, NO_PARENT);
+        if record == self.root_record {
+            return Some(self.root);
         }
-        self.record_lookup[at] = entry;
+        self.records.get(u32::try_from(record).ok()?)
+    }
+}
+
+/// Maps record numbers to entries using 4 bytes per indexed entry.
+///
+/// A volume's entries are stored in record order right after its root, so the entry of
+/// `sorted[i]` is simply `first_entry + i` and a binary search finds it. Only indexed
+/// records are listed, which matters because most records on a typical drive belong to
+/// skipped clutter or are unused. Entries created after the last compaction are kept in
+/// a small hash map until the next compaction sorts them in.
+#[derive(Default)]
+struct RecordMap {
+    first_entry: u32,
+    sorted: Vec<u32>,
+    recent: hashbrown::HashMap<u32, u32>,
+}
+
+impl RecordMap {
+    fn get(&self, record: u32) -> Option<u32> {
+        if let Some(&entry) = self.recent.get(&record) {
+            return Some(entry);
+        }
+        let i = self.sorted.binary_search(&record).ok()?;
+        Some(self.first_entry + i as u32)
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.sorted.capacity() * size_of::<u32>()
+            + self.recent.capacity() * (2 * size_of::<u32>() + 1)
     }
 }
 
@@ -284,11 +313,12 @@ pub struct MemoryUsage {
     pub name_bytes: usize,
     pub entry_bytes: usize,
     pub lookup_bytes: usize,
+    pub interner_bytes: usize,
 }
 
 impl MemoryUsage {
     pub fn total(&self) -> usize {
-        self.name_bytes + self.entry_bytes + self.lookup_bytes
+        self.name_bytes + self.entry_bytes + self.lookup_bytes + self.interner_bytes
     }
 }
 
@@ -318,19 +348,20 @@ pub enum Applied {
 
 pub struct Index {
     names: NameTable,
+    interner: Interner,
     name_ids: Vec<u32>,
     parents: Vec<u32>,
     flags: Vec<u8>,
     volumes: Vec<Volume>,
     deleted: usize,
-    /// Names added by live changes since the last compaction. They are not checked for
-    /// duplicates when added (keeping a lookup table for that costs more memory than
-    /// the few duplicates do); [`Self::compact`] merges them.
-    unmerged_names: usize,
+    /// Renames since the last compaction; each may leave an unused name behind.
+    renames: usize,
     /// [`SKIP_RULES_VERSION`] if clutter folders were skipped, 0 if everything is indexed.
     skip_rules: u32,
     generation: u64,
     locations_dirty: bool,
+    /// A folder left the index, so entries below it must go too.
+    orphans_possible: bool,
     batch_changed: bool,
 }
 
@@ -383,9 +414,11 @@ impl Index {
         self.skip_rules
     }
 
-    /// Names that may duplicate existing ones until the next [`Self::compact`].
-    pub fn unmerged_names(&self) -> usize {
-        self.unmerged_names
+    /// Whether enough deleted entries, unused names and not-yet-sorted records have
+    /// built up to be worth a compaction (about 2% of the index).
+    pub fn needs_compaction(&self) -> bool {
+        let recent: usize = self.volumes.iter().map(|v| v.records.recent.len()).sum();
+        (self.deleted + self.renames + recent) * 50 >= self.live_len().max(1000)
     }
 
     pub fn name(&self, entry: u32) -> String {
@@ -445,18 +478,22 @@ impl Index {
             entry_bytes: self.name_ids.capacity() * size_of::<u32>()
                 + self.parents.capacity() * size_of::<u32>()
                 + self.flags.capacity(),
-            lookup_bytes: self
-                .volumes
-                .iter()
-                .map(|v| v.record_lookup.capacity() * size_of::<u32>())
-                .sum(),
+            lookup_bytes: self.volumes.iter().map(|v| v.records.heap_bytes()).sum(),
+            interner_bytes: self.interner.heap_bytes(),
         }
     }
 
     fn add_name(&mut self, name: &str) -> u32 {
         self.names.reserve_small(name.len());
-        self.unmerged_names += 1;
-        self.names.push(name.as_bytes())
+        self.interner.intern(&mut self.names, name.as_bytes())
+    }
+
+    /// The entry for `parent_record` if new children of it belong in the index.
+    /// `None` means the parent is not indexed (inside a skipped folder, or unknown) or
+    /// is a skipped folder itself.
+    fn indexed_parent(&self, volume: usize, parent_record: u64) -> Option<u32> {
+        self.live_entry(volume, parent_record)
+            .filter(|&p| self.flags[p as usize] & flags::SKIPPED == 0)
     }
 
     fn live_entry(&self, volume: usize, record: u64) -> Option<u32> {
@@ -488,10 +525,7 @@ impl Index {
                 if entry == self.volumes[volume].root {
                     return Applied::Unchanged;
                 }
-                self.flags[entry as usize] |= flags::DELETED;
-                self.volumes[volume].record_lookup[record as usize] = NO_PARENT;
-                self.deleted += 1;
-                self.batch_changed = true;
+                self.remove_entry(volume, record, entry);
                 Applied::Deleted(entry)
             }
             Change::Upsert {
@@ -506,7 +540,21 @@ impl Index {
                     return Applied::Unchanged;
                 }
                 let root = vol.root;
-                let mut parent = self.live_entry(volume, parent_record).unwrap_or(root);
+                let existing = self.live_entry(volume, record);
+                // Children of folders that are not indexed are not indexed either. This
+                // is what keeps new files inside skipped folders out, since the folders
+                // below a skipped folder are not indexed. Windows always reports a folder
+                // before the files in it, so a known folder is never missed this way.
+                let Some(mut parent) = self.indexed_parent(volume, parent_record) else {
+                    return match existing {
+                        // Moved into a skipped folder: it leaves the index.
+                        Some(entry) => {
+                            self.remove_entry(volume, record, entry);
+                            Applied::Deleted(entry)
+                        }
+                        None => Applied::Unchanged,
+                    };
+                };
                 let mut basic = 0;
                 if is_dir {
                     basic |= flags::DIR;
@@ -515,7 +563,7 @@ impl Index {
                     basic |= flags::HIDDEN;
                 }
 
-                let (entry, applied) = match self.live_entry(volume, record) {
+                let (entry, applied) = match existing {
                     Some(entry) => {
                         let e = entry as usize;
                         let same_name = self
@@ -531,6 +579,7 @@ impl Index {
                         let moved = !same_name || self.parents[e] != parent;
                         if !same_name {
                             self.name_ids[e] = self.add_name(name);
+                            self.renames += 1;
                         }
                         self.parents[e] = parent;
                         self.flags[e] = (self.flags[e] & !(flags::DIR | flags::HIDDEN)) | basic;
@@ -541,15 +590,6 @@ impl Index {
                         (entry, Applied::Updated(entry))
                     }
                     None => {
-                        let vol = &self.volumes[volume];
-                        if vol.is_skipped_record(parent_record)
-                            || self.flags[parent as usize] & flags::SKIPPED != 0
-                        {
-                            // Inside a skipped folder. Existing entries moved in there are
-                            // kept (above); only new ones are left out.
-                            self.volumes[volume].set_record(record, SKIPPED_RECORD);
-                            return Applied::Unchanged;
-                        }
                         let entry = self.name_ids.len() as u32;
                         reserve_small(&mut self.name_ids, 1);
                         reserve_small(&mut self.parents, 1);
@@ -558,7 +598,10 @@ impl Index {
                         self.name_ids.push(name_id);
                         self.parents.push(parent);
                         self.flags.push(basic);
-                        self.volumes[volume].set_record(record, entry);
+                        self.volumes[volume]
+                            .records
+                            .recent
+                            .insert(record as u32, entry);
                         (entry, Applied::Created(entry))
                     }
                 };
@@ -581,6 +624,10 @@ impl Index {
     /// Finishes a group of changes: fixes up locations if folders moved and bumps
     /// the generation if anything changed.
     pub fn end_batch(&mut self) {
+        if self.orphans_possible {
+            self.remove_orphans();
+            self.orphans_possible = false;
+        }
         if self.locations_dirty {
             assign_locations(self);
             self.locations_dirty = false;
@@ -591,52 +638,139 @@ impl Index {
         }
     }
 
-    /// Drops deleted entries and unused names, and merges duplicate names.
+    fn remove_entry(&mut self, volume: usize, record: u64, entry: u32) {
+        let e = entry as usize;
+        self.flags[e] |= flags::DELETED;
+        if let Ok(record) = u32::try_from(record) {
+            self.volumes[volume].records.recent.remove(&record);
+        }
+        self.deleted += 1;
+        if self.flags[e] & flags::DIR != 0 {
+            self.orphans_possible = true;
+        }
+        self.batch_changed = true;
+    }
+
+    /// Marks entries below deleted folders as deleted too. Windows deletes the contents
+    /// of a folder before the folder, but a folder moved out of the index takes its
+    /// contents along.
+    fn remove_orphans(&mut self) {
+        const UNKNOWN: u8 = 0;
+        const ALIVE: u8 = 1;
+        const DEAD: u8 = 2;
+        let mut state = vec![UNKNOWN; self.len()];
+        let mut stack = Vec::with_capacity(64);
+        for start in 0..self.len() as u32 {
+            let mut current = Some(start);
+            while let Some(e) = current {
+                if state[e as usize] != UNKNOWN || stack.len() == MAX_DEPTH {
+                    break;
+                }
+                stack.push(e);
+                current = self.parent(e);
+            }
+            while let Some(e) = stack.pop() {
+                let dead =
+                    self.is_deleted(e) || self.parent(e).is_some_and(|p| state[p as usize] == DEAD);
+                state[e as usize] = if dead { DEAD } else { ALIVE };
+            }
+        }
+        let mut removed = 0;
+        for (e, &s) in state.iter().enumerate() {
+            if s == DEAD && self.flags[e] & flags::DELETED == 0 {
+                self.flags[e] |= flags::DELETED;
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.deleted += removed;
+            let flags = &self.flags;
+            for v in &mut self.volumes {
+                v.records
+                    .recent
+                    .retain(|_, e| flags[*e as usize] & flags::DELETED == 0);
+            }
+        }
+    }
+
+    /// Drops deleted entries and unused names in place. See [`Self::compacted`].
     pub fn compact(&mut self) {
-        let unused_names = !self.names.is_empty() && {
-            let mut used = vec![false; self.names.len()];
-            for (e, &id) in self.name_ids.iter().enumerate() {
-                if self.flags[e] & flags::DELETED == 0 {
-                    used[id as usize] = true;
+        *self = self.compacted();
+    }
+
+    /// Builds a cleaned-up copy: deleted entries and unused names are dropped, and each
+    /// volume's entries are put back in record order so the record lookup is a plain
+    /// sorted list again. Only needs read access, so searches can keep using this index
+    /// while the copy is built.
+    pub fn compacted(&self) -> Index {
+        // Old entry numbers in their new order: per volume, the root, then entries by
+        // record number.
+        let live = self.live_len();
+        let mut order: Vec<u32> = Vec::with_capacity(live);
+        let mut volume_layout = Vec::with_capacity(self.volumes.len());
+        for v in &self.volumes {
+            let root = order.len() as u32;
+            order.push(v.root);
+            let first_entry = order.len() as u32;
+            let alive = |e: u32| self.flags[e as usize] & flags::DELETED == 0 && e != v.root;
+            let mut recent: Vec<(u32, u32)> = v
+                .records
+                .recent
+                .iter()
+                .map(|(&r, &e)| (r, e))
+                .filter(|&(_, e)| alive(e))
+                .collect();
+            recent.sort_unstable();
+            let mut sorted = Vec::with_capacity(v.records.sorted.len() + recent.len());
+            let mut recent = recent.into_iter().peekable();
+            for (i, &record) in v.records.sorted.iter().enumerate() {
+                while let Some(&(r, e)) = recent.peek()
+                    && r <= record
+                {
+                    recent.next();
+                    order.push(e);
+                    sorted.push(r);
+                }
+                // A record that was reused for a newer entry: the newer one wins.
+                if sorted.last() == Some(&record) {
+                    continue;
+                }
+                let e = v.records.first_entry + i as u32;
+                if alive(e) {
+                    order.push(e);
+                    sorted.push(record);
                 }
             }
-            used.iter().any(|u| !u)
-        };
-        if self.deleted == 0 && !unused_names && self.unmerged_names == 0 {
-            return;
+            for (r, e) in recent {
+                order.push(e);
+                sorted.push(r);
+            }
+            sorted.shrink_to_fit();
+            volume_layout.push((root, first_entry, sorted));
         }
 
         let mut remap = vec![NO_PARENT; self.len()];
-        let mut name_remap = vec![NO_PARENT; self.names.len()];
+        for (new, &old) in order.iter().enumerate() {
+            remap[old as usize] = new as u32;
+        }
         let mut names = NameTable::default();
-        // Only needed while compacting, so it is dropped again at the end.
         let mut interner = Interner::default();
+        let mut name_remap = vec![NO_PARENT; self.names.len()];
         let mut original = String::new();
-        let live = self.live_len();
-        let mut name_ids = Vec::with_capacity(live);
-        let mut flags_out = Vec::with_capacity(live);
-        for (e, new_index) in remap.iter_mut().enumerate() {
-            if self.flags[e] & flags::DELETED != 0 {
-                continue;
-            }
-            *new_index = name_ids.len() as u32;
-            let old_name = self.name_ids[e] as usize;
+        let mut name_ids = Vec::with_capacity(order.len());
+        let mut flags_out = Vec::with_capacity(order.len());
+        let mut parents = Vec::with_capacity(order.len());
+        for &old in &order {
+            let old_name = self.name_ids[old as usize] as usize;
             if name_remap[old_name] == NO_PARENT {
                 original.clear();
                 self.names.write_original(old_name as u32, &mut original);
                 name_remap[old_name] = interner.intern(&mut names, original.as_bytes());
             }
             name_ids.push(name_remap[old_name]);
-            flags_out.push(self.flags[e]);
-        }
-        drop(interner);
-        let mut parents = Vec::with_capacity(live);
-        for (e, &new_index) in remap.iter().enumerate() {
-            if new_index == NO_PARENT {
-                continue;
-            }
-            // Skip over deleted ancestors; volume roots are never deleted.
-            let mut p = self.parents[e];
+            flags_out.push(self.flags[old as usize]);
+            // Skip over ancestors that were dropped; volume roots are always kept.
+            let mut p = self.parents[old as usize];
             let mut depth = 0;
             while p != NO_PARENT && remap[p as usize] == NO_PARENT && depth < MAX_DEPTH {
                 p = self.parents[p as usize];
@@ -648,22 +782,38 @@ impl Index {
                 remap[p as usize]
             });
         }
-        for volume in &mut self.volumes {
-            volume.root = remap[volume.root as usize];
-            for slot in &mut volume.record_lookup {
-                if *slot != NO_PARENT && *slot != SKIPPED_RECORD {
-                    *slot = remap[*slot as usize];
-                }
-            }
-        }
         names.shrink_to_fit();
-        self.names = names;
-        self.name_ids = name_ids;
-        self.parents = parents;
-        self.flags = flags_out;
-        self.deleted = 0;
-        self.unmerged_names = 0;
-        self.generation += 1;
+        let volumes = self
+            .volumes
+            .iter()
+            .zip(volume_layout)
+            .map(|(v, (root, first_entry, sorted))| Volume {
+                label: v.label.clone(),
+                root,
+                root_record: v.root_record,
+                sync: v.sync,
+                records: RecordMap {
+                    first_entry,
+                    sorted,
+                    recent: Default::default(),
+                },
+            })
+            .collect();
+        Index {
+            names,
+            interner,
+            name_ids,
+            parents,
+            flags: flags_out,
+            volumes,
+            deleted: 0,
+            renames: 0,
+            skip_rules: self.skip_rules,
+            generation: self.generation + 1,
+            locations_dirty: self.locations_dirty,
+            orphans_possible: false,
+            batch_changed: false,
+        }
     }
 
     /// Leaves out the contents of clutter folders such as `node_modules`, `.git`,
@@ -716,16 +866,8 @@ impl Index {
             }
         }
         drop(rule_of);
-        self.deleted += removed;
-        for volume in &mut self.volumes {
-            for slot in &mut volume.record_lookup {
-                if *slot != NO_PARENT && *slot != SKIPPED_RECORD && state[*slot as usize] == INSIDE
-                {
-                    *slot = SKIPPED_RECORD;
-                }
-            }
-        }
         drop(state);
+        self.deleted += removed;
         self.compact();
         let mut by_rule: Vec<(String, usize)> = by_rule
             .into_iter()
@@ -744,16 +886,18 @@ impl Index {
             .filter(|&&f| f & flags::DELETED != 0)
             .count();
         Self {
+            interner: Interner::rebuild(&parts.names),
             names: parts.names,
             name_ids: parts.name_ids,
             parents: parts.parents,
             flags: parts.flags,
             volumes: parts.volumes,
             deleted,
-            unmerged_names: 0,
+            renames: 0,
             skip_rules: parts.skip_rules,
             generation: 0,
             locations_dirty: false,
+            orphans_possible: false,
             batch_changed: false,
         }
     }
@@ -913,12 +1057,37 @@ impl IndexBuilder {
             self.parents[entry as usize] = parent;
         }
 
+        drop(lookup);
+        let first_entry = first_entry as u32;
+        let in_order = pending.source_ids.windows(2).all(|w| w[0] < w[1])
+            && pending.source_ids.last().is_none_or(|&id| id < MAX_RECORD);
+        let records = if in_order {
+            // NTFS lists records in increasing order, so this is the normal case.
+            RecordMap {
+                first_entry,
+                sorted: pending.source_ids.iter().map(|&id| id as u32).collect(),
+                recent: Default::default(),
+            }
+        } else {
+            // Sorted by the compaction in `finish`.
+            RecordMap {
+                first_entry,
+                sorted: Vec::new(),
+                recent: pending
+                    .source_ids
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &id)| id < MAX_RECORD)
+                    .map(|(k, &id)| (id as u32, first_entry + k as u32))
+                    .collect(),
+            }
+        };
         self.volumes.push(Volume {
             label: pending.label,
             root: pending.root_entry,
             root_record: pending.root_id,
             sync: None,
-            record_lookup: lookup,
+            records,
         });
     }
 
@@ -930,18 +1099,23 @@ impl IndexBuilder {
         self.flags.shrink_to_fit();
         let mut index = Index {
             names: self.names,
+            interner: self.interner,
             name_ids: self.name_ids,
             parents: self.parents,
             flags: self.flags,
             volumes: self.volumes,
             deleted: 0,
-            unmerged_names: 0,
+            renames: 0,
             skip_rules: 0,
             generation: 0,
             locations_dirty: false,
+            orphans_possible: false,
             batch_changed: false,
         };
         assign_locations(&mut index);
+        if index.volumes.iter().any(|v| !v.records.recent.is_empty()) {
+            index.compact();
+        }
         index
     }
 }
@@ -1373,6 +1547,12 @@ mod tests {
         index.end_batch();
         assert!(index.is_deleted(entry));
         assert_eq!(index.deleted_len(), 1);
+        assert!(
+            index.volumes()[0]
+                .entry_for_record(21)
+                .is_none_or(|e| index.is_deleted(e))
+        );
+        index.compact();
         assert_eq!(index.volumes()[0].entry_for_record(21), None);
     }
 
@@ -1401,16 +1581,10 @@ mod tests {
         assert_eq!(index.volumes()[0].entry_for_record(50), Some(calc));
         assert_eq!(index.volumes()[0].entry_for_record(5), Some(0));
         find(&index, "C:\\code\\app\\node_modules\\index.js");
-        // A second calc.exe adds a duplicate name until the next compaction merges it.
-        index.apply(0, upsert(51, 20, "calc.exe", false));
+        // Names are shared right away, also after compaction.
+        index.apply(0, upsert(51, 5, "calc.exe", false));
         index.end_batch();
-        assert_eq!(index.names().len(), names_before - 1);
-        index.compact();
         assert_eq!(index.names().len(), names_before - 2);
-        assert_eq!(
-            index.name(find(&index, "C:\\Windows\\calc.exe")),
-            "calc.exe"
-        );
     }
 
     #[test]
@@ -1422,7 +1596,90 @@ mod tests {
         index.compact();
         find(&index, "C:\\Report.docx");
         find(&index, "C:\\report.docx");
-        assert_eq!(index.unmerged_names(), 0);
+    }
+
+    #[test]
+    fn records_stay_findable_through_changes_and_compaction() {
+        let mut index = sample();
+        // New records below, between and above the scanned ones.
+        index.apply(0, upsert(7, 5, "low.txt", false));
+        index.apply(0, upsert(25, 20, "mid.txt", false));
+        index.apply(0, upsert(900, 31, "high.txt", false));
+        // Record 13 (report.docx) is deleted and its number reused for a new file.
+        index.apply(0, Change::Delete { record: 13 });
+        index.apply(0, upsert(13, 12, "reused.txt", false));
+        index.end_batch();
+        let check = |index: &Index| {
+            for (record, path) in [
+                (7, "C:\\low.txt"),
+                (25, "C:\\Windows\\mid.txt"),
+                (900, "C:\\code\\high.txt"),
+                (13, "C:\\Users\\bob\\Documents\\reused.txt"),
+                (21, "C:\\Windows\\notepad.exe"),
+                (5, "C:\\"),
+            ] {
+                let entry = index.volumes()[0].entry_for_record(record).unwrap();
+                assert_eq!(index.full_path(entry), path, "record {record}");
+            }
+        };
+        check(&index);
+        index.compact();
+        check(&index);
+        assert!(index.volumes()[0].records.recent.is_empty());
+        assert!(try_find(&index, "C:\\Users\\bob\\Documents\\report.docx").is_none());
+        // Changes keep working on the compacted index.
+        index.apply(0, upsert(900, 5, "high.txt", false));
+        index.end_batch();
+        find(&index, "C:\\high.txt");
+    }
+
+    #[test]
+    fn new_files_with_unknown_folders_are_ignored() {
+        let mut index = sample();
+        assert_eq!(
+            index.apply(0, upsert(60, 12345, "lost.txt", false)),
+            Applied::Unchanged
+        );
+    }
+
+    #[test]
+    fn moving_into_a_skipped_folder_removes_the_whole_subtree() {
+        let mut index = clutter_sample();
+        index.skip_clutter();
+        // Move C:\Users\bob\Documents (with cache\notes.txt inside) into node_modules.
+        let applied = index.apply(0, upsert(50, 22, "Documents", true));
+        index.end_batch();
+        assert!(matches!(applied, Applied::Deleted(_)));
+        assert!(try_find(&index, "C:\\Users\\bob\\Documents").is_none());
+        assert!(try_find(&index, "C:\\Users\\bob\\Documents\\cache\\notes.txt").is_none());
+        let deleted = index.deleted_len();
+        assert_eq!(deleted, 3);
+        index.compact();
+        assert_eq!(index.deleted_len(), 0);
+        find(&index, "C:\\code\\app\\node_modules");
+    }
+
+    #[test]
+    fn compaction_is_needed_only_after_enough_changes() {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 5);
+        for i in 0..10_000u64 {
+            b.push(100 + i, 5, &format!("f{i}"), false, false);
+        }
+        b.end_volume();
+        let mut index = b.finish();
+        for i in 0..100u64 {
+            index.apply(0, Change::Delete { record: 100 + i });
+        }
+        index.end_batch();
+        assert!(!index.needs_compaction());
+        for i in 100..300u64 {
+            index.apply(0, Change::Delete { record: 100 + i });
+        }
+        index.end_batch();
+        assert!(index.needs_compaction());
+        index.compact();
+        assert!(!index.needs_compaction());
     }
 
     /// C:\Users\bob\AppData\Local\Temp\x.tmp, C:\code\app\node_modules\lib\a.js,
