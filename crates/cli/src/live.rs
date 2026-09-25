@@ -10,13 +10,18 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bs_index::{Applied, Change, Index, IndexBuilder, SyncPoint};
+use bs_index::{Applied, Change, Index, IndexBuilder, SKIP_RULES_VERSION, SyncPoint};
 use bs_ntfs::{ChangeKind, JournalInfo, Record, Volume};
 
 use crate::{fmt_bytes, fmt_count, fmt_duration};
 
 const LOG_LINES: usize = 50;
-const SAVE_EVERY: Duration = Duration::from_secs(5 * 60);
+/// Searches always use the live in-memory index; the saved copy only makes the next
+/// start fast, and changes missed since the last save are replayed from the journal.
+/// So saving rarely loses nothing and avoids rewriting the file all day.
+const SAVE_EVERY: Duration = Duration::from_secs(60 * 60);
+/// After this long without a search, the index is allowed to leave RAM.
+const IDLE_TRIM_AFTER: Duration = Duration::from_secs(60);
 /// Same size Windows uses for the journal it creates on the system drive.
 const JOURNAL_MAX_BYTES: u64 = 32 << 20;
 const JOURNAL_GROW_BYTES: u64 = 8 << 20;
@@ -26,6 +31,10 @@ pub struct Shared {
     pub index: RwLock<Index>,
     log: Mutex<VecDeque<String>>,
     saved_generation: Mutex<Option<u64>>,
+    /// Held while saving so the saver thread and the exit handler never write at once.
+    save_lock: Mutex<()>,
+    last_search: Mutex<Instant>,
+    trimmed: AtomicBool,
     stop: AtomicBool,
 }
 
@@ -35,8 +44,17 @@ impl Shared {
             index: RwLock::new(index),
             log: Mutex::new(VecDeque::new()),
             saved_generation: Mutex::new(None),
+            save_lock: Mutex::new(()),
+            last_search: Mutex::new(Instant::now()),
+            trimmed: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         }
+    }
+
+    /// Records that the user searched, which keeps the index in RAM for a while.
+    pub fn touch(&self) {
+        *self.last_search.lock().unwrap() = Instant::now();
+        self.trimmed.store(false, Ordering::Relaxed);
     }
 
     fn push_log(&self, line: String) {
@@ -111,14 +129,18 @@ fn open_volumes(letters: &[char]) -> Result<Vec<OpenVolume>, String> {
 
 /// Loads or builds the index for `letters` and brings it fully up to date. The flag
 /// tells whether the returned index is already saved to disk.
-pub fn load_or_scan(letters: &[char], rescan: bool) -> Result<(Index, bool), String> {
+pub fn load_or_scan(
+    letters: &[char],
+    rescan: bool,
+    skip_clutter: bool,
+) -> Result<(Index, bool), String> {
     let volumes = open_volumes(letters)?;
     let path = snapshot_path();
 
     if !rescan && path.exists() {
         let t = Instant::now();
         match Index::load(&path) {
-            Ok(index) => match snapshot_mismatch(&index, &volumes) {
+            Ok(index) => match snapshot_mismatch(&index, &volumes, skip_clutter) {
                 None => {
                     let size = std::fs::metadata(&path)
                         .map(|m| m.len() as usize)
@@ -139,7 +161,10 @@ pub fn load_or_scan(letters: &[char], rescan: bool) -> Result<(Index, bool), Str
         }
     }
 
-    let index = scan(&volumes)?;
+    let mut index = scan(&volumes)?;
+    if skip_clutter {
+        skip(&mut index);
+    }
     let index =
         catch_up_all(index, &volumes).map_err(|e| format!("reading change journal: {e}"))?;
     let saved = save(&index, &path);
@@ -147,7 +172,11 @@ pub fn load_or_scan(letters: &[char], rescan: bool) -> Result<(Index, bool), Str
 }
 
 /// Why a snapshot cannot be used for these volumes, or `None` if it can.
-fn snapshot_mismatch(index: &Index, volumes: &[OpenVolume]) -> Option<String> {
+fn snapshot_mismatch(index: &Index, volumes: &[OpenVolume], skip_clutter: bool) -> Option<String> {
+    let wanted_rules = if skip_clutter { SKIP_RULES_VERSION } else { 0 };
+    if index.skip_rules() != wanted_rules {
+        return Some("the list of skipped folders changed".into());
+    }
     let saved: Vec<&str> = index.volumes().iter().map(|v| v.label.as_str()).collect();
     let wanted: Vec<String> = volumes.iter().map(|v| format!("{}:", v.letter)).collect();
     if saved != wanted {
@@ -226,6 +255,23 @@ fn scan(volumes: &[OpenVolume]) -> Result<Index, String> {
         );
     }
     Ok(index)
+}
+
+/// Leaves out clutter folder contents and reports how much that removed.
+pub fn skip(index: &mut Index) {
+    let t = Instant::now();
+    let before = index.live_len();
+    let report = index.skip_clutter();
+    println!(
+        "Skipped {} entries inside clutter folders ({:.0}% of {}) in {}",
+        fmt_count(report.removed),
+        100.0 * report.removed as f64 / before.max(1) as f64,
+        fmt_count(before),
+        fmt_duration(t.elapsed())
+    );
+    for (rule, count) in report.by_rule.iter().take(15) {
+        println!("  {:>10}  {rule}", fmt_count(*count));
+    }
 }
 
 fn catch_up_all(mut index: Index, volumes: &[OpenVolume]) -> io::Result<Index> {
@@ -332,18 +378,50 @@ pub fn start_background(shared: &Arc<Shared>) {
             .spawn(move || watch(&shared, vol, &label, sync))
             .expect("spawning a thread");
     }
-    let shared = Arc::clone(shared);
+    let saver = Arc::clone(shared);
     thread::Builder::new()
         .name("saver".into())
         .spawn(move || {
-            while !shared.stop.load(Ordering::Relaxed) {
-                thread::park_timeout(SAVE_EVERY);
-                if !shared.stop.load(Ordering::Relaxed) {
-                    save_shared(&shared);
+            let mut last_save = Instant::now();
+            while !saver.stop.load(Ordering::Relaxed) {
+                thread::park_timeout(Duration::from_secs(15));
+                if saver.stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if last_save.elapsed() >= SAVE_EVERY {
+                    save_shared(&saver);
+                    last_save = Instant::now();
+                }
+                let idle = saver.last_search.lock().unwrap().elapsed() >= IDLE_TRIM_AFTER;
+                if idle && !saver.trimmed.swap(true, Ordering::Relaxed) {
+                    crate::memory::trim_working_set();
                 }
             }
         })
         .expect("spawning a thread");
+}
+
+static EXIT_TARGET: std::sync::OnceLock<Arc<Shared>> = std::sync::OnceLock::new();
+
+/// Saves the index when the console window is closed, Ctrl+C is pressed, or Windows
+/// logs off or shuts down, then exits.
+pub fn save_on_exit(shared: &Arc<Shared>) {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+
+    unsafe extern "system" fn handler(_event: u32) -> windows_sys::core::BOOL {
+        if let Some(shared) = EXIT_TARGET.get() {
+            shared.stop();
+            save_shared(shared);
+        }
+        std::process::exit(0);
+    }
+
+    if EXIT_TARGET.set(Arc::clone(shared)).is_ok() {
+        // SAFETY: `handler` is a valid function for the whole life of the process.
+        unsafe {
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
+    }
 }
 
 fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
@@ -457,15 +535,17 @@ fn save(index: &Index, path: &std::path::Path) -> bool {
     }
 }
 
-/// Compacts and saves if anything changed since the last save.
+/// Compacts and saves if anything changed since the last save, then lets the index
+/// leave RAM again if nobody is searching.
 pub fn save_shared(shared: &Shared) {
+    let _saving = shared.save_lock.lock().unwrap();
     let generation = shared.index.read().unwrap().generation();
     if *shared.saved_generation.lock().unwrap() == Some(generation) {
         return;
     }
     {
         let mut index = shared.index.write().unwrap();
-        if index.deleted_len() > 0 {
+        if index.deleted_len() > 0 || index.unmerged_names() > 0 {
             index.compact();
         }
     }
@@ -479,6 +559,12 @@ pub fn save_shared(shared: &Shared) {
             shared.push_log(format!("saved index in {}", fmt_duration(t.elapsed())));
         }
         Err(e) => shared.push_log(format!("could not save index: {e}")),
+    }
+    drop(index);
+    // Compacting and saving read the whole index back into RAM.
+    if shared.last_search.lock().unwrap().elapsed() >= IDLE_TRIM_AFTER {
+        crate::memory::trim_working_set();
+        shared.trimmed.store(true, Ordering::Relaxed);
     }
 }
 

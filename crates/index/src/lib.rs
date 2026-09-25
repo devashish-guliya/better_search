@@ -32,7 +32,17 @@ pub mod flags {
     pub const LOCATION_MASK: u8 = 0b11 << LOCATION_SHIFT;
     /// Removed entry, kept in place until the next [`crate::Index::compact`].
     pub const DELETED: u8 = 1 << 4;
+    /// Folder whose contents are left out of the index (see [`crate::Index::skip_clutter`]).
+    pub const SKIPPED: u8 = 1 << 5;
 }
+
+/// Record lookup value for records inside a skipped folder. Their entries do not exist,
+/// but new files created under them must be recognized as skipped too.
+const SKIPPED_RECORD: u32 = u32::MAX - 1;
+
+/// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
+/// change so saved indexes built with the old rules are rebuilt.
+pub const SKIP_RULES_VERSION: u32 = 1;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,23 +109,6 @@ impl NameTable {
         }
         self.offsets.push(self.folded.len() as u32);
         id
-    }
-
-    /// Copies name `id` of another table, returning its id in this table.
-    fn push_from(&mut self, other: &NameTable, id: u32) -> u32 {
-        let new_id = self.len() as u32;
-        let range = other.range(id);
-        let start = self.folded.len();
-        self.folded.extend_from_slice(&other.folded[range.clone()]);
-        self.upper.resize(self.folded.len().div_ceil(64), 0);
-        for (i, src) in range.enumerate() {
-            if other.is_upper(src) {
-                let at = start + i;
-                self.upper[at / 64] |= 1 << (at % 64);
-            }
-        }
-        self.offsets.push(self.folded.len() as u32);
-        new_id
     }
 
     pub fn len(&self) -> usize {
@@ -239,24 +232,6 @@ impl Interner {
             .insert_unique(hash, id, |&id| hasher.hash_one(names.folded(id)));
         id
     }
-
-    fn rebuild(names: &NameTable) -> Self {
-        let mut interner = Self::default();
-        interner.table.reserve(names.len(), |_| 0);
-        for id in 0..names.len() as u32 {
-            let hash = interner.hasher.hash_one(names.folded(id));
-            let hasher = &interner.hasher;
-            interner
-                .table
-                .insert_unique(hash, id, |&id| hasher.hash_one(names.folded(id)));
-        }
-        interner
-    }
-
-    fn heap_bytes(&self) -> usize {
-        // One u32 slot plus one control byte per bucket.
-        self.table.capacity() * (size_of::<u32>() + 1)
-    }
 }
 
 /// Where the index last caught up with a volume's change journal.
@@ -283,7 +258,14 @@ pub struct Volume {
 impl Volume {
     pub fn entry_for_record(&self, record: u64) -> Option<u32> {
         let entry = *self.record_lookup.get(usize::try_from(record).ok()?)?;
-        (entry != NO_PARENT).then_some(entry)
+        (entry != NO_PARENT && entry != SKIPPED_RECORD).then_some(entry)
+    }
+
+    fn is_skipped_record(&self, record: u64) -> bool {
+        usize::try_from(record)
+            .ok()
+            .and_then(|r| self.record_lookup.get(r))
+            == Some(&SKIPPED_RECORD)
     }
 
     fn set_record(&mut self, record: u64, entry: u32) {
@@ -302,12 +284,11 @@ pub struct MemoryUsage {
     pub name_bytes: usize,
     pub entry_bytes: usize,
     pub lookup_bytes: usize,
-    pub interner_bytes: usize,
 }
 
 impl MemoryUsage {
     pub fn total(&self) -> usize {
-        self.name_bytes + self.entry_bytes + self.lookup_bytes + self.interner_bytes
+        self.name_bytes + self.entry_bytes + self.lookup_bytes
     }
 }
 
@@ -337,12 +318,17 @@ pub enum Applied {
 
 pub struct Index {
     names: NameTable,
-    interner: Interner,
     name_ids: Vec<u32>,
     parents: Vec<u32>,
     flags: Vec<u8>,
     volumes: Vec<Volume>,
     deleted: usize,
+    /// Names added by live changes since the last compaction. They are not checked for
+    /// duplicates when added (keeping a lookup table for that costs more memory than
+    /// the few duplicates do); [`Self::compact`] merges them.
+    unmerged_names: usize,
+    /// [`SKIP_RULES_VERSION`] if clutter folders were skipped, 0 if everything is indexed.
+    skip_rules: u32,
     generation: u64,
     locations_dirty: bool,
     batch_changed: bool,
@@ -390,6 +376,16 @@ impl Index {
 
     pub fn set_sync(&mut self, volume: usize, sync: Option<SyncPoint>) {
         self.volumes[volume].sync = sync;
+    }
+
+    /// [`SKIP_RULES_VERSION`] if clutter folders were skipped, 0 if everything is indexed.
+    pub fn skip_rules(&self) -> u32 {
+        self.skip_rules
+    }
+
+    /// Names that may duplicate existing ones until the next [`Self::compact`].
+    pub fn unmerged_names(&self) -> usize {
+        self.unmerged_names
     }
 
     pub fn name(&self, entry: u32) -> String {
@@ -454,8 +450,13 @@ impl Index {
                 .iter()
                 .map(|v| v.record_lookup.capacity() * size_of::<u32>())
                 .sum(),
-            interner_bytes: self.interner.heap_bytes(),
         }
+    }
+
+    fn add_name(&mut self, name: &str) -> u32 {
+        self.names.reserve_small(name.len());
+        self.unmerged_names += 1;
+        self.names.push(name.as_bytes())
     }
 
     fn live_entry(&self, volume: usize, record: u64) -> Option<u32> {
@@ -529,9 +530,7 @@ impl Index {
                         }
                         let moved = !same_name || self.parents[e] != parent;
                         if !same_name {
-                            self.names.reserve_small(name.len());
-                            self.name_ids[e] =
-                                self.interner.intern(&mut self.names, name.as_bytes());
+                            self.name_ids[e] = self.add_name(name);
                         }
                         self.parents[e] = parent;
                         self.flags[e] = (self.flags[e] & !(flags::DIR | flags::HIDDEN)) | basic;
@@ -542,12 +541,20 @@ impl Index {
                         (entry, Applied::Updated(entry))
                     }
                     None => {
+                        let vol = &self.volumes[volume];
+                        if vol.is_skipped_record(parent_record)
+                            || self.flags[parent as usize] & flags::SKIPPED != 0
+                        {
+                            // Inside a skipped folder. Existing entries moved in there are
+                            // kept (above); only new ones are left out.
+                            self.volumes[volume].set_record(record, SKIPPED_RECORD);
+                            return Applied::Unchanged;
+                        }
                         let entry = self.name_ids.len() as u32;
-                        self.names.reserve_small(name.len());
                         reserve_small(&mut self.name_ids, 1);
                         reserve_small(&mut self.parents, 1);
                         reserve_small(&mut self.flags, 1);
-                        let name_id = self.interner.intern(&mut self.names, name.as_bytes());
+                        let name_id = self.add_name(name);
                         self.name_ids.push(name_id);
                         self.parents.push(parent);
                         self.flags.push(basic);
@@ -559,6 +566,12 @@ impl Index {
                 let location = own_location(self, entry, inherited);
                 let e = entry as usize;
                 self.flags[e] = (self.flags[e] & !flags::LOCATION_MASK) | location.to_bits();
+                if matches!(applied, Applied::Created(_))
+                    && self.skip_rules != 0
+                    && skips_contents(self, entry)
+                {
+                    self.flags[e] |= flags::SKIPPED;
+                }
                 self.batch_changed = true;
                 applied
             }
@@ -578,7 +591,7 @@ impl Index {
         }
     }
 
-    /// Drops deleted entries and names nothing refers to anymore.
+    /// Drops deleted entries and unused names, and merges duplicate names.
     pub fn compact(&mut self) {
         let unused_names = !self.names.is_empty() && {
             let mut used = vec![false; self.names.len()];
@@ -589,13 +602,16 @@ impl Index {
             }
             used.iter().any(|u| !u)
         };
-        if self.deleted == 0 && !unused_names {
+        if self.deleted == 0 && !unused_names && self.unmerged_names == 0 {
             return;
         }
 
         let mut remap = vec![NO_PARENT; self.len()];
         let mut name_remap = vec![NO_PARENT; self.names.len()];
         let mut names = NameTable::default();
+        // Only needed while compacting, so it is dropped again at the end.
+        let mut interner = Interner::default();
+        let mut original = String::new();
         let live = self.live_len();
         let mut name_ids = Vec::with_capacity(live);
         let mut flags_out = Vec::with_capacity(live);
@@ -606,11 +622,14 @@ impl Index {
             *new_index = name_ids.len() as u32;
             let old_name = self.name_ids[e] as usize;
             if name_remap[old_name] == NO_PARENT {
-                name_remap[old_name] = names.push_from(&self.names, old_name as u32);
+                original.clear();
+                self.names.write_original(old_name as u32, &mut original);
+                name_remap[old_name] = interner.intern(&mut names, original.as_bytes());
             }
             name_ids.push(name_remap[old_name]);
             flags_out.push(self.flags[e]);
         }
+        drop(interner);
         let mut parents = Vec::with_capacity(live);
         for (e, &new_index) in remap.iter().enumerate() {
             if new_index == NO_PARENT {
@@ -632,42 +651,130 @@ impl Index {
         for volume in &mut self.volumes {
             volume.root = remap[volume.root as usize];
             for slot in &mut volume.record_lookup {
-                if *slot != NO_PARENT {
+                if *slot != NO_PARENT && *slot != SKIPPED_RECORD {
                     *slot = remap[*slot as usize];
                 }
             }
         }
         names.shrink_to_fit();
-        self.interner = Interner::rebuild(&names);
         self.names = names;
         self.name_ids = name_ids;
         self.parents = parents;
         self.flags = flags_out;
         self.deleted = 0;
+        self.unmerged_names = 0;
         self.generation += 1;
     }
 
-    fn from_parts(
-        names: NameTable,
-        name_ids: Vec<u32>,
-        parents: Vec<u32>,
-        flags: Vec<u8>,
-        volumes: Vec<Volume>,
-    ) -> Self {
-        let deleted = flags.iter().filter(|&&f| f & flags::DELETED != 0).count();
+    /// Leaves out the contents of clutter folders such as `node_modules`, `.git`,
+    /// caches, temp folders and Windows component stores. The folders themselves stay
+    /// searchable. Files created inside them later are left out too.
+    pub fn skip_clutter(&mut self) -> SkipReport {
+        const UNKNOWN: u8 = 0;
+        const KEPT: u8 = 1;
+        const INSIDE: u8 = 2;
+        self.skip_rules = SKIP_RULES_VERSION;
+        // For skipped folders and everything inside them: the rule that applied.
+        let mut rule_of = vec![0u8; self.len()];
+        let mut state = vec![UNKNOWN; self.len()];
+        let mut stack = Vec::with_capacity(64);
+        for start in 0..self.len() as u32 {
+            let mut current = Some(start);
+            while let Some(e) = current {
+                if state[e as usize] != UNKNOWN || stack.len() == MAX_DEPTH {
+                    break;
+                }
+                stack.push(e);
+                current = self.parent(e);
+            }
+            while let Some(e) = stack.pop() {
+                let inside = self.parent(e).filter(|&p| {
+                    state[p as usize] == INSIDE || self.flags[p as usize] & flags::SKIPPED != 0
+                });
+                state[e as usize] = match inside {
+                    Some(p) => {
+                        rule_of[e as usize] = rule_of[p as usize];
+                        INSIDE
+                    }
+                    None => {
+                        if let Some(rule) = skip_rule(self, e) {
+                            self.flags[e as usize] |= flags::SKIPPED;
+                            rule_of[e as usize] = rule as u8;
+                        }
+                        KEPT
+                    }
+                };
+            }
+        }
+        let mut removed = 0;
+        let mut by_rule = vec![0usize; RULE_ROOT_SYSTEM + 1];
+        for (e, &s) in state.iter().enumerate() {
+            if s == INSIDE && self.flags[e] & flags::DELETED == 0 {
+                self.flags[e] |= flags::DELETED;
+                by_rule[rule_of[e] as usize] += 1;
+                removed += 1;
+            }
+        }
+        drop(rule_of);
+        self.deleted += removed;
+        for volume in &mut self.volumes {
+            for slot in &mut volume.record_lookup {
+                if *slot != NO_PARENT && *slot != SKIPPED_RECORD && state[*slot as usize] == INSIDE
+                {
+                    *slot = SKIPPED_RECORD;
+                }
+            }
+        }
+        drop(state);
+        self.compact();
+        let mut by_rule: Vec<(String, usize)> = by_rule
+            .into_iter()
+            .enumerate()
+            .filter(|&(_, n)| n > 0)
+            .map(|(rule, n)| (rule_name(rule), n))
+            .collect();
+        by_rule.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        SkipReport { removed, by_rule }
+    }
+
+    fn from_parts(parts: Parts) -> Self {
+        let deleted = parts
+            .flags
+            .iter()
+            .filter(|&&f| f & flags::DELETED != 0)
+            .count();
         Self {
-            interner: Interner::rebuild(&names),
-            names,
-            name_ids,
-            parents,
-            flags,
-            volumes,
+            names: parts.names,
+            name_ids: parts.name_ids,
+            parents: parts.parents,
+            flags: parts.flags,
+            volumes: parts.volumes,
             deleted,
+            unmerged_names: 0,
+            skip_rules: parts.skip_rules,
             generation: 0,
             locations_dirty: false,
             batch_changed: false,
         }
     }
+}
+
+/// What [`Index::skip_clutter`] removed.
+#[derive(Debug)]
+pub struct SkipReport {
+    pub removed: usize,
+    /// Entries removed per folder rule, largest first.
+    pub by_rule: Vec<(String, usize)>,
+}
+
+/// Everything a snapshot stores.
+struct Parts {
+    names: NameTable,
+    name_ids: Vec<u32>,
+    parents: Vec<u32>,
+    flags: Vec<u8>,
+    volumes: Vec<Volume>,
+    skip_rules: u32,
 }
 
 struct PendingVolume {
@@ -823,12 +930,13 @@ impl IndexBuilder {
         self.flags.shrink_to_fit();
         let mut index = Index {
             names: self.names,
-            interner: self.interner,
             name_ids: self.name_ids,
             parents: self.parents,
             flags: self.flags,
             volumes: self.volumes,
             deleted: 0,
+            unmerged_names: 0,
+            skip_rules: 0,
             generation: 0,
             locations_dirty: false,
             batch_changed: false,
@@ -903,6 +1011,102 @@ const USER_CONTENT: &[&[u8]] = &[
     b"music",
     b"onedrive",
 ];
+
+// Folders whose contents are never indexed when clutter is skipped.
+const SKIP_ANYWHERE: &[&[u8]] = &[
+    b"node_modules",
+    b"bower_components",
+    b".git",
+    b".svn",
+    b".hg",
+    b"__pycache__",
+    b"site-packages",
+    b".venv",
+    b".gradle",
+    b".m2",
+    b".npm",
+    b".nuget",
+    b".rustup",
+    b".cache",
+];
+
+// Folders whose contents are skipped only inside system or app-data areas (entries
+// with the Noisy location), where names like "cache" or "temp" are never user files.
+const SKIP_IN_NOISY: &[&[u8]] = &[
+    b"winsxs",
+    b"servicing",
+    b"softwaredistribution",
+    b"installer",
+    b"assembly",
+    b"microsoft.net",
+    b"driverstore",
+    b"prefetch",
+    b"logs",
+    b"temp",
+    b"tmp",
+    b"wer",
+    b"crashpad",
+    b"crashdumps",
+    b"cache",
+    b"caches",
+    b"code cache",
+    b"gpucache",
+    b"cachestorage",
+    b"inetcache",
+    b"webcache",
+    b"shadercache",
+    b"grshadercache",
+    b"graphitedawncache",
+    b"dawncache",
+    b"dawngraphitecache",
+    b"d3dscache",
+    b"service worker",
+    b"indexeddb",
+    b"blob_storage",
+    b"file system",
+    b"package cache",
+];
+
+/// Rule number used for system folders at drive roots; the lists above use lower ones.
+const RULE_ROOT_SYSTEM: usize = SKIP_ANYWHERE.len() + SKIP_IN_NOISY.len();
+
+fn rule_name(rule: usize) -> String {
+    let bytes = if rule < SKIP_ANYWHERE.len() {
+        SKIP_ANYWHERE[rule]
+    } else if rule < RULE_ROOT_SYSTEM {
+        SKIP_IN_NOISY[rule - SKIP_ANYWHERE.len()]
+    } else {
+        b"$... and System Volume Information at drive roots"
+    };
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Which rule, if any, leaves out the contents of folder `entry`.
+fn skip_rule(index: &Index, entry: u32) -> Option<usize> {
+    if !index.is_dir(entry) {
+        return None;
+    }
+    let parent = index.parent(entry)?;
+    let name = index.name_folded(entry);
+    let at_root = index.parent(parent).is_none();
+    if at_root && (name.starts_with(b"$") || name == b"system volume information") {
+        return Some(RULE_ROOT_SYSTEM);
+    }
+    if let Some(i) = SKIP_ANYWHERE.iter().position(|&n| n == name) {
+        return Some(i);
+    }
+    if index.location(parent) == Location::Noisy {
+        return SKIP_IN_NOISY
+            .iter()
+            .position(|&n| n == name)
+            .map(|i| SKIP_ANYWHERE.len() + i);
+    }
+    None
+}
+
+fn skips_contents(index: &Index, entry: u32) -> bool {
+    skip_rule(index, entry).is_some()
+}
 
 fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
     let Some(parent) = index.parent(entry) else {
@@ -1197,9 +1401,137 @@ mod tests {
         assert_eq!(index.volumes()[0].entry_for_record(50), Some(calc));
         assert_eq!(index.volumes()[0].entry_for_record(5), Some(0));
         find(&index, "C:\\code\\app\\node_modules\\index.js");
-        // The interner still works after compaction.
+        // A second calc.exe adds a duplicate name until the next compaction merges it.
         index.apply(0, upsert(51, 20, "calc.exe", false));
         index.end_batch();
+        assert_eq!(index.names().len(), names_before - 1);
+        index.compact();
         assert_eq!(index.names().len(), names_before - 2);
+        assert_eq!(
+            index.name(find(&index, "C:\\Windows\\calc.exe")),
+            "calc.exe"
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_case_variants_apart() {
+        let mut index = sample();
+        index.apply(0, upsert(50, 5, "Report.docx", false));
+        index.apply(0, upsert(51, 5, "report.docx", false));
+        index.end_batch();
+        index.compact();
+        find(&index, "C:\\Report.docx");
+        find(&index, "C:\\report.docx");
+        assert_eq!(index.unmerged_names(), 0);
+    }
+
+    /// C:\Users\bob\AppData\Local\Temp\x.tmp, C:\code\app\node_modules\lib\a.js,
+    /// C:\Windows\WinSxS\big.dll, C:\Windows\notepad.exe, C:\$Recycle.Bin\$R1.txt,
+    /// C:\Users\bob\Documents\cache\notes.txt
+    fn clutter_sample() -> Index {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 5);
+        b.push(10, 5, "Users", true, false);
+        b.push(11, 10, "bob", true, false);
+        b.push(12, 11, "AppData", true, true);
+        b.push(13, 12, "Local", true, false);
+        b.push(14, 13, "Temp", true, false);
+        b.push(15, 14, "x.tmp", false, false);
+        b.push(20, 5, "code", true, false);
+        b.push(21, 20, "app", true, false);
+        b.push(22, 21, "node_modules", true, false);
+        b.push(23, 22, "lib", true, false);
+        b.push(24, 23, "a.js", false, false);
+        b.push(30, 5, "Windows", true, false);
+        b.push(31, 30, "WinSxS", true, false);
+        b.push(32, 31, "big.dll", false, false);
+        b.push(33, 30, "notepad.exe", false, false);
+        b.push(40, 5, "$Recycle.Bin", true, true);
+        b.push(41, 40, "$R1.txt", false, false);
+        b.push(50, 11, "Documents", true, false);
+        b.push(51, 50, "cache", true, false);
+        b.push(52, 51, "notes.txt", false, false);
+        b.end_volume();
+        b.finish()
+    }
+
+    #[test]
+    fn skips_clutter_contents_but_keeps_the_folders() {
+        let mut index = clutter_sample();
+        let report = index.skip_clutter();
+        assert_eq!(report.removed, 5);
+        let count = |rule: &str| {
+            report
+                .by_rule
+                .iter()
+                .find(|(name, _)| name == rule)
+                .map_or(0, |&(_, n)| n)
+        };
+        assert_eq!(count("node_modules"), 2);
+        assert_eq!(count("temp"), 1);
+        assert_eq!(count("winsxs"), 1);
+        assert_eq!(index.skip_rules(), SKIP_RULES_VERSION);
+        for gone in [
+            "C:\\Users\\bob\\AppData\\Local\\Temp\\x.tmp",
+            "C:\\code\\app\\node_modules\\lib",
+            "C:\\code\\app\\node_modules\\lib\\a.js",
+            "C:\\Windows\\WinSxS\\big.dll",
+            "C:\\$Recycle.Bin\\$R1.txt",
+        ] {
+            assert!(try_find(&index, gone).is_none(), "{gone} should be skipped");
+        }
+        for kept in [
+            "C:\\Users\\bob\\AppData\\Local\\Temp",
+            "C:\\code\\app\\node_modules",
+            "C:\\Windows\\WinSxS",
+            "C:\\Windows\\notepad.exe",
+            // "cache" is only clutter inside system or app-data folders.
+            "C:\\Users\\bob\\Documents\\cache\\notes.txt",
+        ] {
+            find(&index, kept);
+        }
+    }
+
+    #[test]
+    fn new_files_inside_skipped_folders_stay_out() {
+        let mut index = clutter_sample();
+        index.skip_clutter();
+        // Directly inside a skipped folder, and inside a subfolder that was skipped.
+        let a = index.apply(0, upsert(60, 22, "b.js", false));
+        let b = index.apply(0, upsert(61, 23, "c.js", false));
+        // A new folder that gets skipped, then a file inside it.
+        let c = index.apply(0, upsert(62, 21, ".git", true));
+        let d = index.apply(0, upsert(63, 62, "HEAD", false));
+        index.end_batch();
+        assert_eq!(a, Applied::Unchanged);
+        assert_eq!(b, Applied::Unchanged);
+        assert!(matches!(c, Applied::Created(_)));
+        assert_eq!(d, Applied::Unchanged);
+        find(&index, "C:\\code\\app\\.git");
+        assert!(try_find(&index, "C:\\code\\app\\.git\\HEAD").is_none());
+        // Deleting a skipped file is harmless, and a normal new file is still indexed.
+        assert_eq!(
+            index.apply(0, Change::Delete { record: 24 }),
+            Applied::Unchanged
+        );
+        index.apply(0, upsert(64, 21, "main.js", false));
+        index.end_batch();
+        find(&index, "C:\\code\\app\\main.js");
+    }
+
+    #[test]
+    fn skipped_state_survives_save_and_load() {
+        let mut index = clutter_sample();
+        index.skip_clutter();
+        let path = std::env::temp_dir().join(format!("bs-skip-{}.bin", std::process::id()));
+        index.save(&path).unwrap();
+        let mut loaded = Index::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(loaded.skip_rules(), SKIP_RULES_VERSION);
+        assert_eq!(loaded.live_len(), index.live_len());
+        assert_eq!(
+            loaded.apply(0, upsert(60, 23, "d.js", false)),
+            Applied::Unchanged
+        );
     }
 }

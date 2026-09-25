@@ -27,6 +27,9 @@ cargo build --release
 # Ignore the saved snapshot and read the drives again.
 .\target\release\bs.exe --rescan
 
+# Also index the contents of clutter folders (skipped by default, see below).
+.\target\release\bs.exe --all
+
 # No admin needed: walk a folder, or generate fake data.
 .\target\release\bs.exe --walk $env:USERPROFILE
 .\target\release\bs.exe --synthetic 5000000 --bench
@@ -38,11 +41,30 @@ In the interactive prompt, type a query to search. Commands:
 |---|---|
 | `:changes` | Show the latest file changes picked up from the journal |
 | `:stats` | Show entry count and memory use |
-| `:save` | Write the snapshot now (it is also saved every 5 minutes and on exit) |
+| `:save` | Write the snapshot now |
+
+Searches always use the live in-memory index. The snapshot on disk only makes the next
+start fast, so it is written rarely: once an hour if something changed, on exit, and when
+the console is closed or Windows logs off or shuts down. Changes made since the last save
+are replayed from the NTFS change journal on the next start.
 
 The snapshot is stored at `%LOCALAPPDATA%\better_search\index.bin`. It is thrown away and
-the drives are read again if a drive's serial number or journal changed, or if too many
-changes were missed while the tool was closed.
+the drives are read again if a drive's serial number or journal changed, if too many
+changes were missed while the tool was closed, or if the clutter setting changed.
+
+Drives without a change journal get one (32 MB, the size Windows uses for the system
+drive), so their snapshot stays valid too.
+
+### Clutter folders
+
+By default the contents of folders no ordinary user searches are left out: `node_modules`,
+`.git`, Python and Rust package folders, and inside system or app-data areas also caches,
+temp folders, logs and Windows component stores such as `WinSxS`. The folders themselves
+stay searchable. New files created inside them are left out too. The full list is in
+`crates/index/src/lib.rs` (`SKIP_ANYWHERE`, `SKIP_IN_NOISY`).
+
+After 60 seconds without a search the index is allowed to leave RAM; the first search after
+that reads it back in.
 
 ## Checks
 

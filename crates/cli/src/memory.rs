@@ -1,7 +1,17 @@
 use windows_sys::Win32::System::ProcessStatus::{
     K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+
+/// Lets Windows move this process's memory out of RAM. It stays reserved and is read
+/// back in on first use, which costs a few hundred milliseconds at most.
+pub fn trim_working_set() {
+    // SAFETY: the pseudo handle needs no closing; (MAX, MAX) is the documented way to
+    // ask for the working set to be trimmed.
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
 
 pub struct ProcessMemory {
     pub private: usize,

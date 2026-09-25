@@ -15,4 +15,4 @@ bs-index = { version = "0.1.0", path = "../index" }
 bs-ntfs = { version = "0.1.0", path = "../ntfs" }
 bs-query = { version = "0.1.0", path = "../query" }
 rayon = "1.12.0"
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

@@ -27,6 +27,9 @@ Usage:
 Options:
   --bench                Run a fixed set of timed queries and exit.
   --rescan               Ignore the saved index and scan the drives again.
+  --all                  Also index the contents of clutter folders (node_modules, .git,
+                         caches, temp folders, Windows component stores). They are
+                         skipped by default; the folders themselves stay searchable.
   -n <COUNT>             Number of results to show (default 20).
   -h, --help             Show this help.
 
@@ -50,6 +53,7 @@ struct Args {
     source: Source,
     bench: bool,
     rescan: bool,
+    all: bool,
     limit: usize,
 }
 
@@ -58,12 +62,14 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
     let mut source = None;
     let mut bench = false;
     let mut rescan = false;
+    let mut all = false;
     let mut limit = 20;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "--bench" => bench = true,
             "--rescan" => rescan = true,
+            "--all" => all = true,
             "-n" => {
                 let value = args.next().ok_or("-n needs a number")?;
                 limit = value
@@ -102,6 +108,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
         source,
         bench,
         rescan,
+        all,
         limit,
     }))
 }
@@ -121,7 +128,7 @@ fn main() -> ExitCode {
 
     let started = Instant::now();
     let live = matches!(args.source, Source::Ntfs(_));
-    let (index, saved) = match build_index(&args.source, args.rescan) {
+    let (index, saved) = match build_index(&args.source, args.rescan, !args.all) {
         Ok(result) => result,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -138,6 +145,7 @@ fn main() -> ExitCode {
         run_bench(&shared.index.read().unwrap(), args.limit);
     } else {
         if live {
+            live::save_on_exit(&shared);
             live::start_background(&shared);
             println!("Live updates are on: new, renamed and deleted files show up right away.");
         }
@@ -150,7 +158,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn build_index(source: &Source, rescan: bool) -> Result<(Index, bool), String> {
+fn build_index(source: &Source, rescan: bool, skip_clutter: bool) -> Result<(Index, bool), String> {
     let mut builder = IndexBuilder::new();
     match source {
         Source::Ntfs(requested) => {
@@ -162,7 +170,7 @@ fn build_index(source: &Source, rescan: bool) -> Result<(Index, bool), String> {
             if letters.is_empty() {
                 return Err("no fixed NTFS drives found".into());
             }
-            return live::load_or_scan(&letters, rescan);
+            return live::load_or_scan(&letters, rescan, skip_clutter);
         }
         Source::Walk(folder) => {
             let t = Instant::now();
@@ -174,6 +182,11 @@ fn build_index(source: &Source, rescan: bool) -> Result<(Index, bool), String> {
                 fmt_count(count),
                 fmt_duration(t.elapsed())
             );
+            let mut index = builder.finish();
+            if skip_clutter {
+                live::skip(&mut index);
+            }
+            return Ok((index, false));
         }
         Source::Synthetic(count) => {
             let t = Instant::now();
@@ -218,11 +231,10 @@ fn print_stats(index: &Index, elapsed: Option<Duration>) {
         per_entry(usage.total())
     );
     println!(
-        "    names {} · entries {} · change lookup {} · name lookup {}",
+        "    names {} · entries {} · change lookup {}",
         fmt_bytes(usage.name_bytes),
         fmt_bytes(usage.entry_bytes),
-        fmt_bytes(usage.lookup_bytes),
-        fmt_bytes(usage.interner_bytes)
+        fmt_bytes(usage.lookup_bytes)
     );
     if let Some(mem) = memory::process_memory() {
         println!(
@@ -274,6 +286,7 @@ fn interactive(shared: &Shared, limit: usize, live: bool) {
         let Some(query) = Query::parse(input) else {
             continue;
         };
+        shared.touch();
 
         let index = shared.index.read().unwrap();
         let t = Instant::now();
@@ -433,12 +446,21 @@ mod tests {
 
     #[test]
     fn parses_options() {
-        let args = parse(&["--synthetic", "1_000", "--bench", "--rescan", "-n", "5"])
-            .unwrap()
-            .unwrap();
+        let args = parse(&[
+            "--synthetic",
+            "1_000",
+            "--bench",
+            "--rescan",
+            "--all",
+            "-n",
+            "5",
+        ])
+        .unwrap()
+        .unwrap();
         assert!(matches!(args.source, Source::Synthetic(1000)));
         assert!(args.bench);
         assert!(args.rescan);
+        assert!(args.all);
         assert_eq!(args.limit, 5);
     }
 

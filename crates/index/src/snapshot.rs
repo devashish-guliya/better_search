@@ -9,10 +9,10 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
-use crate::{Index, NO_PARENT, NameTable, SyncPoint, Volume};
+use crate::{Index, NO_PARENT, NameTable, Parts, SKIPPED_RECORD, SyncPoint, Volume};
 
 const MAGIC: &[u8; 4] = b"BSIX";
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const COMPRESSION_LEVEL: i32 = 3;
 /// Refuse absurd lengths from a corrupt file instead of trying to allocate them.
 const MAX_LEN: u64 = 1 << 32;
@@ -69,9 +69,10 @@ impl Index {
     }
 
     fn write_body(&self, w: &mut impl Write) -> io::Result<()> {
+        write_u32(w, self.skip_rules)?;
         write_bytes(w, &self.names.folded)?;
         write_u64s(w, &self.names.upper)?;
-        write_u32s(w, &self.names.offsets)?;
+        write_u32s_delta(w, &self.names.offsets)?;
         write_u32s(w, &self.name_ids)?;
         write_u32s(w, &self.parents)?;
         write_bytes(w, &self.flags)?;
@@ -89,7 +90,7 @@ impl Index {
                 }
                 None => w.write_all(&[0])?,
             }
-            write_u32s(w, &v.record_lookup)?;
+            write_u32s_delta(w, &v.record_lookup)?;
         }
         Ok(())
     }
@@ -118,9 +119,10 @@ impl Index {
 }
 
 fn read_body(r: &mut impl Read) -> Result<Index, SnapshotError> {
+    let skip_rules = read_u32(r)?;
     let folded = read_bytes(r)?;
     let upper = read_u64s(r)?;
-    let offsets = read_u32s(r)?;
+    let offsets = read_u32s_delta(r)?;
     let name_ids = read_u32s(r)?;
     let parents = read_u32s(r)?;
     let flags = read_bytes(r)?;
@@ -145,7 +147,7 @@ fn read_body(r: &mut impl Read) -> Result<Index, SnapshotError> {
             }),
             _ => return Err(SnapshotError::Invalid("volume sync tag")),
         };
-        let record_lookup = read_u32s(r)?;
+        let record_lookup = read_u32s_delta(r)?;
         volumes.push(Volume {
             label,
             root,
@@ -161,7 +163,14 @@ fn read_body(r: &mut impl Read) -> Result<Index, SnapshotError> {
         offsets,
     };
     validate(&names, &name_ids, &parents, &flags, &volumes)?;
-    Ok(Index::from_parts(names, name_ids, parents, flags, volumes))
+    Ok(Index::from_parts(Parts {
+        names,
+        name_ids,
+        parents,
+        flags,
+        volumes,
+        skip_rules,
+    }))
 }
 
 fn validate(
@@ -210,7 +219,7 @@ fn validate(
         }
         if v.record_lookup
             .iter()
-            .any(|&e| e != NO_PARENT && e as usize >= entries)
+            .any(|&e| e != NO_PARENT && e != SKIPPED_RECORD && e as usize >= entries)
         {
             return Err(invalid("volume records"));
         }
@@ -243,6 +252,34 @@ fn write_u32s(w: &mut impl Write, values: &[u32]) -> io::Result<()> {
         w.write_all(&buf)?;
     }
     Ok(())
+}
+
+/// Writes each value as the difference to the one before. Used for arrays that mostly
+/// count upwards, which turns them into long runs of small numbers that compress about
+/// ten times better.
+fn write_u32s_delta(w: &mut impl Write, values: &[u32]) -> io::Result<()> {
+    write_u64(w, values.len() as u64)?;
+    let mut buf = Vec::with_capacity(CHUNK * 4);
+    let mut prev = 0u32;
+    for chunk in values.chunks(CHUNK) {
+        buf.clear();
+        for &v in chunk {
+            buf.extend(v.wrapping_sub(prev).to_le_bytes());
+            prev = v;
+        }
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+fn read_u32s_delta(r: &mut impl Read) -> Result<Vec<u32>, SnapshotError> {
+    let mut values = read_u32s(r)?;
+    let mut prev = 0u32;
+    for v in &mut values {
+        prev = prev.wrapping_add(*v);
+        *v = prev;
+    }
+    Ok(values)
 }
 
 fn write_u64s(w: &mut impl Write, values: &[u64]) -> io::Result<()> {
@@ -392,11 +429,14 @@ mod tests {
         );
         loaded.end_batch();
         find(&loaded, "C:\\code\\index.js");
+        assert_eq!(loaded.unmerged_names(), 1);
+        loaded.compact();
         assert_eq!(
             loaded.names().len(),
             names,
-            "existing name should be reused"
+            "duplicate name should be merged"
         );
+        find(&loaded, "C:\\code\\index.js");
     }
 
     #[test]
