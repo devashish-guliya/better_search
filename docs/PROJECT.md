@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `913618b` ("Detect clutter folders on any PC").
+Last updated after commit `9c479c7` ("Background service, named pipe and per-user privacy").
 
 ---
 
@@ -39,23 +39,33 @@ Out of scope: searching file **contents**. Only names are searched.
 | `4b12a23` | Clutter skipping, smaller snapshot (delta coding), hourly save, idle memory trim |
 | `aca0454` | Sorted record lookup, non-blocking compaction, name table restored, "unknown parent → ignore" rule |
 | `913618b` | Clutter detection that works on any PC: tool-only names, project-confirmed names, self-labelled folders |
+| `9c479c7` | Phase 3 steps 1-5: engine crate, `bs-service.exe` (SCM), named pipe, per-user privacy, `bs query` |
 
 ## 4. Current results on the development machine
 
-Measured with an elevated run of `bs --bench` after `913618b`:
+Measured with an elevated run of `bs --bench` and of the service after `9c479c7`:
 
 | Measure | Value |
 |---|---|
-| Files and folders scanned | 3,978,539 |
-| Kept in the index (clutter skipped) | 608,982 (85% skipped) |
-| First full scan | about 35 s (C: 12.8 s, D: 19.5 s, E: 1.5 s; the HDD is the limit) |
-| Normal start (load snapshot + catch up) | 60 ms |
-| Index memory | 18.4 MB (names 8.7, entries 5.2, change lookup 2.3, name lookup 2.2) |
-| Process private memory | about 20 MB |
-| Snapshot on disk | 4.5 MB, saved in about 0.2 s |
-| Typical search | 0.7–1.3 ms |
-| Single-letter search (worst case) | 5–7 ms |
-| Idle CPU | 0 |
+| Files and folders scanned | 3,981,149 |
+| Kept in the index (clutter skipped) | 609,686 (85% skipped) |
+| Entries hidden by clutter rules | 3,371,463 (node_modules 2.1 M, System Volume Information 255 K, winsxs 206 K, ...) |
+| First full scan | about 53 s under the service (C: 20.7 s, D: 29.4 s, E: 2.2 s; the HDD is the limit) |
+| Normal start (load snapshot + catch up) | 134 ms load plus 13 ms catch-up under the service; 158 ms for `bs` |
+| Index memory | 18.8 MB (names 8.9, entries 5.3, change lookup 2.3, name lookup 2.2) |
+| Privacy map | 0.6 MB, built in 7 ms (once per index state), extended in 0.2 ms (per change) |
+| Service process memory | 21-22 MB private at ready, 25 MB working set |
+| Snapshot on disk | 4.5 MB, saved in 270-530 ms |
+| Search through the pipe | 0.6-1.1 ms (readme, notepad, "config json"), 3.0-3.4 ms (png), 9-11 ms (single letter "e") |
+| Pipe overhead | 0.1-0.2 ms over a search; a connection costs 0.2 ms |
+| Typing a word | first keystroke 7-11 ms, 1-2 ms from the fourth letter on (under 1 ms for long words with few matches) |
+| Idle CPU | 0 while nothing changes on the drives; 359 ms per 90 s while builds and file changes were happening (journal updates, by design) |
+| Service stop (save included) | 680 ms; restart to ready 319 ms |
+
+The machine state moves these numbers by up to 25%: an earlier bench of the same index gave
+"e" 7.1 ms and a 60 ms start, and the same binary gave 8.9 ms and 158 ms in a later run
+while the editor and this session were also running. Compare runs within one session
+rather than across sessions.
 
 History of the main numbers, to show what each change bought:
 
@@ -65,19 +75,23 @@ History of the main numbers, to show what each change bought:
 | `4b12a23` (clutter skipped) | 35 MB | 7.1 MB | 0.15 s | 2–3 ms |
 | `aca0454` (sorted lookup, name table back) | 23.5 MB | 6.4 MB | 87 ms | 1.2–1.9 ms |
 | `913618b` (universal clutter rules) | 18.4 MB | 4.5 MB | 60 ms | 0.7–1.3 ms |
+| `9c479c7` (service, pipe, privacy) | 18.8 MB | 4.5 MB | 134 ms (service) | 0.6–1.1 ms plus 0.1–0.2 ms pipe |
 
 ---
 
 ## 5. Architecture
 
-A Cargo workspace with four crates:
+A Cargo workspace with seven crates:
 
 | Crate | Package | Purpose |
 |---|---|---|
 | `crates/ntfs` | `bs-ntfs` | Reads NTFS volumes: full file list and the change journal |
 | `crates/index` | `bs-index` | The compact in-memory index, clutter rules, snapshot format |
 | `crates/query` | `bs-query` | Ranked, parallel, case-insensitive name search |
-| `crates/cli` | `bs-cli` (binary `bs`) | Console prototype: load/scan, live updates, saving, interactive search, benchmarks |
+| `crates/engine` | `bs-engine` | Keeps the index loaded, current and saved; per-user profile map |
+| `crates/pipe` | `bs-pipe` | Message format of the service's named pipe, and a client for it |
+| `crates/service` | `bs-service` (binary `bs-service.exe`) | Background service: owns the index, answers searches |
+| `crates/cli` | `bs-cli` (binary `bs`) | Console tools: index and search locally, `bs query` through the service |
 
 Dependencies are deliberately few: `windows-sys` (raw Win32 bindings), `hashbrown`,
 `zstd`, `memchr`, `rayon`. Release profile: `opt-level=3`, LTO, one codegen unit,
@@ -167,6 +181,14 @@ deleted entries and unused names, puts entries back in record order, and merges
 `recent` into `sorted`. It takes about 0.2 s on the real index. `needs_compaction()` is
 true when `(deleted + renames + recent) × 50 ≥ max(live, 1000)`, which is about 2%
 garbage.
+
+**Users epoch.** `Index::users_epoch()` counts changes that can move a result between
+users' profile folders, plus compactions (which renumber entries). The service's
+privacy map is rebuilt when it changes and extended otherwise, so the map costs
+something only when ownership really changed. Inside `apply`, that means: a users
+folder or a profile folder (`<drive>\Users\<name>`) was created, renamed, moved or
+deleted, or an entry entered, left or moved between users folders. Everything else
+(a new file inside a profile folder, for example) inherits its owner and costs nothing.
 
 ### 5.3 Clutter skipping
 
@@ -265,13 +287,19 @@ the `SKIPPED` flag; nothing below it is in the index.
   lower entry number, so results are deterministic.
 - **Type-ahead narrowing (`Session`):** when the new query only adds characters to the
   previous one, only the names that matched before are re-checked. The cache resets when
-  the index `generation` changes.
+  the index `generation` changes. Narrowing keeps a match list only up to 8192 names:
+  re-checking remembered names costs about 80 ns each (a per-name call), while the SIMD
+  scan over the whole name buffer costs about 5 ns per name, so long lists are cheaper
+  to search from scratch. Match lists are also only built when they are going to be
+  kept (`collect_matches`), so a broad query in a session runs at the same speed as a
+  fresh one, and the service does not allocate megabytes per keystroke per client.
 - **Zero-match early exit:** if no name matches, pass 2 is skipped.
 - Parallelism: `rayon`.
 
 ### 5.5 Snapshot (`crates/index/src/snapshot.rs`)
 
-- Path: `%LOCALAPPDATA%\better_search\index.bin`.
+- Path: `%LOCALAPPDATA%\better_search\index.bin` for the console tool;
+  `%ProgramData%\better_search\index.bin` for the service (see 5.7).
 - Format **version 3**: 8-byte header (`BSIX` + version), then one zstd stream (level 3,
   with frame checksum) holding: skip rules version, name buffer, uppercase bitmask,
   name offsets (delta-coded), name IDs, parents, flags, and per volume: label, root,
@@ -289,7 +317,130 @@ the `SKIPPED` flag; nothing below it is in the index.
 - On load, changes since the saved position are replayed from each drive's journal
   ("catch up"), which takes a few milliseconds.
 
-### 5.6 The console tool (`bs`, `crates/cli`)
+### 5.6 The engine (`crates/engine`)
+
+Both the console tool and the service are thin shells around `Engine`. It owns the
+index, keeps it current, saves it and serves searches:
+
+- `Config` chooses the drives (or a walk folder), the snapshot path, the skip rules and
+  the save interval. A `Log` callback (an `Arc<dyn Fn(&str)>`) replaces printing, so the
+  console tool prints and the service writes to its log file; the crates never print.
+- `Engine::open` scans and builds; `Engine::from_index` loads a snapshot and catches up
+  from the journals; `start` spawns the watcher and saver threads; `read` runs a search
+  (`Session::search_filtered` when the service passes a privacy filter); `touch` runs
+  the maintenance that a search should wait behind; `save` and `shutdown` stop it all.
+- `shutdown` must be able to interrupt a journal read that is blocked in the kernel, and
+  a blocked `ReadFile` cannot be asked to stop. Each watcher therefore registers its
+  current journal handle and thread id, and `shutdown` cancels the read with
+  `CancelSynchronousIo`. That is why a service stop is fast (a few hundred ms) instead
+  of waiting for the read timeout.
+- **Shared state:** `Shared` holds the index in an `RwLock`. Searches take a read lock.
+- One **watcher thread per drive** follows its journal and applies changes in batches
+  under the write lock.
+- A **maintenance mutex** is taken by writers and by the saver before the write lock.
+  So while a long read-locked job runs (compaction or save), no writer is queued on the
+  `RwLock`. A queued writer would make new searches wait.
+- **Saver thread:** wakes every 15 s. Saves once an hour if anything changed. When
+  saving, it first compacts if `needs_compaction()`: builds the clean copy under a read
+  lock, swaps it in under a brief write lock, and frees the old copy outside the lock.
+- **Idle trim:** after 60 s without a search, `EmptyWorkingSet` lets Windows page the
+  index out of RAM; the first search after that reads it back.
+- No save at process exit in the console tool, but `:q` calls `shutdown(true)`, which
+  saves first. The service saves on stop and skips the save on a machine shutdown
+  (`shutdown(false)`), see 5.7. Anything missed is replayed from the journal at the next
+  start.
+
+### 5.7 The service (`bs-service.exe`, `crates/service`)
+
+```
+bs-service.exe            Run as a service (started by the SCM)
+bs-service.exe --console  Same thing in a terminal, for testing
+```
+
+- Registered as a service with the SCM (Windows service control manager), so it starts
+  at boot as **LocalSystem** and needs no user session. `StartServiceCtrlDispatcherW` is
+  called from `main`; the SCM handler accepts `STOP` (save, then exit) and
+  `SHUTDOWN` (exit without a save, because the machine is going down anyway) and reports
+  `SERVICE_STOP_PENDING` with a wait hint while it saves, so an installer or the user
+  never sees "did not respond".
+- The data folder is `%ProgramData%\better_search`. It is created (or re-secured) on
+  every start with an explicit DACL: SYSTEM and administrators full control, a
+  **protected** DACL (no inherited entries), and it is owned by SYSTEM. Other users
+  cannot list or read the folder, so the index (all file names on the machine) is not
+  readable by a normal user; this was verified from a non-elevated shell.
+- Log: `%ProgramData%\better_search\service.log`, one line per event with a timestamp,
+  rotated at about 1 MB keeping one old copy. It records single lines only: start,
+  per-drive scan results, skipped-entry summary, save, ready, one line per client
+  (user SID and profile path), stop, errors. Queries are not logged.
+- While the index loads or scans, searches answer `Status::Loading` and the client says
+  "the index is still loading", instead of failing. Installation state (first full scan)
+  is the only time this happens for more than a moment.
+- The console mode exists so the service can be tested end to end without registering
+  it. Registering a service is a machine-wide change, so it is always done with the
+  user's approval; during development the scripts in `target/admin_run` used a
+  temporary `better_search_dev` service and deleted it afterwards.
+
+### 5.8 The named pipe (`crates/pipe`)
+
+- Name: `\\.\pipe\better_search`. One message per request and reply, message mode, so a
+  client cannot read a partial reply; remote clients are rejected
+  (`PIPE_REJECT_REMOTE_CLIENTS`).
+- **Who may connect:** the pipe's security descriptor allows `SYSTEM`,
+  `BUILTIN\Administrators` and `INTERACTIVE` (each logged-on interactive user), and
+  denies a network logon outright. Users get read and write (query text in, reply out)
+  but **not** `FILE_CREATE_PIPE_INSTANCE`, so a program started by a user cannot create
+  its own `\\.\pipe\better_search` instance and impersonate the service (tested:
+  creating the pipe as a normal user is refused). The service also creates its first
+  instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`, which fails if anyone got there first.
+- **Request:** version, kind, limit (capped at 1000 hits), length-prefixed UTF-8 query.
+  **Reply:** status (`Ok`, `Loading`, `BadRequest`), total match count, then up to `limit`
+  hits of `id, parent record, flags, size, modified time, name`. Little endian, fixed
+  layout, size-checked on both sides, with round-trip and truncation tests. The protocol
+  version is checked on connect.
+- **Client** (`bs-pipe`): connects, then `TransactNamedPipe` per query, reading the rest
+  of a reply if it did not fit in one buffer (`ERROR_MORE_DATA` handshake), retrying on
+  `ERROR_PIPE_BUSY` for a few seconds. Overhead measured from the console tool:
+  0.1-0.2 ms per query (connection 0.2 ms), against a service-side search of 0.6-11 ms.
+
+### 5.9 Per-user privacy (`crates/engine/src/profiles.rs`)
+
+The point: a normal user must not see file names in other users' profile folders, and
+administrators are filtered the same way, because Windows accounts can be switched
+without the service noticing.
+
+- **Who is asking:** on each connection the service calls `ImpersonateNamedPipeClient`
+  at **identification** level (enough to read the token, not enough to act as the user),
+  opens the thread token, reads the SID, then looks up
+  `ProfileList\<SID>\ProfileImagePath` in the registry to get the profile folder. The
+  token is read once per connection and the connection then serves many queries, as the
+  search window will. Any failure to read the token fails the connection (fail closed),
+  and only the user's SID and profile path are kept in memory.
+- **The map** (`Profiles`): one byte per index entry. The byte is a slot number: 0 means
+  "no profile owns this", 1-253 are distinct profile folder names (every folder directly
+  inside a `Users` folder at a drive root), 254 means the machine has more profile folder
+  names than slots (those folders stay hidden) and 255 is "not classified yet", which
+  only exists while the map is being built. A user is allowed the slot named `public` and
+  the slot named after their own profile folder.
+- **Judging an entry:** by its **parent's** slot, not its own. So `C:\Users` is visible,
+  the profile folder itself is visible (its parent is `C:\Users`), and everything below
+  it is hidden. A folder that happens to have the caller's profile name on another drive
+  is visible too, which is what a user expects when they search for a folder name and
+  matches how Windows treats user folders that were once that user's profile. A profile
+  folder renamed to something else stops being treated as the owner's, and hidden entries
+  cannot leak through a parent in another profile's tree.
+- **Where it applies:** the filter runs inside pass 2 of the search
+  (`search_filtered`), not on the finished hits. Hidden entries are therefore missing
+  from both the hits and the match count, so "1,673 matches" means 1,673 matches the
+  caller is allowed to see, not a first page with a padded number behind it.
+- **Cost:** the check is one byte read per entry considered, about 0.2-0.6 ms on the
+  real index; the map builds in 7 ms (0.6 MB). Builds happen only when
+  `users_epoch()` changes (see 5.2) and are extensions otherwise (0.2 ms), so the map is
+  built about once per service run. On the real index, the console tool (map for
+  `C:\Users\hp`) hid 77 of the 351,791 matches for `e` (the machine's `Default` profile)
+  at no measurable cost, and through the service a `ntuser` search returned no hits from
+  `C:\Users\Default` while the caller's own files stayed visible.
+
+### 5.10 The console tool (`bs`, `crates/cli`)
 
 ```
 bs                     Index all fixed NTFS drives (needs "Run as administrator")
@@ -299,27 +450,19 @@ bs --synthetic <N>     N generated fake entries, for benchmarking
 --bench                Run a fixed set of timed queries and exit
 --rescan               Ignore the snapshot and read the drives again
 --all                  Do not skip clutter
+-n <COUNT>             Number of results to show (default 20)
+bs query <TEXT>        Search through the running service (see 5.8)
+bs query --bench       Measure round trip, service time and overhead through the pipe
 ```
 
-Interactive prompt: type to search; `:changes` shows recent journal changes, `:stats`
-shows memory use, `:save` writes the snapshot, an empty line or `:q` quits.
-
-Runtime behaviour (`crates/cli/src/live.rs`):
-
-- `Shared` holds the index in an `RwLock`. Searches take a read lock.
-- One **watcher thread per drive** follows its journal and applies changes in batches
-  under the write lock.
-- A **maintenance mutex** is taken by writers and by the saver before the write lock.
-  So while a long read-locked job runs (compaction or save), no writer is queued on the
-  `RwLock`. A queued writer would make new searches wait.
-- **Saver thread:** wakes every 15 s. Saves once an hour if anything changed, and on a
-  normal quit. When saving, it first compacts if `needs_compaction()`: builds the clean
-  copy under a read lock, swaps it in under a brief write lock, and frees the old copy
-  outside the lock.
-- **Idle trim:** after 60 s without a search, `EmptyWorkingSet` lets Windows page the
-  index out of RAM; the first search after that reads it back.
-- No save at shutdown or logoff (no console control handler). Missed changes are
-  replayed from the journal at the next start.
+`bs` uses the same engine as the service, with the snapshot in `%LOCALAPPDATA%` and no
+privacy filter (the user started it, so it is their own data; the service exists so a
+search does not need admin rights at all). Interactive prompt: type to search;
+`:changes` shows recent journal changes, `:stats` shows memory use, `:save` writes the
+snapshot, an empty line or `:q` quits (and saves). Benchmarks and progress lines are
+silent under `--bench` so the numbers are not disturbed. `bs query` needs no admin
+rights: it prints the same hits the service would return, with `-n` to change the limit,
+and reports a clear message when the service is not running.
 
 ---
 
@@ -344,6 +487,20 @@ Runtime behaviour (`crates/cli/src/live.rs`):
 | zstd level 3 with delta coding | Small file (4.5 MB) and fast save/load |
 | Idle working-set trim after 60 s | Near-zero RAM footprint when not in use (user's choice) |
 | No parallel scan, no results during the first scan, no single-letter index | Rejected by the user: complexity and memory for rare cases |
+| Engine as a library (`bs-engine`), shells only print | Both the service and the console tool need the same behaviour; a log callback keeps the library testable and the service quiet |
+| Service runs as LocalSystem | It needs MFT and journal access at boot, before any user logs in; the user installs once |
+| Machine-wide snapshot in `%ProgramData%` with its own protected DACL | The service runs as SYSTEM, so the index must not be readable by users; a protected DACL resists later changes |
+| Cancel a blocked journal read instead of a stop flag | A blocked `ReadFile` never checks a flag; `CancelSynchronousIo` makes a stop take milliseconds |
+| "Loading" replies instead of refusing connections | The first full scan takes about a minute; a client should be told to wait, not fail |
+| Named pipe with a message protocol, remote clients rejected | Local only (locked in), and message mode removes partial-read bugs from the first version |
+| `INTERACTIVE` users get read/write but no `FILE_CREATE_PIPE_INSTANCE` | A user cannot serve a fake pipe and see another user's queries; also blocks squatting |
+| Per-user privacy inside the search pass (a filter), not after it | Hidden entries must be missing from the match count too, otherwise the number is a lie |
+| Privacy by profile folder, not by file ownership | Ownership is not printed in results and would need an ACL read per entry; the folder is the unit users think in |
+| The caller's SID and profile path only, read at identification level | Reading a token is not acting as the user; identification level cannot do anything else |
+| Rebuild the privacy map on a users epoch, not on every change | A rebuild costs 7 ms; the epoch separates "a file appeared in a profile" from "a profile moved" |
+| Narrowing cap at 8192 names | Re-checking remembered names costs about 80 ns each, the SIMD scan about 5 ns per name: long lists are cheaper to search fresh |
+| Do not narrow the privacy map by caller | One index serves all users; a per-user map would double the memory and the rebuild cost for a filter that already costs under a millisecond |
+| `bs query` in the existing console tool, not a new binary | Keeps one small tool; the pipe client is in `bs-pipe` so the UI can reuse it |
 
 ## 7. Locked in (do not change without discussing)
 
@@ -358,8 +515,18 @@ Runtime behaviour (`crates/cli/src/live.rs`):
 - Compaction policy (about 2%, non-blocking).
 - Save policy (hourly plus normal quit; no shutdown handler).
 - Idle trim after 60 s.
-- Snapshot at `%LOCALAPPDATA%\better_search\index.bin`, format v3 (bump `VERSION` when
-  the format changes).
+- Snapshot at `%LOCALAPPDATA%\better_search\index.bin` for the console tool, format v3
+  (bump `VERSION` when the format changes); `%ProgramData%\better_search\index.bin` with
+  its protected SYSTEM + administrators DACL for the service.
+- The service runtime: LocalSystem, started by the SCM, machine-wide data folder,
+  log file at 1 MB with one old copy, `--console` for testing, "loading" replies while
+  the index is not ready, save on stop and no save on shutdown.
+- The pipe: `\\.\pipe\better_search`, message-mode protocol version 1, limit capped at
+  1000 hits, remote clients rejected, `INTERACTIVE` users may read and write but not
+  create instances.
+- Privacy: hide the contents of other users' profile folders (`<drive>\Users\<name>`)
+  from results **and** match counts, for administrators too; the profile folder itself
+  stays visible only under its current name; `C:\Users\Public` is shared.
 - UI requirements: tray icon, Alt+Space hotkey, right-edge hover zone with a slide-in panel.
 - Decided for Phase 3 (see below): background service first; hide other users' private
   folders from each user; include removable non-NTFS drives (as the last step of
@@ -369,11 +536,17 @@ Runtime behaviour (`crates/cli/src/live.rs`):
 
 ## 8. Next phases
 
-### Phase 3: background service (next)
+### Phase 3: background service (steps 1-5 done at `9c479c7`)
 
 **Goal:** the index lives in a Windows service that starts with Windows. The search
 window (Phase 4) talks to it and needs no admin rights, so there is no UAC prompt except
 once at install.
+
+**Status:** steps 1-5 are built and verified end to end, with an elevated temporary
+service (`target\admin_run\run8.ps1` to `run11.ps1`), a non-elevated client and the
+release binaries. Steps 6 (removable non-NTFS drives) and 7 (final measurements at the
+end of the phase) remain. The step text below is the plan as it was written; where the
+result differed, the difference is noted.
 
 **Steps:**
 
@@ -393,7 +566,9 @@ once at install.
    - The snapshot moves to a machine-wide location such as
      `%ProgramData%\better_search\index.bin`, readable only by SYSTEM and administrators
      (it contains all users' file names).
-   - Logs to a small rotating file or the Windows event log.
+   - Logs to a small rotating file at 1 MB with one old copy, next to the snapshot
+     (chosen over the event log: the per-drive scan lines and the skipped-entry summary
+     stay readable).
    - A console mode (for example `bs-service --console`) for debugging without
      installing.
 3. **Local connection (named pipe).**
@@ -403,8 +578,11 @@ once at install.
    - A small binary protocol: request = query text + result limit (+ options such as
      "include skipped folders" later); response = total match count + the best results
      (full path, is-folder flag, score). Results are capped so replies stay small.
-   - Several clients at once; one thread per connection or overlapped I/O.
-   - Target: well under 1 ms added to a search.
+   - Several clients at once; one thread per connection or overlapped I/O. Done with a
+     blocking thread per connection (8 concurrent clients were answered in 11-17 ms
+     each); overlapped I/O can come later if many clients ever matter.
+   - Target: well under 1 ms added to a search. **Measured: 0.1-0.2 ms**, connection
+     0.2 ms.
 4. **Per-user privacy.**
    - The service identifies the caller with `ImpersonateNamedPipeClient` /
      `GetNamedPipeClientProcessId` and the caller's token (user SID, profile path).
@@ -412,8 +590,14 @@ once at install.
      Administrators get the same filtering by default.
    - Possible later: also hide folders whose permissions deny that user (checking
      permissions per result with `AccessCheck`).
+   - Built as described in 5.9: impersonation at **identification** level is enough (the
+     plan did not say which level), the profile path comes from
+     `ProfileList\<SID>\ProfileImagePath` in the registry, and a test on the real index
+     hid 77 of 351,791 `e` matches (the machine's `Default` profile) from a normal user.
 5. **Test client.** `bs query "text"` (or a small separate tool) sends a query through
    the pipe and prints the results, so everything can be tested without the UI.
+   Built as `bs query` inside the existing tool, with `--bench` for round trip, service
+   time and overhead, and `-n` for the limit.
 6. **Removable non-NTFS drives (FAT, FAT32, exFAT: USB sticks, SD cards).**
    - Indexed on plug-in by walking folders (`FindFirstFileExW` with
      `FIND_FIRST_EX_LARGE_FETCH`, `FindExInfoBasic`); kept current with
@@ -432,7 +616,17 @@ once at install.
 so ask the user before registering it. Use a clearly named temporary service (for
 example `better_search_dev`) created with `sc.exe create` from an elevated test script,
 and delete it (`sc.exe stop` + `sc.exe delete`) at the end of every test run, until
-Phase 5 provides a real installer.
+Phase 5 provides a real installer. This pattern worked at `9c479c7` (scripts
+`target\admin_run\run8.ps1` to `run11.ps1`): each script registered the temporary
+service, ran the console tool and the service, exercised the pipe from the same elevated
+session or from a separate non-elevated one, deleted the service and the data folder,
+and wrote its results to text files. Two things to watch:
+
+- Run one script at a time and wait for its UAC prompt: approving a later prompt starts
+  the second copy while the first is still running, and the two fight over the service
+  and the port-like pipe name.
+- Check that the service and `C:\ProgramData\better_search` are gone (as the user asked)
+  before the next run, and start from a clean state.
 
 ### Phase 4: search window
 
@@ -482,20 +676,27 @@ Phase 5 provides a real installer.
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  At `913618b`: 53 workspace tests pass (index crate 30, query crate 16, 7 in the other
-  crates), clippy clean.
+  At `9c479c7`: 69 workspace tests pass (index crate 30, query crate 17, engine crate 7,
+  pipe crate 5, ntfs crate 3, cli crate 3, service crate 2), clippy clean, release build
+  produced `bs.exe`, `bs-service.exe` and the example at about 1 MB each.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList
   '-ExecutionPolicy','Bypass','-File','<script>'`, writing results to text files that are
-  read afterwards. The user approves each UAC prompt. Latest scripts: `run6.ps1` (rescan
-  plus live test), `run7.ps1` (live marker test).
+  read afterwards. The user approves each UAC prompt, one script at a time (see the
+  Phase 3 note above). Latest scripts: `run11.ps1` (final `bs --bench`), `run10.ps1`
+  (privacy and live tests through the service), `run9.ps1` (first service-only run),
+  `run8.ps1` (scan plus bench); their `*.txt` outputs carry the numbers quoted in
+  section 4.
 - **Live tests must run outside `D:\better_search\target`:** that folder sits next to
   `Cargo.toml`, so the clutter rules skip it. Use a folder such as `D:\bsprobe_live` and
   delete it afterwards.
 - **Shell:** Windows PowerShell 5.1. No `&&` / `||`; use `;` and `$LASTEXITCODE`. Run
   cargo through `cmd /c "... 2>&1"` so stderr output does not produce a false error
-  exit code.
+  exit code. Two PowerShell traps hit in practice: `r` is an alias for `Invoke-History`
+  (a one-letter report function silently swallowed its output), and PowerShell quoting
+  mangles the `binPath= "..."` argument of `sc.exe create`, so pass the binary path
+  unquoted or build the argument list as an array.
 - **Commits:** write the message to `.git\COMMIT_DRAFT.txt`, run
   `git -C D:\better_search commit -q -F .git\COMMIT_DRAFT.txt` in a separate step, then
   delete the draft. Messages end with

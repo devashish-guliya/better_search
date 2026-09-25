@@ -2,9 +2,11 @@
 
 Very fast file and folder name search for Windows.
 
-The current prototype is a command-line tool. It reads the file list of NTFS drives directly,
-builds a compact in-memory index and searches it. It then follows the NTFS change journal
-so the index stays current, and saves a compressed snapshot so the next start is instant.
+The index is kept in memory by a background service. It reads the file list of NTFS
+drives directly, follows the NTFS change journal so it stays current, and saves a
+compressed snapshot so the next start is instant. A small console client searches it
+through a named pipe without admin rights; the search window (later) will use the same
+pipe.
 
 The full design record (decisions, what is settled, and the plan for the next phases) is
 in [docs/PROJECT.md](docs/PROJECT.md).
@@ -13,17 +15,25 @@ in [docs/PROJECT.md](docs/PROJECT.md).
 
 | Crate | Purpose |
 |---|---|
-| `crates/ntfs` | Reads every file record of an NTFS volume with `FSCTL_ENUM_USN_DATA` |
-| `crates/index` | Compact index: shared UTF-8 name table, parent links, location tags |
-| `crates/query` | Parallel ranked search that keeps only the best results |
-| `crates/cli` | `bs` prototype: builds the index, prints stats, interactive search and benchmarks |
+| `crates/ntfs` | Reads every file record of an NTFS volume with `FSCTL_ENUM_USN_DATA`, and the change journal |
+| `crates/index` | Compact index: shared UTF-8 name table, parent links, location tags, clutter rules, snapshot |
+| `crates/query` | Parallel ranked search that keeps only the best results; per-result filter hook |
+| `crates/engine` | Keeps the index loaded, current and saved; per-user profile map for privacy |
+| `crates/pipe` | Message format of the service's named pipe, and a client for it |
+| `crates/service` | `bs-service.exe`: the background service that owns the index |
+| `crates/cli` | `bs`: console tool that indexes and searches locally, and `bs query` through the service |
 
 ## Usage
 
 ```powershell
 cargo build --release
 
-# Index all fixed NTFS drives. Needs a terminal opened with "Run as administrator".
+# Search through the running service (no admin rights).
+.\target\release\bs.exe query readme
+.\target\release\bs.exe query --bench
+
+# Index all fixed NTFS drives locally. Needs a terminal opened with
+# "Run as administrator".
 .\target\release\bs.exe
 .\target\release\bs.exe C D --bench
 
@@ -55,12 +65,52 @@ Deleted and renamed files leave some unused space in the index. Once that reache
 2% of the index, it is rebuilt into a clean copy in the background during the next save.
 Searches keep running on the old copy until the new one is swapped in.
 
-The snapshot is stored at `%LOCALAPPDATA%\better_search\index.bin`. It is thrown away and
-the drives are read again if a drive's serial number or journal changed, if too many
-changes were missed while the tool was closed, or if the clutter setting changed.
+The console tool keeps its snapshot at `%LOCALAPPDATA%\better_search\index.bin`. It is
+thrown away and the drives are read again if a drive's serial number or journal changed,
+if too many changes were missed while the tool was closed, or if the clutter setting
+changed.
 
 Drives without a change journal get one (32 MB, the size Windows uses for the system
 drive), so their snapshot stays valid too.
+
+## The service
+
+`bs-service.exe` is meant to run as a Windows service (started by the Service Control
+Manager as LocalSystem at boot), so the index is always ready and no search needs admin
+rights.
+
+```powershell
+# Run it in a terminal instead of installing it, for testing.
+.\target\release\bs-service.exe --console
+```
+
+- Data folder: `%ProgramData%\better_search` (snapshot `index.bin`, `service.log`). The
+  service sets a protected DACL that gives SYSTEM and administrators full control, so a
+  normal user cannot read the index (it contains every file name on the machine).
+- The log holds one line per event, rotates at 1 MB, and never records queries.
+- While the index loads or is scanned for the first time, a search answers
+  "the index is still loading" instead of failing.
+- A normal stop saves first (a few hundred milliseconds); a machine shutdown does not
+  save, and the change journal replays whatever was missed.
+- Registering the service changes the machine, so it is done by an installer
+  (Phase 5) or by hand: `sc.exe create better_search binPath= <full path to
+  bs-service.exe>` and `sc.exe start better_search`.
+
+### The pipe
+
+The service listens on `\\.\pipe\better_search` (message mode, one message per request
+and reply, remote clients rejected). Local interactive users may connect and search but
+cannot create their own instance of that pipe name. Overhead is 0.1-0.2 ms per query.
+
+### Privacy between users
+
+The service reads the caller's SID and profile path while impersonating them at
+identification level (reading the token, not acting as the user). Results and match
+counts leave out the contents of other users' profile folders (`<drive>\Users\<name>`),
+for administrators too. The folder itself stays visible, `C:\Users\Public` is shared,
+and a folder that happens to match the caller's profile name on another drive stays
+visible. The per-entry privacy map costs about 0.6 MB and is rebuilt only when a profile
+folder appears, disappears or moves.
 
 ### Clutter folders
 
