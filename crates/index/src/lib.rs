@@ -359,6 +359,9 @@ pub struct Index {
     /// [`SKIP_RULES_VERSION`] if clutter folders were skipped, 0 if everything is indexed.
     skip_rules: u32,
     generation: u64,
+    /// Bumped when a change could alter which user owns an entry. Compaction bumps it
+    /// too, because renumbering invalidates any map built from entry indices.
+    users_epoch: u64,
     locations_dirty: bool,
     /// A folder left the index, so entries below it must go too.
     orphans_possible: bool,
@@ -449,6 +452,42 @@ impl Index {
         Location::from_flags(self.flags[entry as usize])
     }
 
+    /// A `<drive>:\Users` folder, which holds one private folder per user.
+    fn is_users_folder(&self, entry: u32) -> bool {
+        self.name_folded(entry) == b"users"
+            && self.parent(entry).is_some_and(|p| self.parent(p).is_none())
+    }
+
+    /// A users folder itself, or a profile folder directly inside one: changing these
+    /// changes which user a result belongs to, even when no ancestor moved.
+    fn users_direct(&self, entry: u32) -> bool {
+        self.is_users_folder(entry) || self.parent(entry).is_some_and(|p| self.is_users_folder(p))
+    }
+
+    /// The profile folder `entry` belongs to, if it is inside a users folder. The
+    /// users folder itself and everything outside have no owner.
+    fn users_owner(&self, entry: u32) -> Option<u32> {
+        let mut current = Some(entry);
+        for _ in 0..MAX_DEPTH {
+            let e = current?;
+            if self.is_users_folder(e) {
+                return None;
+            }
+            if self.parent(e).is_some_and(|p| self.is_users_folder(p)) {
+                return Some(e);
+            }
+            current = self.parent(e);
+        }
+        None
+    }
+
+    /// Changes whenever something changed that affects which user's profile a result
+    /// belongs to, or when entries were renumbered by a compaction. A per-user privacy
+    /// map built earlier can be reused while this is unchanged.
+    pub fn users_epoch(&self) -> u64 {
+        self.users_epoch
+    }
+
     /// Rebuilds the full path by walking parent links. Only call this for results
     /// that are actually shown.
     pub fn full_path(&self, entry: u32) -> String {
@@ -528,6 +567,9 @@ impl Index {
                 if entry == self.volumes[volume].root {
                     return Applied::Unchanged;
                 }
+                if self.users_direct(entry) {
+                    self.users_epoch += 1;
+                }
                 self.remove_entry(volume, record, entry);
                 Applied::Deleted(entry)
             }
@@ -565,6 +607,7 @@ impl Index {
                 if hidden {
                     basic |= flags::HIDDEN;
                 }
+                let owner_before = existing.and_then(|entry| self.users_owner(entry));
 
                 let (entry, applied, placed) = match existing {
                     Some(entry) => {
@@ -629,6 +672,15 @@ impl Index {
                     }
                 }
                 self.batch_changed = true;
+                // Profile ownership changes only when an entry enters, leaves or moves
+                // between users folders, or when a users folder or a profile folder
+                // itself is created or changed. Everything else is picked up by
+                // extending a map that is already built.
+                if self.users_direct(entry)
+                    || existing.is_some_and(|_| owner_before != self.users_owner(entry))
+                {
+                    self.users_epoch += 1;
+                }
                 applied
             }
         }
@@ -828,6 +880,8 @@ impl Index {
             renames: 0,
             skip_rules: self.skip_rules,
             generation: self.generation + 1,
+            // Entry indices change in a compaction, so maps built from them are void.
+            users_epoch: self.users_epoch + 1,
             locations_dirty: self.locations_dirty,
             orphans_possible: false,
             marker_parents: Vec::new(),
@@ -977,6 +1031,7 @@ impl Index {
             renames: 0,
             skip_rules: parts.skip_rules,
             generation: 0,
+            users_epoch: 0,
             locations_dirty: false,
             orphans_possible: false,
             marker_parents: Vec::new(),
@@ -1190,6 +1245,7 @@ impl IndexBuilder {
             renames: 0,
             skip_rules: 0,
             generation: 0,
+            users_epoch: 0,
             locations_dirty: false,
             orphans_possible: false,
             marker_parents: Vec::new(),
@@ -2173,5 +2229,52 @@ mod tests {
             loaded.apply(0, upsert(60, 23, "d.js", false)),
             Applied::Unchanged
         );
+    }
+
+    #[test]
+    fn users_epoch_changes_only_when_profiles_change() {
+        // sample(): C:\Users\bob\Documents\report.docx, C:\Windows\notepad.exe, record
+        // numbers 10 (Users), 11 (bob), 12 (Documents), 13 (report.docx).
+        // sample(): C:\Users (record 10) \ bob (11) \ Documents (12) \ report.docx (13),
+        // and C:\Windows (20), C:\orphan.txt (40).
+        let mut index = sample();
+        let start = index.users_epoch();
+
+        // A new file inside a profile folder inherits its owner; no rebuild needed.
+        index.apply(0, upsert(300, 11, "notes.txt", false));
+        index.end_batch();
+        assert_eq!(index.users_epoch(), start);
+
+        // Renaming a file inside a profile folder also changes nothing.
+        index.apply(0, upsert(300, 11, "notes2.txt", false));
+        index.end_batch();
+        assert_eq!(index.users_epoch(), start);
+
+        // A new profile folder changes who owns what until the map is rebuilt.
+        index.apply(0, upsert(301, 10, "anna", true));
+        index.end_batch();
+        let after_new_profile = index.users_epoch();
+        assert_ne!(after_new_profile, start);
+
+        // Moving a folder from bob's profile into anna's changes its owner.
+        index.apply(0, upsert(12, 301, "Documents", true));
+        index.end_batch();
+        assert_ne!(index.users_epoch(), after_new_profile);
+        assert_eq!(
+            index.parent(index.volumes()[0].entry_for_record(12).unwrap()),
+            index.volumes()[0].entry_for_record(301)
+        );
+
+        // Moving it out of any profile folder gives up its owner too.
+        let moved = index.volumes()[0].entry_for_record(12).unwrap();
+        let windows = index.volumes()[0].entry_for_record(20).unwrap();
+        index.apply(0, upsert(12, 20, "Documents", true));
+        index.end_batch();
+        assert_eq!(index.parent(moved), Some(windows));
+
+        // Compaction renumbers entries, so any map built from them is void.
+        let before_compaction = index.users_epoch();
+        index.compact();
+        assert_ne!(index.users_epoch(), before_compaction);
     }
 }

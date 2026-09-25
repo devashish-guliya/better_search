@@ -1,0 +1,12 @@
+[package]
+name = "bs-engine"
+description = "Keeps the index of all NTFS drives loaded, current and saved; shared by the console tool and the service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bs-index = { version = "0.1.0", path = "../index" }
+bs-ntfs = { version = "0.1.0", path = "../ntfs" }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_IO", "Win32_System_ProcessStatus", "Win32_System_Threading"] }

@@ -1,19 +1,30 @@
-//! Keeps an NTFS index current: loads the saved snapshot (or scans), catches up on
-//! changes made while the program was closed, then follows each volume's change
-//! journal on its own thread.
+//! Keeps an index of NTFS drives current: loads the saved snapshot (or scans), catches
+//! up on changes made while nothing was running, then follows each volume's change
+//! journal on its own thread, saves now and then, and lets the index leave RAM when
+//! nobody searches.
+//!
+//! Nothing here prints. Progress and events go to a [`Log`] callback, so the same
+//! engine runs in the console tool and in the background service.
+
+pub mod fmt;
+pub mod memory;
+pub mod profiles;
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bs_index::{Applied, Change, Index, IndexBuilder, SKIP_RULES_VERSION, SyncPoint};
 use bs_ntfs::{ChangeKind, JournalInfo, Record, Volume};
+use windows_sys::Win32::System::IO::CancelSynchronousIo;
 
-use crate::{fmt_bytes, fmt_count, fmt_duration};
+/// Receives one line per progress message or event.
+pub type Log = Arc<dyn Fn(&str) + Send + Sync>;
 
 const LOG_LINES: usize = 50;
 /// Searches always use the live in-memory index; the saved copy only makes the next
@@ -25,11 +36,41 @@ const IDLE_TRIM_AFTER: Duration = Duration::from_secs(60);
 /// Same size Windows uses for the journal it creates on the system drive.
 const JOURNAL_MAX_BYTES: u64 = 32 << 20;
 const JOURNAL_GROW_BYTES: u64 = 8 << 20;
+/// How long [`Engine::shutdown`] keeps trying to wake a watcher blocked in the kernel.
+const STOP_WAIT: Duration = Duration::from_secs(3);
 
-/// Index plus what the background threads report.
-pub struct Shared {
-    pub index: RwLock<Index>,
-    log: Mutex<VecDeque<String>>,
+/// `%LOCALAPPDATA%\better_search\index.bin`: the snapshot of the console tool, which
+/// runs as the current user.
+pub fn user_snapshot_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("better_search").join("index.bin")
+}
+
+/// `%ProgramData%\better_search`: the service's folder for its snapshot and log.
+pub fn machine_data_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("better_search")
+}
+
+pub struct Config {
+    /// Drive letters to index; empty means all fixed NTFS drives.
+    pub drives: Vec<char>,
+    pub snapshot: PathBuf,
+    /// Ignore the snapshot and read the drives again.
+    pub rescan: bool,
+    pub skip_clutter: bool,
+}
+
+/// State shared with the background threads.
+struct Shared {
+    index: RwLock<Index>,
+    log: Log,
+    /// Latest changes and events, for display.
+    recent: Mutex<VecDeque<String>>,
     saved_generation: Mutex<Option<u64>>,
     /// Held by whoever changes or saves the index. Writers take it before the write
     /// lock, so while a compaction or save holds a read lock for a while, no writer is
@@ -38,49 +79,174 @@ pub struct Shared {
     last_search: Mutex<Instant>,
     trimmed: AtomicBool,
     stop: AtomicBool,
+    snapshot: Option<PathBuf>,
 }
 
 impl Shared {
-    pub fn new(index: Index) -> Self {
-        Self {
-            index: RwLock::new(index),
-            log: Mutex::new(VecDeque::new()),
-            saved_generation: Mutex::new(None),
-            maintenance: Mutex::new(()),
-            last_search: Mutex::new(Instant::now()),
-            trimmed: AtomicBool::new(false),
-            stop: AtomicBool::new(false),
+    fn push_recent(&self, line: String) {
+        let mut recent = self.recent.lock().unwrap();
+        if recent.len() == LOG_LINES {
+            recent.pop_front();
         }
+        recent.push_back(line);
+    }
+
+    /// An event worth keeping in the log, as opposed to a single file change.
+    fn event(&self, line: String) {
+        (self.log)(&line);
+        self.push_recent(line);
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct Workers {
+    watchers: Vec<JoinHandle<()>>,
+    saver: Option<JoinHandle<()>>,
+}
+
+/// An index plus the machinery that keeps it current.
+pub struct Engine {
+    shared: Arc<Shared>,
+    workers: Mutex<Workers>,
+}
+
+impl Engine {
+    /// Loads or builds the index of the configured NTFS drives and brings it fully up
+    /// to date. Call [`Self::start`] to keep it current afterwards.
+    pub fn open(config: &Config, log: Log) -> Result<Self, String> {
+        let letters = if config.drives.is_empty() {
+            bs_ntfs::fixed_ntfs_volumes()
+        } else {
+            config.drives.clone()
+        };
+        if letters.is_empty() {
+            return Err("no fixed NTFS drives found".into());
+        }
+        let (index, saved) = load_or_scan(&letters, config, &*log)?;
+        let engine = Self::new(index, log, Some(config.snapshot.clone()));
+        if saved {
+            let generation = engine.read().generation();
+            *engine.shared.saved_generation.lock().unwrap() = Some(generation);
+        }
+        Ok(engine)
+    }
+
+    /// Wraps an index that is not backed by drives (a walked folder, test data): no
+    /// live updates and no snapshot.
+    pub fn from_index(index: Index, log: Log) -> Self {
+        Self::new(index, log, None)
+    }
+
+    fn new(index: Index, log: Log, snapshot: Option<PathBuf>) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                index: RwLock::new(index),
+                log,
+                recent: Mutex::new(VecDeque::new()),
+                saved_generation: Mutex::new(None),
+                maintenance: Mutex::new(()),
+                last_search: Mutex::new(Instant::now()),
+                trimmed: AtomicBool::new(false),
+                stop: AtomicBool::new(false),
+                snapshot,
+            }),
+            workers: Mutex::new(Workers::default()),
+        }
+    }
+
+    /// True when the index follows change journals and is saved to a snapshot.
+    pub fn is_live(&self) -> bool {
+        self.shared.snapshot.is_some()
+    }
+
+    /// Starts one watcher thread per volume with a change journal, plus the thread that
+    /// saves and trims memory. Does nothing for an index without drives.
+    pub fn start(&self) {
+        if !self.is_live() {
+            return;
+        }
+        let mut workers = self.workers.lock().unwrap();
+        if workers.saver.is_some() {
+            return;
+        }
+        let volumes: Vec<(usize, String, SyncPoint)> = self
+            .read()
+            .volumes()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.sync.map(|s| (i, v.label.clone(), s)))
+            .collect();
+        for (vol, label, sync) in volumes {
+            let shared = Arc::clone(&self.shared);
+            let handle = thread::Builder::new()
+                .name(format!("watch {label}"))
+                .spawn(move || watch(&shared, vol, &label, sync))
+                .expect("spawning a thread");
+            workers.watchers.push(handle);
+        }
+        let shared = Arc::clone(&self.shared);
+        let saver = thread::Builder::new()
+            .name("saver".into())
+            .spawn(move || run_saver(&shared))
+            .expect("spawning a thread");
+        workers.saver = Some(saver);
+    }
+
+    /// Read access for searching. Searches run in parallel; changes wait meanwhile.
+    pub fn read(&self) -> RwLockReadGuard<'_, Index> {
+        self.shared.index.read().unwrap()
     }
 
     /// Records that the user searched, which keeps the index in RAM for a while.
     pub fn touch(&self) {
-        *self.last_search.lock().unwrap() = Instant::now();
-        self.trimmed.store(false, Ordering::Relaxed);
+        *self.shared.last_search.lock().unwrap() = Instant::now();
+        self.shared.trimmed.store(false, Ordering::Relaxed);
     }
 
-    fn push_log(&self, line: String) {
-        let mut log = self.log.lock().unwrap();
-        if log.len() == LOG_LINES {
-            log.pop_front();
-        }
-        log.push_back(line);
-    }
-
+    /// The latest file changes and events, oldest first.
     pub fn recent_changes(&self) -> Vec<String> {
-        self.log.lock().unwrap().iter().cloned().collect()
+        self.shared.recent.lock().unwrap().iter().cloned().collect()
     }
 
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+    /// Saves now if anything changed since the last save.
+    pub fn save(&self) {
+        save_shared(&self.shared);
     }
-}
 
-pub fn snapshot_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    base.join("better_search").join("index.bin")
+    /// Stops following the journals and, with `save`, writes the snapshot once the
+    /// watchers are done. The index stays readable.
+    pub fn shutdown(&self, save: bool) {
+        let workers = std::mem::take(&mut *self.workers.lock().unwrap());
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(saver) = &workers.saver {
+            saver.thread().unpark();
+        }
+        let deadline = Instant::now() + STOP_WAIT;
+        for watcher in workers.watchers {
+            // The watcher may be blocked waiting for journal records. Cancelling is
+            // repeated because it can land just before the thread enters the wait.
+            while !watcher.is_finished() && Instant::now() < deadline {
+                // SAFETY: the handle belongs to a live JoinHandle and has full access.
+                unsafe { CancelSynchronousIo(watcher.as_raw_handle()) };
+                thread::sleep(Duration::from_millis(5));
+            }
+            if watcher.is_finished() {
+                let _ = watcher.join();
+            } else {
+                (self.shared.log)("a drive watcher did not stop in time");
+            }
+        }
+        if let Some(saver) = workers.saver {
+            let _ = saver.join();
+        }
+        if save {
+            self.save();
+        }
+    }
 }
 
 struct OpenVolume {
@@ -90,7 +256,7 @@ struct OpenVolume {
     journal: Option<JournalInfo>,
 }
 
-fn open_volumes(letters: &[char]) -> Result<Vec<OpenVolume>, String> {
+fn open_volumes(letters: &[char], log: &dyn Fn(&str)) -> Result<Vec<OpenVolume>, String> {
     letters
         .iter()
         .map(|&letter| {
@@ -110,11 +276,13 @@ fn open_volumes(letters: &[char]) -> Result<Vec<OpenVolume>, String> {
             let journal = volume.journal().or_else(|| {
                 match bs_ntfs::create_journal(letter, JOURNAL_MAX_BYTES, JOURNAL_GROW_BYTES) {
                     Ok(()) => {
-                        println!("Turned on the change journal of drive {letter}:");
+                        log(&format!("Turned on the change journal of drive {letter}:"));
                         volume.journal()
                     }
                     Err(e) => {
-                        println!("Could not turn on the change journal of drive {letter}: ({e})");
+                        log(&format!(
+                            "Could not turn on the change journal of drive {letter}: ({e})"
+                        ));
                         None
                     }
                 }
@@ -129,47 +297,49 @@ fn open_volumes(letters: &[char]) -> Result<Vec<OpenVolume>, String> {
         .collect()
 }
 
-/// Loads or builds the index for `letters` and brings it fully up to date. The flag
-/// tells whether the returned index is already saved to disk.
-pub fn load_or_scan(
+/// Loads or builds the index and brings it fully up to date. The flag tells whether
+/// the returned index is already saved to disk.
+fn load_or_scan(
     letters: &[char],
-    rescan: bool,
-    skip_clutter: bool,
+    config: &Config,
+    log: &dyn Fn(&str),
 ) -> Result<(Index, bool), String> {
-    let volumes = open_volumes(letters)?;
-    let path = snapshot_path();
+    let volumes = open_volumes(letters, log)?;
+    let path = &config.snapshot;
 
-    if !rescan && path.exists() {
+    if !config.rescan && path.exists() {
         let t = Instant::now();
-        match Index::load(&path) {
-            Ok(index) => match snapshot_mismatch(&index, &volumes, skip_clutter) {
+        match Index::load(path) {
+            Ok(index) => match snapshot_mismatch(&index, &volumes, config.skip_clutter) {
                 None => {
-                    let size = std::fs::metadata(&path)
+                    let size = std::fs::metadata(path)
                         .map(|m| m.len() as usize)
                         .unwrap_or(0);
-                    println!(
+                    log(&format!(
                         "Loaded saved index ({} on disk) in {}",
-                        fmt_bytes(size),
-                        fmt_duration(t.elapsed())
-                    );
-                    match catch_up_all(index, &volumes) {
+                        fmt::bytes(size),
+                        fmt::duration(t.elapsed())
+                    ));
+                    match catch_up_all(index, &volumes, log) {
                         Ok(index) => return Ok((index, false)),
-                        Err(e) => println!("Could not catch up on changes ({e}); rescanning."),
+                        Err(e) => log(&format!("Could not catch up on changes ({e}); rescanning.")),
                     }
                 }
-                Some(reason) => println!("Saved index is out of date ({reason}); rescanning."),
+                Some(reason) => log(&format!(
+                    "Saved index is out of date ({reason}); rescanning."
+                )),
             },
-            Err(e) => println!("Could not load saved index ({e}); rescanning."),
+            Err(e) => log(&format!("Could not load saved index ({e}); rescanning.")),
         }
     }
 
-    let mut index = scan(&volumes)?;
-    if skip_clutter {
-        skip(&mut index);
+    let mut index = scan(&volumes, log)?;
+    if config.skip_clutter {
+        skip(&mut index, log);
     }
     let index =
-        catch_up_all(index, &volumes).map_err(|e| format!("reading change journal: {e}"))?;
-    let saved = save(&index, &path);
+        catch_up_all(index, &volumes, log).map_err(|e| format!("reading change journal: {e}"))?;
+    let saved = save_to(&index, path, log);
     Ok((index, saved))
 }
 
@@ -206,7 +376,7 @@ fn snapshot_mismatch(index: &Index, volumes: &[OpenVolume], skip_clutter: bool) 
     None
 }
 
-fn scan(volumes: &[OpenVolume]) -> Result<Index, String> {
+fn scan(volumes: &[OpenVolume], log: &dyn Fn(&str)) -> Result<Index, String> {
     let mut builder = IndexBuilder::new();
     for open in volumes {
         let letter = open.letter;
@@ -235,14 +405,14 @@ fn scan(volumes: &[OpenVolume]) -> Result<Index, String> {
             Some(_) => "live updates on",
             None => "no change journal, live updates off",
         };
-        println!(
+        log(&format!(
             "{letter}:  {} entries in {}  (read {} · add {} · link {}; {journal})",
-            fmt_count(count),
-            fmt_duration(t.elapsed()),
-            fmt_duration(read),
-            fmt_duration(indexing),
-            fmt_duration(linking)
-        );
+            fmt::count(count),
+            fmt::duration(t.elapsed()),
+            fmt::duration(read),
+            fmt::duration(indexing),
+            fmt::duration(linking)
+        ));
     }
     let mut index = builder.finish();
     // Changes made during the scan are replayed from the journal position taken before it.
@@ -260,23 +430,23 @@ fn scan(volumes: &[OpenVolume]) -> Result<Index, String> {
 }
 
 /// Leaves out clutter folder contents and reports how much that removed.
-pub fn skip(index: &mut Index) {
+pub fn skip(index: &mut Index, log: &dyn Fn(&str)) {
     let t = Instant::now();
     let before = index.live_len();
     let report = index.skip_clutter();
-    println!(
+    log(&format!(
         "Skipped {} entries inside clutter folders ({:.0}% of {}) in {}",
-        fmt_count(report.removed),
+        fmt::count(report.removed),
         100.0 * report.removed as f64 / before.max(1) as f64,
-        fmt_count(before),
-        fmt_duration(t.elapsed())
-    );
+        fmt::count(before),
+        fmt::duration(t.elapsed())
+    ));
     for (rule, count) in report.by_rule.iter().take(15) {
-        println!("  {:>10}  {rule}", fmt_count(*count));
+        log(&format!("  {:>10}  {rule}", fmt::count(*count)));
     }
 }
 
-fn catch_up_all(mut index: Index, volumes: &[OpenVolume]) -> io::Result<Index> {
+fn catch_up_all(mut index: Index, volumes: &[OpenVolume], log: &dyn Fn(&str)) -> io::Result<Index> {
     let t = Instant::now();
     let mut total = 0;
     for (i, open) in volumes.iter().enumerate() {
@@ -288,11 +458,11 @@ fn catch_up_all(mut index: Index, volumes: &[OpenVolume]) -> io::Result<Index> {
         total += changes;
     }
     if total > 0 {
-        println!(
+        log(&format!(
             "Caught up on {} changes in {}",
-            fmt_count(total),
-            fmt_duration(t.elapsed())
-        );
+            fmt::count(total),
+            fmt::duration(t.elapsed())
+        ));
     }
     Ok(index)
 }
@@ -362,45 +532,22 @@ struct OwnedRecord {
     hidden: bool,
 }
 
-/// Starts one watcher thread per volume with a change journal, plus the periodic saver.
-pub fn start_background(shared: &Arc<Shared>) {
-    let volumes: Vec<(usize, String, SyncPoint)> = shared
-        .index
-        .read()
-        .unwrap()
-        .volumes()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| v.sync.map(|s| (i, v.label.clone(), s)))
-        .collect();
-    for (vol, label, sync) in volumes {
-        let shared = Arc::clone(shared);
-        thread::Builder::new()
-            .name(format!("watch {label}"))
-            .spawn(move || watch(&shared, vol, &label, sync))
-            .expect("spawning a thread");
+fn run_saver(shared: &Shared) {
+    let mut last_save = Instant::now();
+    while !shared.stopping() {
+        thread::park_timeout(Duration::from_secs(15));
+        if shared.stopping() {
+            break;
+        }
+        if last_save.elapsed() >= SAVE_EVERY {
+            save_shared(shared);
+            last_save = Instant::now();
+        }
+        let idle = shared.last_search.lock().unwrap().elapsed() >= IDLE_TRIM_AFTER;
+        if idle && !shared.trimmed.swap(true, Ordering::Relaxed) {
+            memory::trim_working_set();
+        }
     }
-    let saver = Arc::clone(shared);
-    thread::Builder::new()
-        .name("saver".into())
-        .spawn(move || {
-            let mut last_save = Instant::now();
-            while !saver.stop.load(Ordering::Relaxed) {
-                thread::park_timeout(Duration::from_secs(15));
-                if saver.stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                if last_save.elapsed() >= SAVE_EVERY {
-                    save_shared(&saver);
-                    last_save = Instant::now();
-                }
-                let idle = saver.last_search.lock().unwrap().elapsed() >= IDLE_TRIM_AFTER;
-                if idle && !saver.trimmed.swap(true, Ordering::Relaxed) {
-                    crate::memory::trim_working_set();
-                }
-            }
-        })
-        .expect("spawning a thread");
 }
 
 fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
@@ -408,14 +555,14 @@ fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
     let volume = match Volume::open(letter) {
         Ok(v) => v,
         Err(e) => {
-            shared.push_log(format!("{label} live updates unavailable: {e}"));
+            shared.event(format!("{label} live updates unavailable: {e}"));
             return;
         }
     };
     let mut usn = sync.next_usn;
     let mut buffer = Vec::new();
     let mut pending: Vec<OwnedRecord> = Vec::new();
-    while !shared.stop.load(Ordering::Relaxed) {
+    while !shared.stopping() {
         let started = Instant::now();
         pending.clear();
         let result = volume.read_journal(sync.journal_id, usn, true, &mut buffer, |r| {
@@ -433,10 +580,13 @@ fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
         });
         let next = match result {
             Ok(next) => next,
+            // A cancelled wait during shutdown; the saved position is still valid.
+            Err(_) if shared.stopping() => return,
             Err(e) => {
-                shared.push_log(format!(
+                shared.event(format!(
                     "{label} live updates stopped ({e}); the next start rescans"
                 ));
+                let _maintenance = shared.maintenance.lock().unwrap();
                 shared.index.write().unwrap().set_sync(vol, None);
                 return;
             }
@@ -487,29 +637,32 @@ fn watch(shared: &Shared, vol: usize, label: &str, sync: SyncPoint) {
             .collect();
         drop(index);
         for line in lines {
-            shared.push_log(line);
+            shared.push_recent(line);
         }
         usn = next;
     }
 }
 
-fn save(index: &Index, path: &std::path::Path) -> bool {
+fn save_to(index: &Index, path: &Path, log: &dyn Fn(&str)) -> bool {
     let t = Instant::now();
     match index.save(path) {
         Ok(()) => {
             let size = std::fs::metadata(path)
                 .map(|m| m.len() as usize)
                 .unwrap_or(0);
-            println!(
+            log(&format!(
                 "Saved index to {} ({}) in {}",
                 path.display(),
-                fmt_bytes(size),
-                fmt_duration(t.elapsed())
-            );
+                fmt::bytes(size),
+                fmt::duration(t.elapsed())
+            ));
             true
         }
         Err(e) => {
-            eprintln!("warning: could not save index to {}: {e}", path.display());
+            log(&format!(
+                "warning: could not save index to {}: {e}",
+                path.display()
+            ));
             false
         }
     }
@@ -518,7 +671,10 @@ fn save(index: &Index, path: &std::path::Path) -> bool {
 /// Saves if anything changed since the last save, compacting first when enough garbage
 /// has built up, then lets the index leave RAM again if nobody is searching. Searches
 /// are never blocked: the compacted copy is built next to the live index and swapped in.
-pub fn save_shared(shared: &Shared) {
+fn save_shared(shared: &Shared) {
+    let Some(path) = &shared.snapshot else {
+        return;
+    };
     let _maintenance = shared.maintenance.lock().unwrap();
     let generation = shared.index.read().unwrap().generation();
     if *shared.saved_generation.lock().unwrap() == Some(generation) {
@@ -531,29 +687,22 @@ pub fn save_shared(shared: &Shared) {
         let old = std::mem::replace(&mut *shared.index.write().unwrap(), fresh);
         // Freed outside the lock so searches do not wait for it.
         drop(old);
-        shared.push_log(format!("compacted index in {}", fmt_duration(t.elapsed())));
+        shared.event(format!("compacted index in {}", fmt::duration(t.elapsed())));
     }
     // Saving only needs read access, so searches keep working meanwhile.
     let index = shared.index.read().unwrap();
     let t = Instant::now();
-    let path = snapshot_path();
-    match index.save(&path) {
+    match index.save(path) {
         Ok(()) => {
             *shared.saved_generation.lock().unwrap() = Some(index.generation());
-            shared.push_log(format!("saved index in {}", fmt_duration(t.elapsed())));
+            shared.event(format!("saved index in {}", fmt::duration(t.elapsed())));
         }
-        Err(e) => shared.push_log(format!("could not save index: {e}")),
+        Err(e) => shared.event(format!("could not save index: {e}")),
     }
     drop(index);
     // Compacting and saving read the whole index back into RAM.
     if shared.last_search.lock().unwrap().elapsed() >= IDLE_TRIM_AFTER {
-        crate::memory::trim_working_set();
+        memory::trim_working_set();
         shared.trimmed.store(true, Ordering::Relaxed);
     }
-}
-
-/// Marks the current state as saved, e.g. right after a load or scan wrote it.
-pub fn mark_saved(shared: &Shared) {
-    let generation = shared.index.read().unwrap().generation();
-    *shared.saved_generation.lock().unwrap() = Some(generation);
 }

@@ -12,10 +12,19 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 name = "bs-cli"
 version = "0.1.0"
 dependencies = [
+ "bs-engine",
  "bs-index",
- "bs-ntfs",
+ "bs-pipe",
  "bs-query",
  "rayon",
+]
+
+[[package]]
+name = "bs-engine"
+version = "0.1.0"
+dependencies = [
+ "bs-index",
+ "bs-ntfs",
  "windows-sys",
 ]
 
@@ -35,12 +44,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs-pipe"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "bs-query"
 version = "0.1.0"
 dependencies = [
  "bs-index",
  "memchr",
  "rayon",
+]
+
+[[package]]
+name = "bs-service"
+version = "0.1.0"
+dependencies = [
+ "bs-engine",
+ "bs-index",
+ "bs-pipe",
+ "bs-query",
+ "windows-sys",
 ]
 
 [[package]]

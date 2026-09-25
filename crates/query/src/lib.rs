@@ -78,20 +78,65 @@ pub struct SearchResult {
     pub total_matches: usize,
 }
 
+/// Decides per entry whether it may appear in results; `false` hides it from both the
+/// hits and the match count.
+pub type Filter<'a> = &'a (dyn Fn(u32) -> bool + Sync);
+
 /// One-off search. Use [`Session`] for searches that follow the user's typing.
 pub fn search(index: &Index, query: &Query, limit: usize) -> SearchResult {
+    search_filtered(index, query, limit, None)
+}
+
+pub fn search_filtered(
+    index: &Index,
+    query: &Query,
+    limit: usize,
+    filter: Option<Filter<'_>>,
+) -> SearchResult {
     let scores = score_names(index.names(), query, None);
-    if !scores.par_iter().any(|&s| s != 0) {
+    if collect_matches(&scores, None, false).0 == 0 {
         return SearchResult {
             hits: Vec::new(),
             total_matches: 0,
         };
     }
-    rank(index, &scores, limit)
+    rank(index, &scores, limit, filter)
+}
+
+/// Counts the names whose score is non-zero, and (when `keep` is set and there are few
+/// enough of them to be worth remembering) lists their ids. Counting is much cheaper
+/// than building the list, so a broad query never materializes one.
+fn collect_matches(
+    scores: &[u8],
+    candidates: Option<&[u32]>,
+    keep: bool,
+) -> (usize, Option<Vec<u32>>) {
+    let hit = |id: u32| scores[id as usize] != 0;
+    match candidates {
+        Some(previous) => {
+            let count = previous.iter().filter(|&&id| hit(id)).count();
+            let list = (keep && count <= MAX_NARROW_NAMES)
+                .then(|| previous.iter().copied().filter(|&id| hit(id)).collect());
+            (count, list)
+        }
+        None => {
+            let count = scores.par_iter().filter(|&&s| s != 0).count();
+            let list = (keep && count <= MAX_NARROW_NAMES).then(|| {
+                scores
+                    .par_iter()
+                    .enumerate()
+                    .filter(|&(_, &s)| s != 0)
+                    .map(|(id, _)| id as u32)
+                    .collect()
+            });
+            (count, list)
+        }
+    }
 }
 
 /// Remembers which names matched the previous query so the next keystroke only has to
-/// re-check those. Automatically starts over when the index changes.
+/// re-check those. Automatically starts over when the index changes, and falls back to
+/// a full scan when the previous query matched a large share of all names.
 #[derive(Default)]
 pub struct Session {
     last: Option<LastSearch>,
@@ -100,8 +145,14 @@ pub struct Session {
 struct LastSearch {
     generation: u64,
     terms: Vec<Vec<u8>>,
-    matched_names: Vec<u32>,
+    /// `None` when the last query matched too many names for narrowing to pay off.
+    matched_names: Option<Vec<u32>>,
 }
+
+/// Longest match list that is remembered for narrowing. Checking remembered names
+/// costs about 80 ns each (measured on the development machine at 12k names: 3.7 ms
+/// narrowed against 2.7 ms for a fresh search), so only short lists are worth keeping.
+const MAX_NARROW_NAMES: usize = 8192;
 
 impl Session {
     pub fn new() -> Self {
@@ -109,37 +160,36 @@ impl Session {
     }
 
     pub fn search(&mut self, index: &Index, query: &Query, limit: usize) -> SearchResult {
+        self.search_filtered(index, query, limit, None)
+    }
+
+    /// The remembered names do not depend on `filter`, so it may differ between calls.
+    pub fn search_filtered(
+        &mut self,
+        index: &Index,
+        query: &Query,
+        limit: usize,
+        filter: Option<Filter<'_>>,
+    ) -> SearchResult {
         let candidates = self
             .last
             .as_ref()
             .filter(|last| last.generation == index.generation() && query.narrows(&last.terms))
-            .map(|last| last.matched_names.as_slice());
+            .and_then(|last| last.matched_names.as_deref());
         let scores = score_names(index.names(), query, candidates);
-        let matched_names: Vec<u32> = match candidates {
-            Some(previous) => previous
-                .iter()
-                .copied()
-                .filter(|&id| scores[id as usize] != 0)
-                .collect(),
-            None => scores
-                .par_iter()
-                .enumerate()
-                .filter(|&(_, &s)| s != 0)
-                .map(|(id, _)| id as u32)
-                .collect(),
-        };
-        let result = if matched_names.is_empty() {
+        let (matched, stored) = collect_matches(&scores, candidates, true);
+        let result = if matched == 0 {
             SearchResult {
                 hits: Vec::new(),
                 total_matches: 0,
             }
         } else {
-            rank(index, &scores, limit)
+            rank(index, &scores, limit, filter)
         };
         self.last = Some(LastSearch {
             generation: index.generation(),
             terms: query.term_bytes(),
-            matched_names,
+            matched_names: stored,
         });
         result
     }
@@ -152,7 +202,12 @@ const WORD_START: i32 = 50;
 const SUBSTRING: i32 = 30;
 
 /// Pass 2: turns per-name scores into the best entries.
-fn rank(index: &Index, name_scores: &[u8], limit: usize) -> SearchResult {
+fn rank(
+    index: &Index,
+    name_scores: &[u8],
+    limit: usize,
+    filter: Option<Filter<'_>>,
+) -> SearchResult {
     const CHUNK: usize = 1 << 14;
     let name_ids = index.name_ids();
     let entry_flags = index.flags();
@@ -169,7 +224,7 @@ fn rank(index: &Index, name_scores: &[u8], limit: usize) -> SearchResult {
                     if name_score != 0 && f & flags::DELETED == 0 {
                         let entry = base + k as u32;
                         // Volume roots ("C:") are not useful results.
-                        if index.parent(entry).is_some() {
+                        if index.parent(entry).is_some() && filter.is_none_or(|f| f(entry)) {
                             top.push(final_score(name_score, f), entry);
                         }
                     }
@@ -465,6 +520,25 @@ mod tests {
     }
 
     #[test]
+    fn filter_hides_entries_from_hits_and_count() {
+        let index = index_of(&["a\\note.txt", "b\\note.md", "b\\notes"]);
+        let q = Query::parse("note").unwrap();
+        let hidden: Vec<u32> = (0..index.len() as u32)
+            .filter(|&e| index.full_path(e).starts_with("T:\\b\\"))
+            .collect();
+        let filter = |e: u32| !hidden.contains(&e);
+        let result = search_filtered(&index, &q, 10, Some(&filter));
+        assert_eq!(result.total_matches, 1);
+        assert_eq!(index.full_path(result.hits[0].entry), "T:\\a\\note.txt");
+
+        let mut session = Session::new();
+        assert_eq!(session.search(&index, &q, 10).total_matches, 3);
+        let narrowed = Query::parse("note.").unwrap();
+        let result = session.search_filtered(&index, &narrowed, 10, Some(&filter));
+        assert_eq!(result.total_matches, 1);
+    }
+
+    #[test]
     fn ranks_exact_then_prefix_then_word_then_substring() {
         let index = index_of(&[
             "dir\\report",
@@ -638,6 +712,28 @@ mod tests {
             );
             assert_eq!(narrowed.hits, fresh.hits, "query {text:?}");
         }
+    }
+
+    #[test]
+    fn long_match_lists_are_not_remembered() {
+        let paths: Vec<String> = (0..MAX_NARROW_NAMES + 100)
+            .map(|i| format!("keep\\note{i:05}.txt"))
+            .collect();
+        let paths: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let index = index_of(&paths);
+        let mut session = Session::new();
+
+        let q = Query::parse("note").unwrap();
+        assert!(session.search(&index, &q, 5).total_matches > MAX_NARROW_NAMES);
+        assert!(session.last.as_ref().unwrap().matched_names.is_none());
+
+        // Narrowing is off, but the results must be the same as a fresh search.
+        let q = Query::parse("note9").unwrap();
+        let narrowed = session.search(&index, &q, 5);
+        let fresh = search(&index, &q, 5);
+        assert_eq!(narrowed.total_matches, fresh.total_matches);
+        assert_eq!(narrowed.hits, fresh.hits);
+        assert!(session.last.as_ref().unwrap().matched_names.is_some());
     }
 
     #[test]
