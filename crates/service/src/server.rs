@@ -32,6 +32,7 @@ use crate::security::{PIPE_SDDL, SecurityDescriptor};
 /// More simultaneous connections than any number of search windows needs.
 const MAX_CONNECTIONS: usize = 64;
 const PIPE_BUFFER: u32 = 64 * 1024;
+const PROFILE_CHECK_EVERY: Duration = Duration::from_secs(10);
 
 pub struct State {
     pub engine: OnceLock<Engine>,
@@ -40,6 +41,8 @@ pub struct State {
     connections: AtomicUsize,
     /// Users already seen, so the log gets one line per user, not one per connection.
     seen_sids: Mutex<Vec<String>>,
+    /// The profile folders last handed to the index, and when the registry was read.
+    profile_folders: Mutex<(Option<Vec<String>>, Option<Instant>)>,
 }
 
 impl State {
@@ -50,6 +53,29 @@ impl State {
             log,
             connections: AtomicUsize::new(0),
             seen_sids: Mutex::new(Vec::new()),
+            profile_folders: Mutex::new((None, None)),
+        }
+    }
+
+    /// Gives the index the profile folders Windows lists, when they changed, so that
+    /// profiles outside `<drive>\Users` are private too. Runs before a search, at most
+    /// every [`PROFILE_CHECK_EVERY`], so a profile created while a search window stays
+    /// connected is picked up within that time.
+    fn refresh_profile_folders(&self, engine: &Engine) {
+        let mut state = self.profile_folders.lock().unwrap();
+        let (applied, checked) = &mut *state;
+        if checked.is_some_and(|t| t.elapsed() < PROFILE_CHECK_EVERY) {
+            return;
+        }
+        *checked = Some(Instant::now());
+        let current = caller::profile_folders();
+        if applied.as_ref() != Some(&current) {
+            engine.set_profile_folders(&current);
+            (self.log)(&format!(
+                "profile folders in the registry: {}",
+                current.len()
+            ));
+            *applied = Some(current);
         }
     }
 
@@ -302,6 +328,7 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
     };
     engine.touch();
     let t = Instant::now();
+    state.refresh_profile_folders(engine);
     let index = engine.read();
     // The epoch is read from the same locked index, so it always describes this state.
     let profiles = state.profiles(&index, index.users_epoch());

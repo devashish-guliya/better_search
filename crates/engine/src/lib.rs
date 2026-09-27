@@ -217,6 +217,17 @@ impl Engine {
         save_shared(&self.shared);
     }
 
+    /// See [`Index::set_profile_folders`]. Takes the write lock, so only call it when
+    /// the list may have changed.
+    pub fn set_profile_folders(&self, paths: &[String]) {
+        let _maintenance = self.shared.maintenance.lock().unwrap();
+        self.shared
+            .index
+            .write()
+            .unwrap()
+            .set_profile_folders(paths);
+    }
+
     /// Stops following the journals and, with `save`, writes the snapshot once the
     /// watchers are done. The index stays readable.
     pub fn shutdown(&self, save: bool) {

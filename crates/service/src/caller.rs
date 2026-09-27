@@ -3,14 +3,17 @@
 use std::ffi::c_void;
 use std::io;
 use std::path::PathBuf;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, RevertToSelf, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Pipes::ImpersonateNamedPipeClient;
-use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW,
+    RegOpenKeyExW,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
 pub struct Caller {
@@ -76,9 +79,62 @@ pub(crate) fn token_user_sid(token: HANDLE) -> io::Result<String> {
     crate::security::sid_string(user.User.Sid)
 }
 
+const PROFILE_LIST: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList";
+
+/// LocalSystem, LocalService and NetworkService: accounts, not people, and no one
+/// searches as them.
+const SERVICE_ACCOUNTS: &[&str] = &["S-1-5-18", "S-1-5-19", "S-1-5-20"];
+
+/// The profile folder of every account with a profile on this machine, sorted.
+pub fn profile_folders() -> Vec<String> {
+    let key: Vec<u16> = PROFILE_LIST.encode_utf16().chain([0]).collect();
+    let mut list: HKEY = null_mut();
+    // SAFETY: the key name is NUL-terminated; `list` receives an open key.
+    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key.as_ptr(), 0, KEY_READ, &mut list) }
+        != ERROR_SUCCESS
+    {
+        return Vec::new();
+    }
+    let mut folders = Vec::new();
+    let mut name = [0u16; 256];
+    for i in 0.. {
+        let mut len = name.len() as u32;
+        // SAFETY: `name` holds `len` characters; the optional outputs are null.
+        let err = unsafe {
+            RegEnumKeyExW(
+                list,
+                i,
+                name.as_mut_ptr(),
+                &mut len,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if err == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if err != ERROR_SUCCESS {
+            continue;
+        }
+        let sid = String::from_utf16_lossy(&name[..len as usize]);
+        if SERVICE_ACCOUNTS.contains(&sid.as_str()) {
+            continue;
+        }
+        if let Some(path) = profile_path(&sid) {
+            folders.push(path.to_string_lossy().into_owned());
+        }
+    }
+    // SAFETY: opened above.
+    unsafe { RegCloseKey(list) };
+    folders.sort();
+    folders
+}
+
 /// Looks up the profile folder Windows records for `sid`.
 fn profile_path(sid: &str) -> Option<PathBuf> {
-    let key: Vec<u16> = format!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}")
+    let key: Vec<u16> = format!(r"{PROFILE_LIST}\{sid}")
         .encode_utf16()
         .chain([0])
         .collect();
@@ -120,5 +176,21 @@ mod tests {
             path.display()
         );
         assert_eq!(profile_path("S-1-5-21-0-0-0-99999"), None);
+    }
+
+    #[test]
+    fn lists_profile_folders_without_service_accounts() {
+        let folders = profile_folders();
+        let own = std::env::var("USERPROFILE").unwrap().to_lowercase();
+        assert!(
+            folders.iter().any(|f| f.to_lowercase() == own),
+            "{folders:?}"
+        );
+        assert!(
+            !folders
+                .iter()
+                .any(|f| f.to_lowercase().ends_with(r"\config\systemprofile")),
+            "{folders:?}"
+        );
     }
 }

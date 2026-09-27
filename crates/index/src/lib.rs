@@ -369,6 +369,20 @@ pub struct Index {
     /// batch; their rules are re-checked in [`Self::end_batch`].
     marker_parents: Vec<u32>,
     batch_changed: bool,
+    /// Profile folders Windows keeps outside `<drive>\Users`. They count as profile
+    /// folders for `users_epoch` exactly like the folders inside a users folder.
+    profile_folders: Vec<ProfileFolder>,
+    /// A folder was created or renamed with the name of a profile folder that is not
+    /// in the index yet; [`Self::end_batch`] looks for it again.
+    profile_recheck: bool,
+}
+
+/// A profile folder outside `<drive>\Users`, from [`Index::set_profile_folders`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProfileFolder {
+    /// Lowercased path parts, drive first: `c:`, `profiles`, `anna`.
+    parts: Vec<String>,
+    entry: Option<u32>,
 }
 
 impl Index {
@@ -461,15 +475,26 @@ impl Index {
     /// A users folder itself, or a profile folder directly inside one: changing these
     /// changes which user a result belongs to, even when no ancestor moved.
     fn users_direct(&self, entry: u32) -> bool {
-        self.is_users_folder(entry) || self.parent(entry).is_some_and(|p| self.is_users_folder(p))
+        self.is_users_folder(entry)
+            || self.parent(entry).is_some_and(|p| self.is_users_folder(p))
+            || self.is_profile_folder(entry)
     }
 
-    /// The profile folder `entry` belongs to, if it is inside a users folder. The
-    /// users folder itself and everything outside have no owner.
+    /// One of the profile folders outside `<drive>\Users`.
+    fn is_profile_folder(&self, entry: u32) -> bool {
+        self.profile_folders.iter().any(|p| p.entry == Some(entry))
+    }
+
+    /// The profile folder `entry` belongs to, if it is inside a users folder or one of
+    /// the profile folders outside them. The users folder itself and everything
+    /// outside have no owner.
     fn users_owner(&self, entry: u32) -> Option<u32> {
         let mut current = Some(entry);
         for _ in 0..MAX_DEPTH {
             let e = current?;
+            if self.is_profile_folder(e) {
+                return Some(e);
+            }
             if self.is_users_folder(e) {
                 return None;
             }
@@ -486,6 +511,87 @@ impl Index {
     /// map built earlier can be reused while this is unchanged.
     pub fn users_epoch(&self) -> u64 {
         self.users_epoch
+    }
+
+    /// Tells the index where Windows keeps profile folders (`ProfileImagePath` in the
+    /// registry), so that those outside `<drive>\Users` count as profile folders too.
+    /// Paths directly inside a users folder are covered already and ignored. Bumps
+    /// `users_epoch` when the result differs from before.
+    pub fn set_profile_folders<S: AsRef<str>>(&mut self, paths: &[S]) {
+        let mut wanted: Vec<Vec<String>> = paths
+            .iter()
+            .filter_map(|p| profile_parts(p.as_ref()))
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        let current: Vec<&Vec<String>> = self.profile_folders.iter().map(|p| &p.parts).collect();
+        if current.iter().copied().eq(wanted.iter()) {
+            return;
+        }
+        self.profile_folders = wanted
+            .into_iter()
+            .map(|parts| ProfileFolder { parts, entry: None })
+            .collect();
+        self.resolve_profile_folders();
+        self.users_epoch += 1;
+    }
+
+    /// The profile folders outside `<drive>\Users` that are in the index, as lowercased
+    /// paths (`c:\profiles\anna`) with their entries.
+    pub fn profile_folders(&self) -> impl Iterator<Item = (String, u32)> + '_ {
+        self.profile_folders.iter().filter_map(|p| {
+            let entry = p.entry.filter(|&e| !self.is_deleted(e))?;
+            Some((p.parts.join("\\"), entry))
+        })
+    }
+
+    /// Whether a folder called `name` may be a profile folder that is not in the index
+    /// yet (or was deleted), so that a new folder of that name needs a look.
+    fn is_missing_profile_folder_name(&self, name: &str) -> bool {
+        self.profile_folders.iter().any(|p| {
+            p.entry.is_none_or(|e| self.is_deleted(e))
+                && p.parts
+                    .last()
+                    .is_some_and(|last| *last == name.to_lowercase())
+        })
+    }
+
+    /// Finds the entries of profile folders not found yet (or deleted since). Returns
+    /// whether any entry changed.
+    fn resolve_profile_folders(&mut self) -> bool {
+        let mut changed = false;
+        for i in 0..self.profile_folders.len() {
+            let entry = self.profile_folders[i].entry;
+            if entry.is_some_and(|e| !self.is_deleted(e)) {
+                continue;
+            }
+            let found = self.find_folder(&self.profile_folders[i].parts);
+            if found != entry {
+                self.profile_folders[i].entry = found;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The live folder at lowercased `parts` (drive first), found one level at a time.
+    /// A scan over all entries per level, so only for rare lookups.
+    fn find_folder(&self, parts: &[String]) -> Option<u32> {
+        let (drive, rest) = parts.split_first()?;
+        let volume = self
+            .volumes
+            .iter()
+            .find(|v| v.label.to_lowercase() == *drive)?;
+        let mut current = volume.root;
+        for part in rest {
+            current = (0..self.len() as u32).find(|&e| {
+                self.parents[e as usize] == current
+                    && self.is_dir(e)
+                    && !self.is_deleted(e)
+                    && self.name(e).to_lowercase() == *part
+            })?;
+        }
+        Some(current)
     }
 
     /// Rebuilds the full path by walking parent links. Only call this for results
@@ -608,6 +714,9 @@ impl Index {
                     basic |= flags::HIDDEN;
                 }
                 let owner_before = existing.and_then(|entry| self.users_owner(entry));
+                // A users folder renamed or moved away stops holding profiles, which
+                // its state after the change no longer shows.
+                let direct_before = existing.is_some_and(|entry| self.users_direct(entry));
 
                 let (entry, applied, placed) = match existing {
                     Some(entry) => {
@@ -676,10 +785,14 @@ impl Index {
                 // between users folders, or when a users folder or a profile folder
                 // itself is created or changed. Everything else is picked up by
                 // extending a map that is already built.
-                if self.users_direct(entry)
+                if direct_before
+                    || self.users_direct(entry)
                     || existing.is_some_and(|_| owner_before != self.users_owner(entry))
                 {
                     self.users_epoch += 1;
+                }
+                if placed && is_dir && self.is_missing_profile_folder_name(name) {
+                    self.profile_recheck = true;
                 }
                 applied
             }
@@ -699,6 +812,12 @@ impl Index {
         if self.locations_dirty {
             assign_locations(self);
             self.locations_dirty = false;
+        }
+        if self.profile_recheck {
+            self.profile_recheck = false;
+            if self.resolve_profile_folders() {
+                self.users_epoch += 1;
+            }
         }
         if self.batch_changed {
             self.generation += 1;
@@ -886,6 +1005,18 @@ impl Index {
             orphans_possible: false,
             marker_parents: Vec::new(),
             batch_changed: false,
+            profile_folders: self
+                .profile_folders
+                .iter()
+                .map(|p| ProfileFolder {
+                    parts: p.parts.clone(),
+                    entry: p
+                        .entry
+                        .map(|e| remap[e as usize])
+                        .filter(|&e| e != NO_PARENT),
+                })
+                .collect(),
+            profile_recheck: self.profile_recheck,
         }
     }
 
@@ -1036,6 +1167,8 @@ impl Index {
             orphans_possible: false,
             marker_parents: Vec::new(),
             batch_changed: false,
+            profile_folders: Vec::new(),
+            profile_recheck: false,
         }
     }
 }
@@ -1250,6 +1383,8 @@ impl IndexBuilder {
             orphans_possible: false,
             marker_parents: Vec::new(),
             batch_changed: false,
+            profile_folders: Vec::new(),
+            profile_recheck: false,
         };
         assign_locations(&mut index);
         if index.volumes.iter().any(|v| !v.records.recent.is_empty()) {
@@ -1612,6 +1747,23 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
         }
     }
     inherited
+}
+
+/// `C:\Profiles\anna` as `["c:", "profiles", "anna"]`, or `None` for paths that are not
+/// below a drive root and for `<drive>\Users\<name>` (a users folder already covers it).
+fn profile_parts(path: &str) -> Option<Vec<String>> {
+    let lower = path.trim_end_matches('\\').to_lowercase();
+    let parts: Vec<String> = lower.split('\\').map(str::to_owned).collect();
+    let drive = parts.first()?;
+    let is_drive =
+        drive.len() == 2 && drive.ends_with(':') && drive.as_bytes()[0].is_ascii_alphabetic();
+    if !is_drive || parts.len() < 2 || parts[1..].iter().any(String::is_empty) {
+        return None;
+    }
+    if parts[1] == "users" && parts.len() <= 3 {
+        return None;
+    }
+    Some(parts)
 }
 
 #[cfg(test)]
@@ -2233,8 +2385,6 @@ mod tests {
 
     #[test]
     fn users_epoch_changes_only_when_profiles_change() {
-        // sample(): C:\Users\bob\Documents\report.docx, C:\Windows\notepad.exe, record
-        // numbers 10 (Users), 11 (bob), 12 (Documents), 13 (report.docx).
         // sample(): C:\Users (record 10) \ bob (11) \ Documents (12) \ report.docx (13),
         // and C:\Windows (20), C:\orphan.txt (40).
         let mut index = sample();
@@ -2268,13 +2418,72 @@ mod tests {
         // Moving it out of any profile folder gives up its owner too.
         let moved = index.volumes()[0].entry_for_record(12).unwrap();
         let windows = index.volumes()[0].entry_for_record(20).unwrap();
+        let before_move_out = index.users_epoch();
         index.apply(0, upsert(12, 20, "Documents", true));
         index.end_batch();
         assert_eq!(index.parent(moved), Some(windows));
+        assert_ne!(index.users_epoch(), before_move_out);
 
         // Compaction renumbers entries, so any map built from them is void.
         let before_compaction = index.users_epoch();
         index.compact();
         assert_ne!(index.users_epoch(), before_compaction);
+    }
+
+    #[test]
+    fn renaming_the_users_folder_changes_the_users_epoch() {
+        let mut index = sample();
+        let start = index.users_epoch();
+        index.apply(0, upsert(10, 5, "Users.old", true));
+        index.end_batch();
+        assert_ne!(index.users_epoch(), start);
+    }
+
+    #[test]
+    fn profile_folders_outside_users_count_as_profiles() {
+        let mut index = sample();
+        index.apply(0, upsert(400, 5, "Profiles", true));
+        index.apply(0, upsert(401, 400, "anna", true));
+        index.end_batch();
+        let start = index.users_epoch();
+        let anna = index.volumes()[0].entry_for_record(401).unwrap();
+
+        // Users\bob is covered by the users folder; other paths are not profiles.
+        index.set_profile_folders(&[r"C:\Profiles\anna\", r"C:\Users\bob", r"\\server\x"]);
+        assert_ne!(index.users_epoch(), start);
+        let listed: Vec<(String, u32)> = index.profile_folders().collect();
+        assert_eq!(listed, vec![(r"c:\profiles\anna".to_string(), anna)]);
+
+        // The same list again, in another spelling, changes nothing.
+        let set = index.users_epoch();
+        index.set_profile_folders(&[r"c:\PROFILES\Anna"]);
+        assert_eq!(index.users_epoch(), set);
+
+        // A new file inside inherits its owner; moving a folder in changes an owner.
+        index.apply(0, upsert(402, 401, "notes.txt", false));
+        index.end_batch();
+        assert_eq!(index.users_epoch(), set);
+        index.apply(0, upsert(31, 401, "code", true));
+        index.end_batch();
+        assert_ne!(index.users_epoch(), set);
+
+        // A profile folder that does not exist yet is picked up when it is created.
+        index.set_profile_folders(&[r"C:\Profiles\anna", r"C:\Profiles\carl"]);
+        assert_eq!(index.profile_folders().count(), 1);
+        let before_carl = index.users_epoch();
+        index.apply(0, upsert(403, 400, "Carl", true));
+        index.end_batch();
+        assert_ne!(index.users_epoch(), before_carl);
+        assert_eq!(index.profile_folders().count(), 2);
+
+        // Compaction renumbers entries but keeps the folders.
+        index.apply(0, Change::Delete { record: 13 });
+        index.end_batch();
+        index.compact();
+        let paths: Vec<String> = index
+            .profile_folders()
+            .map(|(_, e)| index.full_path(e))
+            .collect();
+        assert_eq!(paths, vec![r"C:\Profiles\anna", r"C:\Profiles\Carl"]);
     }
 }

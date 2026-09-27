@@ -1,6 +1,7 @@
 //! Keeps each user's searches out of other users' profile folders
-//! (`<drive>\Users\<name>`). The profile folders themselves stay visible, like the
-//! user list in Explorer; only what is inside them is hidden.
+//! (`<drive>\Users\<name>`, and the folders set with `Index::set_profile_folders`).
+//! The profile folders themselves stay visible, like the user list in Explorer; only
+//! what is inside them is hidden.
 
 use std::path::Path;
 
@@ -62,6 +63,17 @@ impl Profiles {
                 };
                 inherit[e as usize] = slot;
             }
+        }
+        // Profile folders elsewhere are keyed by their whole path, which contains a
+        // backslash, so they can never be confused with a folder name above.
+        for (path, e) in index.profile_folders() {
+            let slot = if names.len() < usize::from(OVERFLOW - 1) {
+                names.push(path);
+                names.len() as u8
+            } else {
+                OVERFLOW
+            };
+            inherit[e as usize] = slot;
         }
 
         let mut built = Self {
@@ -137,11 +149,16 @@ impl Profiles {
     /// `C:\Users\anna`) may see. `None` sees only shared profile folders.
     pub fn visibility(&self, own_profile: Option<&Path>) -> Visibility {
         let own = own_profile.and_then(profile_folder_name);
+        let own_path = own_profile
+            .and_then(Path::to_str)
+            .map(|p| p.trim_end_matches('\\').to_lowercase());
         let mut allowed = [false; 256];
         allowed[usize::from(NONE)] = true;
         for (i, name) in self.names.iter().enumerate() {
             // The same folder name on another drive is usually the user's old profile.
-            let visible = SHARED.contains(&name.as_str()) || own.as_deref() == Some(name);
+            let visible = SHARED.contains(&name.as_str())
+                || own.as_deref() == Some(name)
+                || own_path.as_deref() == Some(name);
             allowed[i + 1] = visible;
         }
         Visibility { allowed }
@@ -300,6 +317,56 @@ mod tests {
         assert_ne!(before.generation(), index.generation());
         let seen = visible(&index, Some(r"C:\Users\anna"));
         assert!(seen.contains(&r"C:\Program Files\Desktop\secret.txt".to_string()));
+    }
+
+    #[test]
+    fn profile_folders_outside_users_are_private_too() {
+        let mut tree = TREE.to_vec();
+        tree.extend(["Profiles\\dora\\diary.txt", "Profiles\\readme.txt"]);
+        let mut index = build(&tree);
+        index.set_profile_folders(&[r"C:\Profiles\dora"]);
+
+        let anna = visible(&index, Some(r"C:\Users\anna"));
+        assert!(!anna.contains(&r"C:\Profiles\dora\diary.txt".to_string()));
+        assert!(anna.contains(&r"C:\Profiles\dora".to_string()));
+        assert!(anna.contains(&r"C:\Profiles\readme.txt".to_string()));
+
+        let dora = visible(&index, Some(r"c:\profiles\DORA\"));
+        assert!(dora.contains(&r"C:\Profiles\dora\diary.txt".to_string()));
+        assert!(!dora.iter().any(|p| p.starts_with(r"C:\Users\Bob\")));
+        assert!(dora.contains(&r"C:\Users\Public\Music\song.mp3".to_string()));
+    }
+
+    #[test]
+    fn extending_matches_a_rebuild() {
+        let mut index = build(TREE);
+        let map = Profiles::build(&index, index.users_epoch());
+        // Records from `build`: 104 is Users\Bob, 115 is Program Files.
+        for (record, parent, name) in [(500, 104, "new.txt"), (501, 115, "tool.exe")] {
+            index.apply(
+                0,
+                Change::Upsert {
+                    record,
+                    parent_record: parent,
+                    name,
+                    is_dir: false,
+                    hidden: false,
+                },
+            );
+        }
+        index.end_batch();
+        assert_eq!(index.users_epoch(), map.epoch());
+
+        let extended = map.extended(&index);
+        assert_eq!(extended.generation(), index.generation());
+        assert_eq!(extended.inherit, Profiles::build(&index, 0).inherit);
+        let anna = extended.visibility(Some(Path::new(r"C:\Users\anna")));
+        let bob = extended.visibility(Some(Path::new(r"C:\Users\Bob")));
+        let new_file = index.volumes()[0].entry_for_record(500).unwrap();
+        let tool = index.volumes()[0].entry_for_record(501).unwrap();
+        assert!(!extended.allows(&anna, &index, new_file));
+        assert!(extended.allows(&bob, &index, new_file));
+        assert!(extended.allows(&anna, &index, tool));
     }
 
     #[test]
