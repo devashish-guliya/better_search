@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `9c479c7` ("Background service, named pipe and per-user privacy").
+Last updated after commit `11970b2` ("Refuse a hijacked data folder and a fake service pipe").
 
 ---
 
@@ -40,6 +40,8 @@ Out of scope: searching file **contents**. Only names are searched.
 | `aca0454` | Sorted record lookup, non-blocking compaction, name table restored, "unknown parent → ignore" rule |
 | `913618b` | Clutter detection that works on any PC: tool-only names, project-confirmed names, self-labelled folders |
 | `9c479c7` | Phase 3 steps 1-5: engine crate, `bs-service.exe` (SCM), named pipe, per-user privacy, `bs query` |
+| `fb317c6` | Project docs and README for Phase 3 steps 1-5 |
+| `11970b2` | Security fixes from an audit: planted data folders are moved aside, the client refuses a pipe the service did not create |
 
 ## 4. Current results on the development machine
 
@@ -50,13 +52,14 @@ Measured with an elevated run of `bs --bench` and of the service after `9c479c7`
 | Files and folders scanned | 3,981,149 |
 | Kept in the index (clutter skipped) | 609,686 (85% skipped) |
 | Entries hidden by clutter rules | 3,371,463 (node_modules 2.1 M, System Volume Information 255 K, winsxs 206 K, ...) |
-| First full scan | about 53 s under the service (C: 20.7 s, D: 29.4 s, E: 2.2 s; the HDD is the limit) |
+| First full scan | 53-61 s under the service (C: 20.7-25.6 s, D: 29.4 s, E: 2.2 s; the HDD is the limit) |
 | Normal start (load snapshot + catch up) | 134 ms load plus 13 ms catch-up under the service; 158 ms for `bs` |
 | Index memory | 18.8 MB (names 8.9, entries 5.3, change lookup 2.3, name lookup 2.2) |
 | Privacy map | 0.6 MB, built in 7 ms (once per index state), extended in 0.2 ms (per change) |
 | Service process memory | 21-22 MB private at ready, 25 MB working set |
 | Snapshot on disk | 4.5 MB, saved in 270-530 ms |
-| Search through the pipe | 0.6-1.1 ms (readme, notepad, "config json"), 3.0-3.4 ms (png), 9-11 ms (single letter "e") |
+| Search through the pipe (same query repeated) | 0.6-1.1 ms (readme, notepad, "config json"), 3.0-3.4 ms (png), 9-11 ms (single letter "e"); see the note below |
+| Fresh search (`bs --bench`, median) | readme 2.2-2.5 ms, "e" 8.9 ms (slower than at `913618b`; see the note below) |
 | Pipe overhead | 0.1-0.2 ms over a search; a connection costs 0.2 ms |
 | Typing a word | first keystroke 7-11 ms, 1-2 ms from the fourth letter on (under 1 ms for long words with few matches) |
 | Idle CPU | 0 while nothing changes on the drives; 359 ms per 90 s while builds and file changes were happening (journal updates, by design) |
@@ -67,6 +70,16 @@ The machine state moves these numbers by up to 25%: an earlier bench of the same
 while the editor and this session were also running. Compare runs within one session
 rather than across sessions.
 
+The pipe numbers come from `bs query --bench`, which repeats each query 15 times on one
+connection and reports the median. From the second repeat on, the connection's session
+re-checks only the names that matched before, so these are best-case numbers, not the
+cost of a fresh search. A fresh search through the service has not been measured yet.
+Two `bs --bench` runs at `913618b` gave fresh-search medians of readme 0.9-1.0 ms and
+"e" 6.0 ms (`10_rescan.txt`, `12_load.txt`); two runs at `9c479c7` gave 2.2-2.5 ms and
+8.9 ms (`13_bench.txt`, `16_bench.txt`). That may be a regression or machine noise, and
+needs a side-by-side run of both binaries in one session (an open item under Phase 3 in
+section 8).
+
 History of the main numbers, to show what each change bought:
 
 | After commit | Index RAM | Snapshot | Start | Typical search |
@@ -75,7 +88,7 @@ History of the main numbers, to show what each change bought:
 | `4b12a23` (clutter skipped) | 35 MB | 7.1 MB | 0.15 s | 2–3 ms |
 | `aca0454` (sorted lookup, name table back) | 23.5 MB | 6.4 MB | 87 ms | 1.2–1.9 ms |
 | `913618b` (universal clutter rules) | 18.4 MB | 4.5 MB | 60 ms | 0.7–1.3 ms |
-| `9c479c7` (service, pipe, privacy) | 18.8 MB | 4.5 MB | 134 ms (service) | 0.6–1.1 ms plus 0.1–0.2 ms pipe |
+| `9c479c7` (service, pipe, privacy) | 18.8 MB | 4.5 MB | 134 ms (service) | 2.2–2.5 ms fresh (`bs --bench`, see above), plus 0.1–0.2 ms pipe |
 
 ---
 
@@ -322,18 +335,24 @@ the `SKIPPED` flag; nothing below it is in the index.
 Both the console tool and the service are thin shells around `Engine`. It owns the
 index, keeps it current, saves it and serves searches:
 
-- `Config` chooses the drives (or a walk folder), the snapshot path, the skip rules and
-  the save interval. A `Log` callback (an `Arc<dyn Fn(&str)>`) replaces printing, so the
+- `Config` chooses the NTFS drives (empty means all fixed NTFS drives), the snapshot
+  path, whether to ignore the snapshot (`rescan`) and whether to skip clutter. The save
+  interval and trim delay are constants. A `Log` callback (an `Arc<dyn Fn(&str)>`) replaces printing, so the
   console tool prints and the service writes to its log file; the crates never print.
-- `Engine::open` scans and builds; `Engine::from_index` loads a snapshot and catches up
-  from the journals; `start` spawns the watcher and saver threads; `read` runs a search
-  (`Session::search_filtered` when the service passes a privacy filter); `touch` runs
-  the maintenance that a search should wait behind; `save` and `shutdown` stop it all.
+- `Engine::open` loads the snapshot and catches up from the journals, or scans the
+  drives when there is no usable snapshot; `Engine::from_index` wraps an index that has
+  no drives behind it (a walked folder, test data), so it gets no live updates and no
+  snapshot; `start` spawns the watcher and saver threads; `read` gives a read lock for
+  searching (the caller runs `Session::search` or, in the service,
+  `Session::search_filtered` with the privacy filter); `touch` records that a search
+  happened, which postpones the idle trim; `save` saves now; `shutdown` stops the
+  threads and optionally saves.
 - `shutdown` must be able to interrupt a journal read that is blocked in the kernel, and
-  a blocked `ReadFile` cannot be asked to stop. Each watcher therefore registers its
-  current journal handle and thread id, and `shutdown` cancels the read with
-  `CancelSynchronousIo`. That is why a service stop is fast (a few hundred ms) instead
-  of waiting for the read timeout.
+  a blocked `ReadFile` never checks a stop flag. `shutdown` therefore calls
+  `CancelSynchronousIo` on each watcher's thread handle (taken from its `JoinHandle`),
+  repeating it every 5 ms because a cancel can land just before the thread enters the
+  wait. That is why a service stop is fast (a few hundred ms) instead of waiting for the
+  read timeout.
 - **Shared state:** `Shared` holds the index in an `RwLock`. Searches take a read lock.
 - One **watcher thread per drive** follows its journal and applies changes in batches
   under the write lock.
@@ -364,10 +383,30 @@ bs-service.exe --console  Same thing in a terminal, for testing
   `SERVICE_STOP_PENDING` with a wait hint while it saves, so an installer or the user
   never sees "did not respond".
 - The data folder is `%ProgramData%\better_search`. It is created (or re-secured) on
-  every start with an explicit DACL: SYSTEM and administrators full control, a
-  **protected** DACL (no inherited entries), and it is owned by SYSTEM. Other users
-  cannot list or read the folder, so the index (all file names on the machine) is not
-  readable by a normal user; this was verified from a non-elevated shell.
+  every start with a **protected** DACL (no inherited entries) that gives only SYSTEM
+  and administrators full control, and owner Administrators
+  (`O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)`). Other users cannot list the folder, read
+  `index.bin` or `service.log`, create files in it or rename it (all four verified from
+  a non-elevated shell against the running service, `17_user_probes.txt`).
+- **A planted folder is never used** (`security::secure_dir`). Every user may create
+  folders in `%ProgramData%`, so before the service first runs, a user could put a
+  junction there (the service would then set its DACL on, and write the index into,
+  whatever the junction points at) or a folder they own (an owner can always rewrite
+  the DACL and read the index later). On every start the service opens the folder
+  without following links and checks it: a junction or other reparse point, a file, or
+  an owner other than SYSTEM or Administrators makes it untrusted. Otherwise the owner
+  and DACL are set **through that handle**, so a folder swapped in between the check
+  and the change cannot receive them. Then the entries inside are checked (no links,
+  no hard-linked files, trusted owners only). An untrusted folder is renamed to
+  `better_search.untrusted-<ms>-<pid>` (the link itself for a junction, so nothing
+  behind it is touched), one log line says why, and a fresh folder is created; this is
+  retried up to four times. The moved-aside folder stays for an administrator (or the
+  uninstaller) to delete, because its contents are not the service's to judge.
+  Verified in `run12.ps1` (`17_service.txt`): a junction to `D:\bsprobe_decoy` planted
+  by a normal user was moved aside and the decoy kept its one file and identical
+  permissions; a trusted folder was reused on restart (ready in 308 ms); a folder
+  handed to the user (owner plus full control, a planted file) was moved aside and
+  replaced.
 - Log: `%ProgramData%\better_search\service.log`, one line per event with a timestamp,
   rotated at about 1 MB keeping one old copy. It records single lines only: start,
   per-drive scan results, skipped-entry summary, save, ready, one line per client
@@ -385,28 +424,47 @@ bs-service.exe --console  Same thing in a terminal, for testing
 - Name: `\\.\pipe\better_search`. One message per request and reply, message mode, so a
   client cannot read a partial reply; remote clients are rejected
   (`PIPE_REJECT_REMOTE_CLIENTS`).
-- **Who may connect:** the pipe's security descriptor allows `SYSTEM`,
-  `BUILTIN\Administrators` and `INTERACTIVE` (each logged-on interactive user), and
-  denies a network logon outright. Users get read and write (query text in, reply out)
-  but **not** `FILE_CREATE_PIPE_INSTANCE`, so a program started by a user cannot create
-  its own `\\.\pipe\better_search` instance and impersonate the service (tested:
-  creating the pipe as a normal user is refused). The service also creates its first
-  instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`, which fails if anyone got there first.
-- **Request:** version, kind, limit (capped at 1000 hits), length-prefixed UTF-8 query.
-  **Reply:** status (`Ok`, `Loading`, `BadRequest`), total match count, then up to `limit`
-  hits of `id, parent record, flags, size, modified time, name`. Little endian, fixed
-  layout, size-checked on both sides, with round-trip and truncation tests. The protocol
-  version is checked on connect.
+- **Who may connect:** the pipe's security descriptor
+  (`O:BAD:P(D;;GA;;;NU)(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12018b;;;IU)`) denies a network
+  logon outright and allows `SYSTEM`, `BUILTIN\Administrators` and `INTERACTIVE` (each
+  logged-on interactive user). Users get read and write (query text in, reply out) but
+  **not** `FILE_CREATE_PIPE_INSTANCE`, so while the service runs, a program started by
+  a user cannot add its own instance of `\\.\pipe\better_search` and receive other
+  users' queries. The service also creates its first instance with
+  `FILE_FLAG_FIRST_PIPE_INSTANCE`, which fails if anyone got there first. (The denied
+  create was not tested separately; it follows from the descriptor.)
+- **The client checks the server.** While the service is stopped, any program may
+  create a pipe with that name. The pipe is therefore owned by Administrators, which an
+  ordinary user cannot make the owner of anything, and `Client::connect` reads the
+  owner right after opening the pipe and refuses anything other than SYSTEM or
+  Administrators, before a query is sent. The fake server learns only who connected
+  (identification level, see 5.9). Verified: a pipe named `better_search` created by
+  the normal user made `bs query` fail with "\\.\pipe\better_search is served by a
+  program that is not the better_search service (the pipe is owned by S-1-5-21-...)";
+  a unit test covers the same. An elevated program can still pass the check, which is
+  fine: an administrator can read the index anyway.
+- **Request:** `version u8 · kind u8 (1 = search) · limit u16 · query UTF-8` (the query
+  is the rest of the message, at most 4096 bytes in total; the limit is capped at 1000).
+  **Reply:** `version u8 · status u8 · total matches u32 · search time µs u32 · hit
+  count u16`, then per hit `score i32 · flags u8 (1 = folder) · path length u16 · path
+  UTF-8`. Status is `Ok`, `Loading`, `BadRequest` or `Denied` (the caller could not be
+  identified). Little endian, size-checked on both sides, with round-trip and
+  truncation tests. Every message carries the version and a mismatch is rejected.
 - **Client** (`bs-pipe`): connects, then `TransactNamedPipe` per query, reading the rest
   of a reply if it did not fit in one buffer (`ERROR_MORE_DATA` handshake), retrying on
   `ERROR_PIPE_BUSY` for a few seconds. Overhead measured from the console tool:
-  0.1-0.2 ms per query (connection 0.2 ms), against a service-side search of 0.6-11 ms.
+  0.1-0.2 ms per query (connection 0.2 ms), against a service-side search of 0.6-11 ms
+  (repeated queries, see section 4).
+- **Connections:** one blocking thread per connection, at most 64 at a time for all
+  users together.
 
 ### 5.9 Per-user privacy (`crates/engine/src/profiles.rs`)
 
-The point: a normal user must not see file names in other users' profile folders, and
-administrators are filtered the same way, because Windows accounts can be switched
-without the service noticing.
+The point: a normal user must not see file names in other users' profile folders.
+Administrators are filtered the same way, as the plan decided, so an administrator's
+everyday search does not show other people's files. For administrators this is a
+courtesy, not a security boundary: they can read the index file or the profile folders
+directly.
 
 - **Who is asking:** on each connection the service calls `ImpersonateNamedPipeClient`
   at **identification** level (enough to read the token, not enough to act as the user),
@@ -489,11 +547,13 @@ and reports a clear message when the service is not running.
 | No parallel scan, no results during the first scan, no single-letter index | Rejected by the user: complexity and memory for rare cases |
 | Engine as a library (`bs-engine`), shells only print | Both the service and the console tool need the same behaviour; a log callback keeps the library testable and the service quiet |
 | Service runs as LocalSystem | It needs MFT and journal access at boot, before any user logs in; the user installs once |
-| Machine-wide snapshot in `%ProgramData%` with its own protected DACL | The service runs as SYSTEM, so the index must not be readable by users; a protected DACL resists later changes |
+| Machine-wide snapshot in `%ProgramData%` with its own protected DACL | The service runs as SYSTEM, so the index must not be readable by users; a protected DACL does not pick up ProgramData's "users may read" entries |
+| Move a planted data folder aside instead of fixing or deleting it | Any user can pre-create the folder; fixing a junction would change its target, fixing a user-owned folder leaves the owner able to undo it, and deleting could remove files behind a link |
+| Pipe owned by Administrators, client checks the owner | While the service is stopped anyone can create the pipe name; the owner is the one property an ordinary user cannot fake, and the check costs one call per connection |
 | Cancel a blocked journal read instead of a stop flag | A blocked `ReadFile` never checks a flag; `CancelSynchronousIo` makes a stop take milliseconds |
 | "Loading" replies instead of refusing connections | The first full scan takes about a minute; a client should be told to wait, not fail |
 | Named pipe with a message protocol, remote clients rejected | Local only (locked in), and message mode removes partial-read bugs from the first version |
-| `INTERACTIVE` users get read/write but no `FILE_CREATE_PIPE_INSTANCE` | A user cannot serve a fake pipe and see another user's queries; also blocks squatting |
+| `INTERACTIVE` users get read/write but no `FILE_CREATE_PIPE_INSTANCE` | While the service runs, a user cannot add a fake instance and see another user's queries (the owner check covers the time it does not run) |
 | Per-user privacy inside the search pass (a filter), not after it | Hidden entries must be missing from the match count too, otherwise the number is a lie |
 | Privacy by profile folder, not by file ownership | Ownership is not printed in results and would need an ACL read per entry; the folder is the unit users think in |
 | The caller's SID and profile path only, read at identification level | Reading a token is not acting as the user; identification level cannot do anything else |
@@ -517,13 +577,15 @@ and reports a clear message when the service is not running.
 - Idle trim after 60 s.
 - Snapshot at `%LOCALAPPDATA%\better_search\index.bin` for the console tool, format v3
   (bump `VERSION` when the format changes); `%ProgramData%\better_search\index.bin` with
-  its protected SYSTEM + administrators DACL for the service.
+  its protected SYSTEM + administrators DACL and owner Administrators for the service;
+  a data folder that fails the checks in 5.7 is moved aside, never used.
 - The service runtime: LocalSystem, started by the SCM, machine-wide data folder,
   log file at 1 MB with one old copy, `--console` for testing, "loading" replies while
   the index is not ready, save on stop and no save on shutdown.
 - The pipe: `\\.\pipe\better_search`, message-mode protocol version 1, limit capped at
   1000 hits, remote clients rejected, `INTERACTIVE` users may read and write but not
-  create instances.
+  create instances, the pipe is owned by Administrators and clients refuse any other
+  owner than SYSTEM or Administrators.
 - Privacy: hide the contents of other users' profile folders (`<drive>\Users\<name>`)
   from results **and** match counts, for administrators too; the profile folder itself
   stays visible only under its current name; `C:\Users\Public` is shared.
@@ -547,6 +609,22 @@ service (`target\admin_run\run8.ps1` to `run11.ps1`), a non-elevated client and 
 release binaries. Steps 6 (removable non-NTFS drives) and 7 (final measurements at the
 end of the phase) remain. The step text below is the plan as it was written; where the
 result differed, the difference is noted.
+
+**Audit after step 5.** A review of the Phase 3 code found two security gaps, fixed in
+`11970b2` (a planted data folder, 5.7; a fake pipe while the service is stopped, 5.8).
+Still open, in the suggested order:
+
+- **Profiles outside `Users`:** profile folders outside `<drive>\Users` (a
+  `ProfileImagePath` in the registry that points elsewhere) are not hidden from other
+  users.
+- **Search speed:** fresh searches may be about twice as slow as at `913618b`
+  (section 4); needs a side-by-side run of both binaries before anything is changed.
+- **Renamed `Users` folder:** renaming a `Users` folder itself does not bump
+  `users_epoch`, so the privacy map is not rebuilt until another profile-level change.
+- **Connection limit:** the 64 connections are shared by all users, so one user can use
+  them up.
+- **Tests:** `Profiles::extended()` has no test, and the last step of the users-epoch
+  test does not assert anything.
 
 **Steps:**
 
@@ -579,8 +657,8 @@ result differed, the difference is noted.
      "include skipped folders" later); response = total match count + the best results
      (full path, is-folder flag, score). Results are capped so replies stay small.
    - Several clients at once; one thread per connection or overlapped I/O. Done with a
-     blocking thread per connection (8 concurrent clients were answered in 11-17 ms
-     each); overlapped I/O can come later if many clients ever matter.
+     blocking thread per connection, at most 64 connections; overlapped I/O can come
+     later if many clients ever matter.
    - Target: well under 1 ms added to a search. **Measured: 0.1-0.2 ms**, connection
      0.2 ms.
 4. **Per-user privacy.**
@@ -676,15 +754,17 @@ and wrote its results to text files. Two things to watch:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  At `9c479c7`: 69 workspace tests pass (index crate 30, query crate 17, engine crate 7,
-  pipe crate 5, ntfs crate 3, cli crate 3, service crate 2), clippy clean, release build
+  At `11970b2`: 74 workspace tests pass (index crate 31, query crate 18, engine crate 7,
+  pipe crate 6, service crate 6, ntfs crate 3, cli crate 3), clippy clean, release build
   produced `bs.exe`, `bs-service.exe` and the example at about 1 MB each.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList
   '-ExecutionPolicy','Bypass','-File','<script>'`, writing results to text files that are
   read afterwards. The user approves each UAC prompt, one script at a time (see the
-  Phase 3 note above). Latest scripts: `run11.ps1` (final `bs --bench`), `run10.ps1`
+  Phase 3 note above). Latest scripts: `run12.ps1` (planted data folders against the
+  real service; it waits for `tests12_done.flag` so non-elevated probes can run while the
+  service is up), `run11.ps1` (final `bs --bench`), `run10.ps1`
   (privacy and live tests through the service), `run9.ps1` (first service-only run),
   `run8.ps1` (scan plus bench); their `*.txt` outputs carry the numbers quoted in
   section 4.

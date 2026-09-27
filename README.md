@@ -86,7 +86,12 @@ rights.
 
 - Data folder: `%ProgramData%\better_search` (snapshot `index.bin`, `service.log`). The
   service sets a protected DACL that gives SYSTEM and administrators full control, so a
-  normal user cannot read the index (it contains every file name on the machine).
+  normal user cannot read the index (it contains every file name on the machine). Any
+  user can create folders in `%ProgramData%`, so on every start the service checks the
+  folder first: a junction or link, a folder owned by someone other than SYSTEM or
+  Administrators, or links inside it make the service rename it to
+  `better_search.untrusted-...` and create a fresh one. It never follows or reuses such
+  a folder.
 - The log holds one line per event, rotates at 1 MB, and never records queries.
 - While the index loads or is scanned for the first time, a search answers
   "the index is still loading" instead of failing.
@@ -100,7 +105,10 @@ rights.
 
 The service listens on `\\.\pipe\better_search` (message mode, one message per request
 and reply, remote clients rejected). Local interactive users may connect and search but
-cannot create their own instance of that pipe name. Overhead is 0.1-0.2 ms per query.
+cannot create their own instance of that pipe name. The pipe is owned by Administrators,
+and the client refuses a pipe with any other owner before it sends a query, so a
+program that takes the name while the service is stopped gets no queries. Overhead is
+0.1-0.2 ms per query.
 
 ### Privacy between users
 
