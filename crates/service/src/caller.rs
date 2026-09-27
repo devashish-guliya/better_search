@@ -5,8 +5,7 @@ use std::io;
 use std::path::PathBuf;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
-use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, RevertToSelf, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
@@ -53,7 +52,7 @@ fn client_token(pipe: HANDLE) -> io::Result<HANDLE> {
     Ok(token)
 }
 
-fn token_user_sid(token: HANDLE) -> io::Result<String> {
+pub(crate) fn token_user_sid(token: HANDLE) -> io::Result<String> {
     let mut needed = 0u32;
     // SAFETY: a size query with no buffer.
     unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed) };
@@ -74,19 +73,7 @@ fn token_user_sid(token: HANDLE) -> io::Result<String> {
     }
     // SAFETY: GetTokenInformation filled the buffer with a TOKEN_USER.
     let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
-    let mut text = null_mut();
-    // SAFETY: the SID points into `buffer`; `text` receives a LocalAlloc'd string.
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `text` is a NUL-terminated string allocated by the call above.
-    let sid = unsafe {
-        let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
-        LocalFree(text.cast());
-        sid
-    };
-    Ok(sid)
+    crate::security::sid_string(user.User.Sid)
 }
 
 /// Looks up the profile folder Windows records for `sid`.

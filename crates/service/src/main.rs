@@ -81,7 +81,8 @@ fn main() -> ExitCode {
 pub fn run(console: bool, stop: &Receiver<Stop>) -> Result<(), String> {
     let started = Instant::now();
     let dir = bs_engine::machine_data_dir();
-    security::secure_dir(&dir).map_err(|e| format!("cannot prepare {}: {e}", dir.display()))?;
+    let notes =
+        security::secure_dir(&dir).map_err(|e| format!("cannot prepare {}: {e}", dir.display()))?;
     let file = Arc::new(LogFile::open(dir.join("service.log"), console));
     let log: Log = {
         let file = Arc::clone(&file);
@@ -92,6 +93,9 @@ pub fn run(console: bool, stop: &Receiver<Stop>) -> Result<(), String> {
         env!("CARGO_PKG_VERSION"),
         std::process::id()
     ));
+    for note in notes {
+        log(&note);
+    }
 
     let state = Arc::new(State::new(Arc::clone(&log)));
     if let Err(e) = server::start(Arc::clone(&state)) {
