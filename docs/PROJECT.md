@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `11970b2` ("Refuse a hijacked data folder and a fake service pipe").
+Last updated after commit `8cb2f4c` ("Keep profile folders outside Users private").
 
 ---
 
@@ -42,6 +42,8 @@ Out of scope: searching file **contents**. Only names are searched.
 | `9c479c7` | Phase 3 steps 1-5: engine crate, `bs-service.exe` (SCM), named pipe, per-user privacy, `bs query` |
 | `fb317c6` | Project docs and README for Phase 3 steps 1-5 |
 | `11970b2` | Security fixes from an audit: planted data folders are moved aside, the client refuses a pipe the service did not create |
+| `c5a9a6d` | Docs for those fixes, plus corrections the audit found in the Phase 3 docs |
+| `8cb2f4c` | Profile folders outside `Users` are private too; users epoch fix for a renamed users folder; missing tests |
 
 ## 4. Current results on the development machine
 
@@ -59,7 +61,7 @@ Measured with an elevated run of `bs --bench` and of the service after `9c479c7`
 | Service process memory | 21-22 MB private at ready, 25 MB working set |
 | Snapshot on disk | 4.5 MB, saved in 270-530 ms |
 | Search through the pipe (same query repeated) | 0.6-1.1 ms (readme, notepad, "config json"), 3.0-3.4 ms (png), 9-11 ms (single letter "e"); see the note below |
-| Fresh search (`bs --bench`, median) | readme 2.2-2.5 ms, "e" 8.9 ms (slower than at `913618b`; see the note below) |
+| Fresh search (`bs --bench`, median) | readme 2.2-2.5 ms, "e" 7.7-8.9 ms (the same as `913618b` side by side; see the note below) |
 | Pipe overhead | 0.1-0.2 ms over a search; a connection costs 0.2 ms |
 | Typing a word | first keystroke 7-11 ms, 1-2 ms from the fourth letter on (under 1 ms for long words with few matches) |
 | Idle CPU | 0 while nothing changes on the drives; 359 ms per 90 s while builds and file changes were happening (journal updates, by design) |
@@ -74,11 +76,14 @@ The pipe numbers come from `bs query --bench`, which repeats each query 15 times
 connection and reports the median. From the second repeat on, the connection's session
 re-checks only the names that matched before, so these are best-case numbers, not the
 cost of a fresh search. A fresh search through the service has not been measured yet.
-Two `bs --bench` runs at `913618b` gave fresh-search medians of readme 0.9-1.0 ms and
-"e" 6.0 ms (`10_rescan.txt`, `12_load.txt`); two runs at `9c479c7` gave 2.2-2.5 ms and
-8.9 ms (`13_bench.txt`, `16_bench.txt`). That may be a regression or machine noise, and
-needs a side-by-side run of both binaries in one session (an open item under Phase 3 in
-section 8).
+Fresh searches are **not** slower than at `913618b`, although the saved runs made it look
+that way (readme 0.9-1.0 ms and "e" 6.0 ms then, 2.2-2.5 ms and 8.9 ms at `9c479c7`).
+Both binaries were run alternately in one session (`run13.ps1`, `18_real_*.txt`, three
+runs each on the real index): readme 2.3 ms for both, "e" 8.3-8.7 ms old and 7.7-8.5 ms
+new, and the other queries equal within 0.3 ms. The same held on 3 million generated
+entries without elevation (`18_synth_*.txt`, every query within about 10%), where typing
+was faster in the new binary. The lower numbers of the earlier runs came from a quieter
+machine, so always compare binaries side by side.
 
 History of the main numbers, to show what each change bought:
 
@@ -199,9 +204,19 @@ garbage.
 users' profile folders, plus compactions (which renumber entries). The service's
 privacy map is rebuilt when it changes and extended otherwise, so the map costs
 something only when ownership really changed. Inside `apply`, that means: a users
-folder or a profile folder (`<drive>\Users\<name>`) was created, renamed, moved or
-deleted, or an entry entered, left or moved between users folders. Everything else
-(a new file inside a profile folder, for example) inherits its owner and costs nothing.
+folder or a profile folder (`<drive>\Users\<name>`, or one of the folders given to
+`set_profile_folders`) was created, renamed, moved or deleted (checked before and after
+the change, so a users folder renamed away counts too), or an entry entered, left or
+moved between profile folders. Everything else (a new file inside a profile folder, for
+example) inherits its owner and costs nothing.
+
+**Profile folders elsewhere.** Windows can keep a profile anywhere (`ProfileImagePath`
+in the registry). `Index::set_profile_folders` takes those paths; the ones not directly
+in a users folder are looked up one level at a time (a scan per level, a few ms, only
+when the list changes) and then count as profile folders exactly like the ones in
+`Users`. Their entries are carried through compaction. A listed folder that is not in
+the index yet is looked up again at the end of a batch in which a folder with its name
+was created or renamed. The list is not saved in the snapshot; the service sets it.
 
 ### 5.3 Clutter skipping
 
@@ -473,12 +488,20 @@ directly.
   token is read once per connection and the connection then serves many queries, as the
   search window will. Any failure to read the token fails the connection (fail closed),
   and only the user's SID and profile path are kept in memory.
+- **Every profile on the machine:** before a search, at most every 10 s, the service
+  lists all `ProfileList` entries (without LocalSystem, LocalService and NetworkService)
+  and passes their paths to the index when the list changed (see "Profile folders
+  elsewhere" in 5.2). So a profile outside `<drive>\Users` is private too, and one
+  created while a search window stays connected becomes private within 10 s. The log
+  gets one line with the number of paths when the list changes.
 - **The map** (`Profiles`): one byte per index entry. The byte is a slot number: 0 means
-  "no profile owns this", 1-253 are distinct profile folder names (every folder directly
-  inside a `Users` folder at a drive root), 254 means the machine has more profile folder
-  names than slots (those folders stay hidden) and 255 is "not classified yet", which
-  only exists while the map is being built. A user is allowed the slot named `public` and
-  the slot named after their own profile folder.
+  "no profile owns this", 1-253 are profiles (a folder name for every folder directly
+  inside a `Users` folder at a drive root, and the whole lowercased path for each
+  profile folder elsewhere, which cannot collide with a name because it contains a
+  backslash), 254 means the machine has more profiles than slots (those folders stay
+  hidden) and 255 is "not classified yet", which only exists while the map is being
+  built. A user is allowed the slot named `public`, the slot named after their own
+  profile folder, and the slot whose path is their own profile path.
 - **Judging an entry:** by its **parent's** slot, not its own. So `C:\Users` is visible,
   the profile folder itself is visible (its parent is `C:\Users`), and everything below
   it is hidden. A folder that happens to have the caller's profile name on another drive
@@ -497,6 +520,11 @@ directly.
   `C:\Users\hp`) hid 77 of the 351,791 matches for `e` (the machine's `Default` profile)
   at no measurable cost, and through the service a `ntuser` search returned no hits from
   `C:\Users\Default` while the caller's own files stayed visible.
+- **Tested outside `Users`** (`run14.ps1`, `19_*.txt`): with a temporary `ProfileList`
+  entry for a made-up SID pointing at `D:\bsprobe_profile\dora` (deleted afterwards), a
+  normal user's search stopped showing the file in that folder within the 10 s recheck,
+  and also did not show a file created inside it later or a folder moved into it, while
+  a file next to the profile folder stayed visible.
 
 ### 5.10 The console tool (`bs`, `crates/cli`)
 
@@ -560,6 +588,9 @@ and reports a clear message when the service is not running.
 | Rebuild the privacy map on a users epoch, not on every change | A rebuild costs 7 ms; the epoch separates "a file appeared in a profile" from "a profile moved" |
 | Narrowing cap at 8192 names | Re-checking remembered names costs about 80 ns each, the SIMD scan about 5 ns per name: long lists are cheaper to search fresh |
 | Do not narrow the privacy map by caller | One index serves all users; a per-user map would double the memory and the rebuild cost for a filter that already costs under a millisecond |
+| Profiles from the registry, rechecked at most every 10 s before a search | Windows may keep a profile anywhere; reading about ten registry keys costs well under a millisecond, and a long-lived search window must not keep seeing a profile created after it connected |
+| Service accounts (LocalSystem, LocalService, NetworkService) are not profiles | No person searches as them, and hiding their folders would only hide system files from administrators |
+| Shared 64-connection limit, no per-user cap | The caller is known only after its first message, so a per-user cap cannot count silent connections; the worst case is a local slowdown, not exposed data |
 | `bs query` in the existing console tool, not a new binary | Keeps one small tool; the pipe client is in `bs-pipe` so the UI can reuse it |
 
 ## 7. Locked in (do not change without discussing)
@@ -586,7 +617,8 @@ and reports a clear message when the service is not running.
   1000 hits, remote clients rejected, `INTERACTIVE` users may read and write but not
   create instances, the pipe is owned by Administrators and clients refuse any other
   owner than SYSTEM or Administrators.
-- Privacy: hide the contents of other users' profile folders (`<drive>\Users\<name>`)
+- Privacy: hide the contents of other users' profile folders (`<drive>\Users\<name>`
+  and any other `ProfileImagePath` in the registry, service accounts excepted)
   from results **and** match counts, for administrators too; the profile folder itself
   stays visible only under its current name; `C:\Users\Public` is shared.
 - UI requirements: tray icon, Alt+Space hotkey, right-edge hover zone with a slide-in panel.
@@ -610,21 +642,20 @@ release binaries. Steps 6 (removable non-NTFS drives) and 7 (final measurements 
 end of the phase) remain. The step text below is the plan as it was written; where the
 result differed, the difference is noted.
 
-**Audit after step 5.** A review of the Phase 3 code found two security gaps, fixed in
-`11970b2` (a planted data folder, 5.7; a fake pipe while the service is stopped, 5.8).
-Still open, in the suggested order:
+**Audit after step 5.** A review of the Phase 3 code found these, all handled:
 
-- **Profiles outside `Users`:** profile folders outside `<drive>\Users` (a
-  `ProfileImagePath` in the registry that points elsewhere) are not hidden from other
-  users.
-- **Search speed:** fresh searches may be about twice as slow as at `913618b`
-  (section 4); needs a side-by-side run of both binaries before anything is changed.
-- **Renamed `Users` folder:** renaming a `Users` folder itself does not bump
-  `users_epoch`, so the privacy map is not rebuilt until another profile-level change.
-- **Connection limit:** the 64 connections are shared by all users, so one user can use
-  them up.
-- **Tests:** `Profiles::extended()` has no test, and the last step of the users-epoch
-  test does not assert anything.
+- A planted data folder (5.7) and a fake pipe while the service is stopped (5.8):
+  fixed in `11970b2`.
+- Profile folders outside `<drive>\Users` were not private (5.9), a renamed users
+  folder did not change the users epoch (5.2), and two tests were missing
+  (`Profiles::extended`, the last step of the users-epoch test): fixed in `8cb2f4c`.
+- A suspected search slowdown since `913618b`: measured side by side, there is none
+  (section 4).
+- **Accepted, not changed:** the 64 connections are shared by all users, so one local
+  user can use them up and make searches wait for others. A per-user cap would not
+  help: the service learns who is calling only after the first message, so connections
+  that never send one cannot be counted per user, and a local user can slow the machine
+  in simpler ways anyway. The data is never exposed this way.
 
 **Steps:**
 
@@ -754,15 +785,18 @@ and wrote its results to text files. Two things to watch:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  At `11970b2`: 74 workspace tests pass (index crate 31, query crate 18, engine crate 7,
-  pipe crate 6, service crate 6, ntfs crate 3, cli crate 3), clippy clean, release build
+  At `8cb2f4c`: 79 workspace tests pass (index crate 33, query crate 18, engine crate 9,
+  service crate 7, pipe crate 6, ntfs crate 3, cli crate 3), clippy clean, release build
   produced `bs.exe`, `bs-service.exe` and the example at about 1 MB each.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList
   '-ExecutionPolicy','Bypass','-File','<script>'`, writing results to text files that are
   read afterwards. The user approves each UAC prompt, one script at a time (see the
-  Phase 3 note above). Latest scripts: `run12.ps1` (planted data folders against the
+  Phase 3 note above). Latest scripts: `run14.ps1` (a temporary `ProfileList` entry
+  outside `Users`, with non-elevated probes between flag files), `run13.ps1` (an old and
+  the current `bs.exe` alternately; build the old one in a `git worktree` outside the
+  repository and remove it afterwards), `run12.ps1` (planted data folders against the
   real service; it waits for `tests12_done.flag` so non-elevated probes can run while the
   service is up), `run11.ps1` (final `bs --bench`), `run10.ps1`
   (privacy and live tests through the service), `run9.ps1` (first service-only run),

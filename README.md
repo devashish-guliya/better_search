@@ -114,8 +114,9 @@ program that takes the name while the service is stopped gets no queries. Overhe
 
 The service reads the caller's SID and profile path while impersonating them at
 identification level (reading the token, not acting as the user). Results and match
-counts leave out the contents of other users' profile folders (`<drive>\Users\<name>`),
-for administrators too. The folder itself stays visible, `C:\Users\Public` is shared,
+counts leave out the contents of other users' profile folders (`<drive>\Users\<name>`,
+and any profile Windows keeps elsewhere, read from the registry), for administrators
+too. The folder itself stays visible, `C:\Users\Public` is shared,
 and a folder that happens to match the caller's profile name on another drive stays
 visible. The per-entry privacy map costs about 0.6 MB and is rebuilt only when a profile
 folder appears, disappears or moves.
