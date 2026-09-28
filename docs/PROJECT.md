@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated for Phase 4 after commit `939d0ff` ("Record the audit follow-up in the project docs").
+Last updated after commit `c626267` ("Add native search window for service-backed name search").
 
 ---
 
@@ -45,6 +45,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `c5a9a6d` | Docs for those fixes, plus corrections the audit found in the Phase 3 docs |
 | `8cb2f4c` | Profile folders outside `Users` are private too; users epoch fix for a renamed users folder; missing tests |
 | `939d0ff` | Record the Phase 3 security audit follow-up in the project docs |
+| `c626267` | Phase 4 native search window, tray, hotkey, hover, settings, and deferred backend decisions |
 
 ## 4. Current results on the development machine
 
@@ -788,7 +789,7 @@ and wrote its results to text files. Two things to watch:
 
 ### Phase 4: search window (native window built; backend extensions deferred)
 
-**Result after `939d0ff`:** `crates/ui` builds `bs-window.exe` and implements the
+**Built at `c626267`:** `crates/ui` builds `bs-window.exe` and implements the
 window, virtual results, icons, actions, tray, configurable hotkey, delayed hover
 slide, DPI/theme handling and per-user settings described in 5.11. Built in the
 requested order: pipe-backed window, tray/hotkey, then hover/settings. A live
