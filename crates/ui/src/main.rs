@@ -11,28 +11,35 @@ use std::sync::mpsc::{Receiver, Sender};
 
 use bs_pipe::{Hit, Status};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DEFAULT_GUI_FONT, DeleteObject, FillRect, GetMonitorInfoW, GetStockObject,
-    HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, SetBkColor,
-    SetTextColor,
+    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
+    GetTextFaceW, HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromPoint, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_SELECTED,
-    LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVN_GETDISPINFOW, LVNI_SELECTED,
-    LVS_EX_FULLROWSELECT, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS,
+    EM_SETMARGINS, HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES,
+    INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE,
+    LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
+    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS,
     LVS_SINGLESEL, LVSIL_SMALL, NM_DBLCLK, NMHDR, NMLVDISPINFOW, SetWindowTheme, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, VK_CONTROL, VK_DOWN, VK_ESCAPE,
-    VK_RETURN, VK_TAB, VK_UP,
+    GetFocus, GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, VK_CONTROL, VK_DOWN,
+    VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
@@ -49,9 +56,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu,
     TranslateMessage, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_RBUTTONUP, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 
 const CLASS: &str = "BetterSearchWindow";
@@ -76,6 +83,38 @@ const SETTINGS_STARTUP: usize = 304;
 const SETTINGS_SAVE: usize = 305;
 const SETTINGS_BACK: usize = 306;
 const CHECKED: isize = 1;
+/// `EM_SETMARGINS` flags for the search box's inner text padding.
+const EC_LEFTMARGIN: usize = 0x0001;
+const EC_RIGHTMARGIN: usize = 0x0002;
+
+/// Colors are Win32 `COLORREF`s: 0x00BBGGRR.
+fn rgb(r: u32, g: u32, b: u32) -> u32 {
+    r | (g << 8) | (b << 16)
+}
+
+/// A small, flat palette so the window looks the same on light and dark Windows.
+/// The list shares `panel` so the result card's rounded outline has no square corners.
+struct Palette {
+    panel: u32,
+    text: u32,
+    edge: u32,
+}
+
+fn palette(light: bool) -> Palette {
+    if light {
+        Palette {
+            panel: rgb(250, 250, 250),
+            text: rgb(24, 24, 24),
+            edge: rgb(206, 206, 206),
+        }
+    } else {
+        Palette {
+            panel: rgb(26, 26, 26),
+            text: rgb(240, 240, 240),
+            edge: rgb(72, 72, 72),
+        }
+    }
+}
 
 struct Slide {
     from: i32,
@@ -109,6 +148,11 @@ struct App {
     controls: Vec<HWND>,
     light: Option<bool>,
     background: HBRUSH,
+    font: HFONT,
+    panel: u32,
+    text: u32,
+    edge: u32,
+    outlines: Vec<RECT>,
     taskbar_message: u32,
 }
 
@@ -137,6 +181,11 @@ impl App {
             controls: Vec::new(),
             light: None,
             background: null_mut(),
+            font: null_mut(),
+            panel: rgb(250, 250, 250),
+            text: rgb(24, 24, 24),
+            edge: rgb(206, 206, 206),
+            outlines: Vec::new(),
             taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         }
     }
@@ -186,7 +235,11 @@ impl App {
         match result.outcome {
             search::Outcome::Reply(reply) => match reply.status {
                 Status::Ok => {
-                    self.status = format!("{} matches", reply.total_matches);
+                    self.status = if reply.total_matches == 0 {
+                        "No matches".into()
+                    } else {
+                        format!("{} matches", reply.total_matches)
+                    };
                     self.names = reply
                         .hits
                         .iter()
@@ -584,11 +637,12 @@ impl App {
         self.show_search(hwnd);
     }
 
-    fn layout(&self, hwnd: HWND) {
+    fn layout(&mut self, hwnd: HWND) {
         let mut rect = RECT::default();
         unsafe { GetClientRect(hwnd, &mut rect) };
-        let pad = scale(hwnd, 12);
+        let pad = scale(hwnd, 14);
         let width = (rect.right - 2 * pad).max(0);
+        self.outlines.clear();
         if self.settings_open {
             let line = scale(hwnd, 35);
             let top = scale(hwnd, 20);
@@ -602,40 +656,93 @@ impl App {
                 unsafe { MoveWindow(control, pad, y, width, height, 1) };
                 y += height + scale(hwnd, 3);
             }
-        } else {
-            unsafe {
-                MoveWindow(self.edit, pad, pad, width, scale(hwnd, 32), 1);
-                MoveWindow(
-                    self.list,
-                    pad,
-                    pad + scale(hwnd, 40),
-                    width,
-                    (rect.bottom - pad * 2 - scale(hwnd, 66)).max(0),
-                    1,
-                );
-                MoveWindow(
-                    self.status_label,
-                    pad,
-                    rect.bottom - pad - scale(hwnd, 20),
-                    width,
-                    scale(hwnd, 20),
-                    1,
-                );
-                let name_width = (width / 3).max(scale(hwnd, 120));
-                SendMessageW(
-                    self.list,
-                    windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
-                    0,
-                    name_width as _,
-                );
-                SendMessageW(
-                    self.list,
-                    windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
-                    1,
-                    (width - name_width - scale(hwnd, 24)).max(0) as _,
-                );
+            return;
+        }
+        let edit_height = scale(hwnd, 38);
+        let gap = scale(hwnd, 12);
+        let status_height = scale(hwnd, 20);
+        let list_top = pad + edit_height + gap;
+        let list_height = (rect.bottom - pad - status_height - scale(hwnd, 8) - list_top).max(0);
+        let inset = scale(hwnd, 10) as isize;
+        unsafe {
+            MoveWindow(self.edit, pad, pad, width, edit_height, 1);
+            SendMessageW(
+                self.edit,
+                EM_SETMARGINS,
+                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                (inset | (inset << 16)) as _,
+            );
+            MoveWindow(self.list, pad, list_top, width, list_height, 1);
+            MoveWindow(
+                self.status_label,
+                pad,
+                rect.bottom - pad - status_height,
+                width,
+                status_height,
+                1,
+            );
+            let name_width = (width / 3).max(scale(hwnd, 120));
+            SendMessageW(
+                self.list,
+                windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
+                0,
+                name_width as _,
+            );
+            SendMessageW(
+                self.list,
+                windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
+                1,
+                (width - name_width - scale(hwnd, 24)).max(0) as _,
+            );
+        }
+        // Rounded outlines the window's WM_PAINT draws around the field and the list.
+        let radius = scale(hwnd, 5);
+        self.outlines.push(RECT {
+            left: pad - radius,
+            top: pad - radius,
+            right: pad + width + radius,
+            bottom: pad + edit_height + radius,
+        });
+        self.outlines.push(RECT {
+            left: pad - 1,
+            top: list_top - 1,
+            right: pad + width + 1,
+            bottom: list_top + list_height + 1,
+        });
+    }
+
+    /// Rebuilds the interface font for the current DPI and hands it to every child.
+    fn apply_font(&mut self, hwnd: HWND) {
+        if !self.font.is_null() {
+            unsafe { DeleteObject(self.font) };
+        }
+        self.font = create_ui_font(hwnd);
+        let font = self.font;
+        for control in [self.edit, self.list, self.status_label]
+            .into_iter()
+            .chain(self.controls.iter().copied())
+        {
+            if !control.is_null() {
+                unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1) };
             }
         }
+    }
+
+    /// The bottom line shows the highlighted result's full path, or the search state.
+    fn refresh_status(&self) {
+        if self.status_label.is_null() {
+            return;
+        }
+        let text = match self.selected().and_then(|index| self.hits.get(index)) {
+            Some(hit) => hit.path.clone(),
+            None => self.status.clone(),
+        };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                self.status_label,
+                wide(&text).as_ptr(),
+            )
+        };
     }
 
     fn theme(&mut self, hwnd: HWND) {
@@ -644,41 +751,72 @@ impl App {
             return;
         }
         self.light = Some(light);
+        let colors = palette(light);
+        self.panel = colors.panel;
+        self.text = colors.text;
+        self.edge = colors.edge;
         if !self.background.is_null() {
             unsafe { DeleteObject(self.background) };
         }
-        self.background = unsafe { CreateSolidBrush(if light { 0x00ffffff } else { 0x00202020 }) };
-        let enabled: i32 = (!light).into();
+        self.background = unsafe { CreateSolidBrush(colors.panel) };
+        let dark: i32 = (!light).into();
+        let corner: i32 = DWMWCP_ROUND;
         unsafe {
             DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
-                (&raw const enabled).cast(),
+                (&raw const dark).cast(),
                 size_of::<i32>() as u32,
             );
-            let theme = wide(if light {
-                "Explorer"
-            } else {
-                "DarkMode_Explorer"
-            });
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+                (&raw const corner).cast(),
+                size_of::<i32>() as u32,
+            );
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR as u32,
+                (&raw const colors.edge).cast(),
+                size_of::<u32>() as u32,
+            );
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_COLOR as u32,
+                (&raw const colors.panel).cast(),
+                size_of::<u32>() as u32,
+            );
+            DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TEXT_COLOR as u32,
+                (&raw const colors.text).cast(),
+                size_of::<u32>() as u32,
+            );
+        }
+        let theme = wide(if light {
+            "Explorer"
+        } else {
+            "DarkMode_Explorer"
+        });
+        unsafe {
             SetWindowTheme(self.list, theme.as_ptr(), null());
             SendMessageW(
                 self.list,
                 windows_sys::Win32::UI::Controls::LVM_SETBKCOLOR,
                 0,
-                if light { 0x00ffffff } else { 0x00202020 },
+                colors.panel as isize,
             );
             SendMessageW(
                 self.list,
                 windows_sys::Win32::UI::Controls::LVM_SETTEXTBKCOLOR,
                 0,
-                if light { 0x00ffffff } else { 0x00202020 },
+                colors.panel as isize,
             );
             SendMessageW(
                 self.list,
                 windows_sys::Win32::UI::Controls::LVM_SETTEXTCOLOR,
                 0,
-                if light { 0x00000000 } else { 0x00eeeeee },
+                colors.text as isize,
             );
             InvalidateRect(hwnd, null(), 1);
             InvalidateRect(self.list, null(), 1);
@@ -762,6 +900,36 @@ unsafe extern "system" fn child_proc(
     if msg == WM_NCDESTROY {
         unsafe { RemoveWindowSubclass(hwnd, Some(child_proc), id) };
     }
+    if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) && id == EDIT_ID {
+        // Repaint so the placeholder appears when the box loses focus and clears on focus.
+        unsafe { InvalidateRect(hwnd, null(), 1) };
+    }
+    if msg == WM_PAINT && id == EDIT_ID {
+        // Let the edit paint itself, then add a placeholder when it is empty and idle.
+        let result = unsafe { DefSubclassProc(hwnd, msg, w, l) };
+        let idle = unsafe { GetFocus() } != hwnd && unsafe { GetWindowTextLengthW(hwnd) } == 0;
+        if idle {
+            let mut paint = PAINTSTRUCT::default();
+            let device = unsafe { BeginPaint(hwnd, &mut paint) };
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(hwnd, &mut rect) };
+            rect.left += scale(hwnd, 12);
+            let placeholder = wide("Search files and folders");
+            unsafe {
+                SetBkMode(device, TRANSPARENT as i32);
+                SetTextColor(device, 0x00808080);
+                DrawTextW(
+                    device,
+                    placeholder.as_ptr(),
+                    -1,
+                    &mut rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                EndPaint(hwnd, &paint);
+            }
+        }
+        return result;
+    }
     if msg == WM_KEYDOWN {
         let main = parent as HWND;
         let ptr = unsafe { GetWindowLongPtrW(main, GWLP_USERDATA) as *mut App };
@@ -820,6 +988,58 @@ fn scale(hwnd: HWND, value: i32) -> i32 {
     value * dpi as i32 / 96
 }
 
+/// Creates the interface font. Windows 11's Segoe UI Variable looks best; older
+/// systems fall back to Segoe UI, which every supported Windows has.
+fn create_ui_font(hwnd: HWND) -> HFONT {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
+    // 10 pt, negative height for character height (not cell height).
+    let height = -(10 * dpi / 72);
+    let font = make_font(height, "Segoe UI Variable Text");
+    if font_face_matches(hwnd, font, "Segoe UI Variable") {
+        font
+    } else {
+        unsafe { DeleteObject(font) };
+        make_font(height, "Segoe UI")
+    }
+}
+
+fn make_font(height: i32, face: &str) -> HFONT {
+    unsafe {
+        CreateFontW(
+            height,
+            0,
+            0,
+            0,
+            FW_NORMAL as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as u32,
+            OUT_DEFAULT_PRECIS as u32,
+            CLIP_DEFAULT_PRECIS as u32,
+            CLEARTYPE_QUALITY as u32,
+            0,
+            wide(face).as_ptr(),
+        )
+    }
+}
+
+fn font_face_matches(hwnd: HWND, font: HFONT, needle: &str) -> bool {
+    let device = unsafe { GetDC(hwnd) };
+    if device.is_null() {
+        return false;
+    }
+    let previous = unsafe { SelectObject(device, font) };
+    let mut buffer = [0u16; 64];
+    let length = unsafe { GetTextFaceW(device, buffer.len() as i32, buffer.as_mut_ptr()) };
+    unsafe {
+        SelectObject(device, previous);
+        ReleaseDC(hwnd, device);
+    }
+    let end = (length.max(1) as usize - 1).min(buffer.len());
+    String::from_utf16_lossy(&buffer[..end]).contains(needle)
+}
+
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if msg == WM_NCCREATE {
         let app = Box::into_raw(Box::new(App::new()));
@@ -855,7 +1075,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     0,
                     edit_class.as_ptr(),
                     hint.as_ptr(),
-                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32,
+                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
                     0,
                     0,
                     0,
@@ -874,7 +1094,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     WS_CHILD
                         | WS_VISIBLE
                         | WS_TABSTOP
-                        | WS_BORDER
                         | LVS_REPORT
                         | LVS_OWNERDATA
                         | LVS_SINGLESEL
@@ -947,15 +1166,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 control(hwnd, &button_class, "Save settings", SETTINGS_SAVE, 0),
                 control(hwnd, &button_class, "Back to search", SETTINGS_BACK, 0),
             ];
-            let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
+            app.apply_font(hwnd);
             unsafe {
-                SendMessageW(app.edit, WM_SETFONT, font as usize, 1);
-                SendMessageW(app.list, WM_SETFONT, font as usize, 1);
                 SendMessageW(
                     app.list,
                     LVM_SETEXTENDEDLISTVIEWSTYLE,
                     0,
-                    LVS_EX_FULLROWSELECT as _,
+                    (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP) as _,
                 );
             }
             let label = wide("Name");
@@ -1005,6 +1222,37 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             app.theme(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
+        WM_PAINT => {
+            let mut paint = PAINTSTRUCT::default();
+            let device = unsafe { BeginPaint(hwnd, &mut paint) };
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(hwnd, &mut rect) };
+            unsafe { FillRect(device, &rect, app.background) };
+            if !app.outlines.is_empty() {
+                let diameter = scale(hwnd, 14);
+                let pen = unsafe { CreatePen(PS_SOLID, 1, app.edge) };
+                unsafe {
+                    let previous_pen = SelectObject(device, pen);
+                    let previous_brush = SelectObject(device, GetStockObject(NULL_BRUSH));
+                    for outline in &app.outlines {
+                        RoundRect(
+                            device,
+                            outline.left,
+                            outline.top,
+                            outline.right,
+                            outline.bottom,
+                            diameter,
+                            diameter,
+                        );
+                    }
+                    SelectObject(device, previous_brush);
+                    SelectObject(device, previous_pen);
+                    DeleteObject(pen);
+                }
+            }
+            unsafe { EndPaint(hwnd, &paint) };
+            0
+        }
         WM_ERASEBKGND => {
             let mut rect = RECT::default();
             unsafe {
@@ -1014,10 +1262,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             1
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let light = app.light.unwrap_or(true);
             unsafe {
-                SetBkColor(w as _, if light { 0x00ffffff } else { 0x00202020 });
-                SetTextColor(w as _, if light { 0 } else { 0x00eeeeee });
+                SetBkColor(w as _, app.panel);
+                SetTextColor(w as _, app.text);
             }
             app.background as _
         }
@@ -1096,6 +1343,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_DPICHANGED => {
             let rect = unsafe { &*(l as *const RECT) };
+            app.apply_font(hwnd);
+            app.layout(hwnd);
             unsafe {
                 SetWindowPos(
                     hwnd,
@@ -1150,6 +1399,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     return 0;
                 }
+                if hdr.code == LVN_ITEMCHANGED {
+                    app.refresh_status();
+                    return 0;
+                }
                 if hdr.code == NM_DBLCLK {
                     app.open_selected(hwnd, false);
                     return 0;
@@ -1196,6 +1449,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 KillTimer(hwnd, RETRY_TIMER);
                 KillTimer(hwnd, ANIMATION_TIMER)
             };
+            if !app.font.is_null() {
+                unsafe { DeleteObject(app.font) };
+            }
             app.hover.rebuild(hwnd, false, false);
             if app.hotkey_registered {
                 unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };

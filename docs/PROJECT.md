@@ -610,6 +610,15 @@ and reports a clear message when the service is not running.
   number drops stale replies. Failed connections retry on later searches; loading and
   missing-service states retry while visible. Denied and bad-request states are distinct.
   It does not read the service's protected data folder.
+- **Look:** a small app manifest (`crates/ui/bs-window.manifest`, embedded by
+  `crates/ui/build.rs` with the MSVC linker's `/MANIFESTINPUT`, no new dependency or
+  runtime) activates common controls v6 and declares per-monitor DPI awareness. The
+  window draws a flat light/dark palette (`Palette` in `main.rs`): rounded Win11 corners,
+  a themed caption/border/text color, a rounded outline "card" around the search field
+  and the list, borderless controls with inner padding, and a Segoe UI Variable font
+  (Segoe UI fallback) sized to the monitor DPI. The list is double-buffered and the
+  status line shows the selected result's full path (or a "No matches" state). A
+  placeholder for the empty search box is attempted but does not yet render.
 - The panel has an edit box, status line, and an owner-data list view (up to 200
   displayed hits, with the accurate allowed-match count from the service). Name and path
   columns use the shell's shared small-icon image list. `SHGetFileInfoW` uses synthetic

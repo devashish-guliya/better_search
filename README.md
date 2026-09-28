@@ -57,7 +57,14 @@ Settings, Pause or Quit. Pause stops window searches, not the background index. 
 search, use the arrow keys, Enter to open, Ctrl+Enter to select the result in Explorer,
 or right-click a result for Open, Open folder and Copy path. Esc hides the window.
 The status line distinguishes a stopped service, an index still loading and access
-denied. The window retries while a service is starting.
+denied. It shows the highlighted result's full path. The window retries while a
+service is starting.
+
+The window is plain Win32 through `windows-sys` (no C#, no web view, no extra runtime;
+the binary is about 260 KB). An embedded app manifest activates the modern common
+controls and per-monitor DPI awareness, and the panel draws its own flat light/dark
+theme: rounded Windows 11 corners, a themed title bar, rounded outlines around the
+search box and the result list, and a Segoe UI Variable font.
 
 Results include matching file and folder **names**, with their full location in the
 Path column. Enter opens the selected item, including an app's `.exe` or a shortcut
