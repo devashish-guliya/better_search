@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bs_engine::profiles::Profiles;
 use bs_engine::{Engine, Log, fmt};
 use bs_index::Index;
-use bs_pipe::{Hit, MAX_REQUEST, PIPE_NAME, Reply, Request, StatsReply, Status};
+use bs_pipe::{Hit, MAX_REQUEST, PIPE_NAME, Reply, Request, Status};
 use bs_query::{Query, Session};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
@@ -240,17 +240,11 @@ fn serve(state: &State, pipe: &Pipe) {
         let Some(len) = read_message(pipe, &mut request) else {
             return;
         };
-        match len {
-            Err(()) => {
-                Reply::status(Status::BadRequest).encode(&mut out);
-            }
-            Ok(len) => {
-                let data = &request[..len];
-                let stats = StatsReply::is_request(data);
-                let search = if stats { None } else { Request::decode(data) };
-                if !stats && search.is_none() {
-                    Reply::status(Status::BadRequest).encode(&mut out);
-                } else {
+        let reply = match len {
+            Err(()) => Reply::status(Status::BadRequest),
+            Ok(len) => match Request::decode(&request[..len]) {
+                None => Reply::status(Status::BadRequest),
+                Some(req) => {
                     if viewer.is_none() {
                         match caller::identify(pipe.0) {
                             Ok(c) => {
@@ -259,63 +253,21 @@ fn serve(state: &State, pipe: &Pipe) {
                             }
                             Err(e) => {
                                 (state.log)(&format!("could not identify a client: {e}"));
-                                if stats {
-                                    StatsReply::unavailable(Status::Denied).encode(&mut out);
-                                } else {
-                                    Reply::status(Status::Denied).encode(&mut out);
-                                }
+                                Reply::status(Status::Denied).encode(&mut out);
                                 let _ = write_message(pipe, &out);
                                 return;
                             }
                         }
                     }
-                    if stats {
-                        answer_stats(state).encode(&mut out);
-                    } else {
-                        let viewer = viewer.as_ref().expect("identified above");
-                        answer(state, &mut session, viewer, &search.expect("decoded above"))
-                            .encode(&mut out);
-                    }
+                    let viewer = viewer.as_ref().expect("identified above");
+                    answer(state, &mut session, viewer, &req)
                 }
-            }
-        }
+            },
+        };
+        reply.encode(&mut out);
         if write_message(pipe, &out).is_err() {
             return;
         }
-    }
-}
-
-fn answer_stats(state: &State) -> StatsReply {
-    let memory = bs_engine::memory::process_memory();
-    let index_heap = state.engine.get().map(|engine| {
-        let mut bytes = engine.read().memory_usage().total() as u64;
-        if let Some(removable) = state.removable.get() {
-            for data in removable.indexes() {
-                bytes =
-                    bytes.saturating_add(data.index.read().unwrap().memory_usage().total() as u64);
-            }
-        }
-        bytes
-    });
-    let dir = bs_engine::machine_data_dir();
-    StatsReply {
-        status: if state.engine.get().is_some() {
-            Status::Ok
-        } else {
-            Status::Loading
-        },
-        service_private: memory.as_ref().map(|m| m.private as u64),
-        service_working_set: memory.as_ref().map(|m| m.working_set as u64),
-        index_heap,
-        snapshot_disk: std::fs::metadata(dir.join("index.bin"))
-            .ok()
-            .map(|m| m.len()),
-        log_disk: std::fs::metadata(dir.join("service.log"))
-            .ok()
-            .map(|m| m.len()),
-        service_binary_disk: std::env::current_exe()
-            .ok()
-            .and_then(|path| std::fs::metadata(path).ok().map(|m| m.len())),
     }
 }
 
@@ -455,16 +407,6 @@ fn merge_removable(
 mod tests {
     use super::*;
     use bs_index::IndexBuilder;
-
-    #[test]
-    fn stats_report_loading_without_an_index() {
-        let state = State::new(Arc::new(|_| {}));
-        let reply = answer_stats(&state);
-        assert_eq!(reply.status, Status::Loading);
-        assert!(reply.service_private.is_some());
-        assert_eq!(reply.index_heap, None);
-        assert!(reply.service_binary_disk.is_some());
-    }
 
     #[test]
     fn removable_counts_respect_profile_visibility() {

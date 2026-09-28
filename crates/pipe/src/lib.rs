@@ -13,19 +13,15 @@ pub use client::Client;
 
 pub const PIPE_NAME: &str = r"\\.\pipe\better_search";
 pub const VERSION: u8 = 1;
-/// Read-only diagnostics use a separate versioned message; v1 searches stay unchanged.
-pub const STATS_VERSION: u8 = 2;
 /// Replies never carry more hits than this.
 pub const MAX_LIMIT: u16 = 1000;
 /// Longest request the service accepts.
 pub const MAX_REQUEST: usize = 4096;
 
 const KIND_SEARCH: u8 = 1;
-const KIND_STATS: u8 = 2;
 const FLAG_DIR: u8 = 1;
 const REQUEST_HEADER: usize = 4;
 const REPLY_HEADER: usize = 12;
-const STATS_REPLY_BYTES: usize = 2 + 6 * 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -78,74 +74,6 @@ pub struct Reply {
     /// Time the service spent searching and building paths, in microseconds.
     pub search_micros: u32,
     pub hits: Vec<Hit>,
-}
-
-/// Resource sizes in bytes. `None` means not available yet, not zero.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatsReply {
-    pub status: Status,
-    pub service_private: Option<u64>,
-    pub service_working_set: Option<u64>,
-    pub index_heap: Option<u64>,
-    pub snapshot_disk: Option<u64>,
-    pub log_disk: Option<u64>,
-    pub service_binary_disk: Option<u64>,
-}
-
-impl StatsReply {
-    pub fn unavailable(status: Status) -> Self {
-        Self {
-            status,
-            service_private: None,
-            service_working_set: None,
-            index_heap: None,
-            snapshot_disk: None,
-            log_disk: None,
-            service_binary_disk: None,
-        }
-    }
-
-    pub fn request() -> [u8; 2] {
-        [STATS_VERSION, KIND_STATS]
-    }
-
-    pub fn is_request(data: &[u8]) -> bool {
-        data == Self::request()
-    }
-
-    pub fn encode(&self, out: &mut Vec<u8>) {
-        out.clear();
-        out.extend_from_slice(&[STATS_VERSION, self.status.code()]);
-        for bytes in [
-            self.service_private,
-            self.service_working_set,
-            self.index_heap,
-            self.snapshot_disk,
-            self.log_disk,
-            self.service_binary_disk,
-        ] {
-            out.extend_from_slice(&bytes.unwrap_or(u64::MAX).to_le_bytes());
-        }
-    }
-
-    pub fn decode(data: &[u8]) -> Option<Self> {
-        if data.len() != STATS_REPLY_BYTES || data[0] != STATS_VERSION {
-            return None;
-        }
-        let field = |offset: usize| {
-            let raw = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-            (raw != u64::MAX).then_some(raw)
-        };
-        Some(Self {
-            status: Status::from_code(data[1])?,
-            service_private: field(2),
-            service_working_set: field(10),
-            index_heap: field(18),
-            snapshot_disk: field(26),
-            log_disk: field(34),
-            service_binary_disk: field(42),
-        })
-    }
 }
 
 impl Reply {
@@ -245,34 +173,6 @@ fn truncate_utf8(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stats_use_separate_version_and_fixed_size() {
-        assert!(StatsReply::is_request(&StatsReply::request()));
-        assert!(!StatsReply::is_request(&[VERSION, KIND_SEARCH, 0, 0]));
-        let stats = StatsReply {
-            status: Status::Loading,
-            service_private: Some(23_000_000),
-            service_working_set: Some(25_000_000),
-            index_heap: None,
-            snapshot_disk: Some(0),
-            log_disk: None,
-            service_binary_disk: Some(1_000_000),
-        };
-        let mut bytes = Vec::new();
-        stats.encode(&mut bytes);
-        assert_eq!(StatsReply::decode(&bytes), Some(stats));
-        bytes.push(0);
-        assert_eq!(StatsReply::decode(&bytes), None);
-        bytes.pop();
-        bytes[0] = VERSION;
-        assert_eq!(StatsReply::decode(&bytes), None);
-        StatsReply::unavailable(Status::Denied).encode(&mut bytes);
-        assert_eq!(
-            StatsReply::decode(&bytes),
-            Some(StatsReply::unavailable(Status::Denied))
-        );
-    }
 
     #[test]
     fn request_round_trip() {

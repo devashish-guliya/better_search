@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_READMODE_MESSAGE, SetNamedPipeHandleState, TransactNamedPipe, WaitNamedPipeW,
 };
 
-use crate::{PIPE_NAME, Reply, Request, StatsReply};
+use crate::{PIPE_NAME, Reply, Request};
 
 const READ_CHUNK: usize = 64 * 1024;
 const BUSY_WAIT_MS: u32 = 2000;
@@ -105,15 +105,6 @@ impl Client {
         let len = self.transact()?;
         Reply::decode(&self.reply[..len])
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed reply"))
-    }
-
-    /// Reads resource sizes without changing the connection's search session.
-    pub fn stats(&mut self) -> io::Result<StatsReply> {
-        self.request.clear();
-        self.request.extend_from_slice(&StatsReply::request());
-        let len = self.transact()?;
-        StatsReply::decode(&self.reply[..len])
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed stats reply"))
     }
 
     fn transact(&mut self) -> io::Result<usize> {
