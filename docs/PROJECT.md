@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `c626267` ("Add native search window for service-backed name search").
+Last updated for the removable-drive implementation and its final service measurements.
 
 ---
 
@@ -106,6 +106,31 @@ virtual rows for `readme` through the real service (1,674 visible matches).
 The shell image list and common controls account for much of the working set.
 This is one session, not a side-by-side performance comparison. The temporary
 service was deleted after the test, along with its ProgramData folder.
+
+**Phase 3 final service measurement after the removable overlay.** The approved
+temporary run `target/admin_run/phase3_final.ps1` produced ignored reports
+`phase3_final.txt` and `phase3_pipe.txt` on the real C:, D:, E: drives. No FAT/exFAT
+device was attached, so this measures the monitoring overhead without a removable
+index, not removable-drive scan time or memory.
+
+| Measure | Current release build | Earlier `9c479c7` reference |
+|---|---|---|
+| Cold full scan to ready | 55.32 s for 609,088 entries | 53–61 s |
+| Warm start after clean stop | 137.2 ms inside service, 304 ms wall | 134 ms inside service |
+| Index memory at ready | 18.6 MB after warm start | 18.8 MB |
+| Service process at warm ready | 21.5 MiB private, 25.7 MiB working set | 21–22 MB private, 25 MB working set |
+| Repeated pipe query `readme` (15-run median) | 1.2 ms round trip, 1.1 ms service | 0.6–1.1 ms service |
+| Repeated pipe query `e` (15-run median) | 9.3 ms round trip, 9.2 ms service | 9–11 ms service |
+| Pipe overhead | 0.1–0.2 ms for 20 hits; 0.8 ms for 1,000 hits | 0.1–0.2 ms for 20 hits |
+| Idle CPU | 16 ms of CPU time over 60 s without queries | 359 ms over 90 s *with file changes* |
+
+The old and new release builds were alternated in one session for fresh-search
+comparisons in `18_real_old_*.txt` / `18_real_new_*.txt` (section 4 above).
+The service reference row is from a different session and is **not** a controlled
+side-by-side A/B comparison; the drive contents and machine load changed. The idle
+CPU samples have different activity and cannot support a direct speedup claim. The
+current run created and removed only `better_search_dev` and its own ProgramData
+folder; both were confirmed absent afterward.
 
 ---
 
@@ -756,20 +781,33 @@ was written; where the result differed, the difference is noted.
    the pipe and prints the results, so everything can be tested without the UI.
    Built as `bs query` inside the existing tool, with `--bench` for round trip, service
    time and overhead, and `-n` for the limit.
-6. **Deferred until after Phase 4: removable non-NTFS drives (FAT, FAT32, exFAT:
-   USB sticks, SD cards).**
-   - Indexed on plug-in by walking folders (`FindFirstFileExW` with
-     `FIND_FIRST_EX_LARGE_FETCH`, `FindExInfoBasic`); kept current with
-     `ReadDirectoryChangesW`; dropped when the drive is removed.
-   - Kept in memory only (no snapshot for them).
-   - Plug-in and removal detection: `RegisterDeviceNotification` or `WM_DEVICECHANGE`
-     in the service, or polling `GetLogicalDrives` every few seconds as a simpler first
-     version.
-   - NTFS-formatted removable drives could use the journal path, but that needs care
-     (the drive can disappear at any time).
-   - Network drives are excluded.
-7. **Deferred until after Phase 4: measurements** on the real drives: service memory,
-   start time, search round trip through the pipe, idle CPU.
+6. **Implemented after Phase 4, pending physical hardware verification: removable
+   non-NTFS drives (FAT, FAT32, exFAT: USB sticks, SD cards).**
+   - `crates/service/src/removable.rs` checks `GetLogicalDrives` / `GetDriveTypeW`
+     every two seconds and tracks drive letter plus volume serial. It walks each
+     new drive with `FindFirstFileExW` (`FindExInfoBasic`, large fetch with a fallback
+     for older drivers); `ReadDirectoryChangesW` watches the whole tree. A change
+     triggers a fresh scan beside the published index; only a complete replacement
+     is published. A failed or oversized scan drops the old index rather than
+     returning a misleading partial count. Reparse points are not traversed.
+   - Each volume has a separate, memory-only `Index`, with the existing ranked search
+     and profile privacy rules. The service merges the best hits and sums visible
+     match counts across NTFS and removable volumes without changing pipe v1, the
+     locked NTFS index arrays, or snapshot v3. No removable entries are saved.
+   - Trade-off: repeated changes on a busy removable drive cause repeated full walks
+     instead of per-file updates. This keeps rename handling and notification
+     overflow recovery simple and correct, but may use disk and CPU during those
+     walks. Entries appear after the first scan, not while it is in progress. A
+     two-million-entry cap bounds index memory and explicitly declines larger drives.
+   - Fixture tests exercise a scan, rename/delete, real directory notifications on
+     a local folder, drive-serial change/removal, and profile-filtered match counts.
+     Actual FAT/exFAT insertion, modification and unplug cannot be claimed tested:
+     there is no removable drive attached. Hardware testing remains pending.
+     NTFS-formatted removable drives and network drives are excluded.
+7. **Measured after Phase 4** on the real fixed NTFS drives: service memory,
+   cold/warm start, search round trip through the pipe, and idle CPU. See the
+   final measurement table in section 4. Removable media performance and real
+   unplug behavior remain unmeasured until physical hardware is available.
 
 **Testing the service during development:** installing a service changes the system,
 so ask the user before registering it. Use a clearly named temporary service (for
@@ -798,9 +836,11 @@ non-elevated window queried the temporary elevated service on the real drives;
 service test script (`run_ui_service.ps1`) deleted `better_search_dev` and
 `C:\ProgramData\better_search`; absence was checked afterwards. The unavailable
 state, settings navigation, Esc, hotkey and slide were exercised without elevation
-in `run_ui_smoke.ps1`; `run_ui_hidden.ps1` checked tray-first startup. The loading/denied
-states, context actions and theme changes
-are implemented but were not exercised end to end in that smoke test.
+in `run_ui_smoke.ps1`; `run_ui_hidden.ps1` checked tray-first startup. Subsequent
+`ui_denied.txt` and `ui_loading_ready.txt` verified a user-owned fake pipe is denied
+and a real service progresses from loading to 1,674 matches and 200 virtual rows
+(5,640,192 window private bytes). Context actions and theme changes are implemented
+but remain untested end to end.
 
 **Deferred by user decision:** the skipped-folder result count and per-folder
 overrides. Neither the pipe protocol nor index model may change for this increment.
@@ -865,8 +905,8 @@ precedence over its backend work:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  Phase 4: 82 workspace tests pass (index crate 33, query crate 18, engine crate 9,
-  service crate 7, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
+  85 workspace tests pass (index crate 33, query crate 18, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with

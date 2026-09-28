@@ -27,6 +27,7 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 use crate::caller;
+use crate::removable::{Removable, VolumeData};
 use crate::security::{PIPE_SDDL, SecurityDescriptor};
 
 /// More simultaneous connections than any number of search windows needs.
@@ -43,6 +44,7 @@ pub struct State {
     seen_sids: Mutex<Vec<String>>,
     /// The profile folders last handed to the index, and when the registry was read.
     profile_folders: Mutex<(Option<Vec<String>>, Option<Instant>)>,
+    removable: OnceLock<Arc<Removable>>,
 }
 
 impl State {
@@ -54,7 +56,12 @@ impl State {
             connections: AtomicUsize::new(0),
             seen_sids: Mutex::new(Vec::new()),
             profile_folders: Mutex::new((None, None)),
+            removable: OnceLock::new(),
         }
+    }
+
+    pub fn set_removable(&self, removable: &Arc<Removable>) {
+        let _ = self.removable.set(Arc::clone(removable));
     }
 
     /// Gives the index the profile folders Windows lists, when they changed, so that
@@ -71,6 +78,9 @@ impl State {
         let current = caller::profile_folders();
         if applied.as_ref() != Some(&current) {
             engine.set_profile_folders(&current);
+            if let Some(removable) = self.removable.get() {
+                removable.set_profile_folders(&current);
+            }
             (self.log)(&format!(
                 "profile folders in the registry: {}",
                 current.len()
@@ -335,7 +345,7 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
     let visibility = profiles.visibility(viewer.profile.as_deref());
     let filter = |entry: u32| profiles.allows(&visibility, &index, entry);
     let result = session.search_filtered(&index, &query, usize::from(req.limit), Some(&filter));
-    let hits = result
+    let mut hits: Vec<Hit> = result
         .hits
         .iter()
         .map(|hit| Hit {
@@ -345,10 +355,99 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
         })
         .collect();
     drop(index);
+    let mut total = result.total_matches;
+    if let Some(removable) = state.removable.get() {
+        let volumes = removable.indexes();
+        if !volumes.is_empty() {
+            merge_removable(
+                volumes,
+                &query,
+                viewer,
+                usize::from(req.limit),
+                &mut total,
+                &mut hits,
+            );
+            // Stable ties keep the NTFS order before entries from removable drives.
+            hits.sort_by_key(|a| std::cmp::Reverse(a.score));
+            hits.truncate(usize::from(req.limit));
+        }
+    }
     Reply {
         status: Status::Ok,
-        total_matches: u32::try_from(result.total_matches).unwrap_or(u32::MAX),
+        total_matches: u32::try_from(total).unwrap_or(u32::MAX),
         search_micros: u32::try_from(t.elapsed().as_micros()).unwrap_or(u32::MAX),
         hits,
+    }
+}
+
+fn merge_removable(
+    volumes: impl IntoIterator<Item = Arc<VolumeData>>,
+    query: &Query,
+    viewer: &Viewer,
+    limit: usize,
+    total: &mut usize,
+    hits: &mut Vec<Hit>,
+) {
+    for data in volumes {
+        let index = data.index.read().unwrap();
+        let profiles = Arc::clone(&data.profiles.lock().unwrap());
+        let visibility = profiles.visibility(viewer.profile.as_deref());
+        let filter = |entry: u32| profiles.allows(&visibility, &index, entry);
+        let found = bs_query::search_filtered(&index, query, limit, Some(&filter));
+        *total = total.saturating_add(found.total_matches);
+        hits.extend(found.hits.iter().map(|hit| Hit {
+            path: index.full_path(hit.entry),
+            is_dir: index.is_dir(hit.entry),
+            score: hit.score,
+        }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bs_index::IndexBuilder;
+
+    #[test]
+    fn removable_counts_respect_profile_visibility() {
+        let mut builder = IndexBuilder::new();
+        builder.begin_volume("R:", 1);
+        builder.push(2, 1, "Users", true, false);
+        builder.push(3, 2, "alice", true, false);
+        builder.push(4, 2, "bob", true, false);
+        builder.push(5, 3, "needle.txt", false, false);
+        builder.push(6, 4, "needle.txt", false, false);
+        builder.push(7, 1, "needle.txt", false, false);
+        builder.push(8, 1, "Private", true, false);
+        builder.push(9, 8, "bob", true, false);
+        builder.push(10, 9, "needle.txt", false, false);
+        builder.end_volume();
+        let data = Arc::new(VolumeData::new(
+            builder.finish(),
+            &[r"R:\Private\bob".into()],
+        ));
+        let query = Query::parse("needle").unwrap();
+        let mut total = 0;
+        let mut hits = Vec::new();
+        let alice = Viewer {
+            profile: Some(r"C:\Users\alice".into()),
+        };
+        merge_removable(
+            [Arc::clone(&data)],
+            &query,
+            &alice,
+            10,
+            &mut total,
+            &mut hits,
+        );
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| !h.path.contains(r"\bob\")));
+        // A later registry refresh must also update the privacy map, not just NTFS.
+        data.set_profile_folders(&[]);
+        total = 0;
+        hits.clear();
+        merge_removable([data], &query, &alice, 10, &mut total, &mut hits);
+        assert_eq!(total, 3);
     }
 }

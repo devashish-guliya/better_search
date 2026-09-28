@@ -2,10 +2,10 @@
 
 Very fast file and folder name search for Windows.
 
-The index is kept in memory by a background service. It reads the file list of NTFS
-drives directly, follows the NTFS change journal so it stays current, and saves a
-compressed snapshot so the next start is instant. The console client and a native Win32
-search window search it through a named pipe without admin rights.
+The index is kept in memory by a background service. It reads fixed NTFS drives
+directly, follows the NTFS change journal and saves a compressed snapshot. Removable
+FAT/FAT32/exFAT drives get separate, memory-only indexes while attached. The console
+client and a native Win32 search window search through a named pipe without admin rights.
 
 The full design record (decisions, what is settled, and the plan for the next phases) is
 in [docs/PROJECT.md](docs/PROJECT.md).
@@ -69,6 +69,14 @@ count and per-folder overrides are also deferred: the v1 index holds no skipped-
 contents, so any count here would be misleading. Neither the pipe protocol nor index
 model was changed for the window.
 
+The service checks for removable FAT/FAT32/exFAT drives every two seconds. It walks a
+new drive once, watches file and folder changes, and rebuilds that drive's index after
+a change. Results appear after the scan completes and disappear on removal. A scan that
+fails (including an oversized drive with more than two million entries) yields no
+partial results. Removable indexes are not saved to disk, so they scan again on each
+service start. NTFS-formatted removable drives and network drives are not covered yet.
+The removable behavior has been tested with folder fixtures, not physical USB hardware.
+
 In the interactive prompt, type a query to search. Commands:
 
 | Command | Effect |
@@ -93,6 +101,9 @@ changed.
 
 Drives without a change journal get one (32 MB, the size Windows uses for the system
 drive), so their snapshot stays valid too.
+
+An installer is planned for Phase 5 but has not been built. Until then, service
+registration is manual or done with a temporary development test.
 
 ## The service
 

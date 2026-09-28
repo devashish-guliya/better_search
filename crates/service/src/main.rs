@@ -6,6 +6,7 @@
 
 mod caller;
 mod logfile;
+mod removable;
 mod scm;
 mod security;
 mod server;
@@ -98,6 +99,11 @@ pub fn run(console: bool, stop: &Receiver<Stop>) -> Result<(), String> {
     }
 
     let state = Arc::new(State::new(Arc::clone(&log)));
+    let removable = Arc::new(
+        removable::Removable::start(Arc::clone(&log))
+            .map_err(|e| format!("cannot start removable drive monitoring: {e}"))?,
+    );
+    state.set_removable(&removable);
     if let Err(e) = server::start(Arc::clone(&state)) {
         let msg = format!(
             "cannot create {} ({e}); is the service already running?",
@@ -143,6 +149,7 @@ pub fn run(console: bool, stop: &Receiver<Stop>) -> Result<(), String> {
 
     let kind = stop.recv().unwrap_or(Stop::Save);
     log(&format!("stop requested ({kind:?})"));
+    removable.shutdown();
     match state.engine.get() {
         Some(engine) => engine.shutdown(kind == Stop::Save),
         None if loader.is_finished() => {}
