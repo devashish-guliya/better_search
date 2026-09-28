@@ -59,15 +59,6 @@ or right-click a result for Open, Open folder and Copy path. Esc hides the windo
 The status line distinguishes a stopped service, an index still loading and access
 denied. The window retries while a service is starting.
 
-While visible, the search panel shows resource estimates refreshed every two seconds: combined
-service and window **private committed memory**, their individual working sets,
-the index heap (already included in service private memory), and disk bytes for
-the saved snapshot, service log and three executables. Working sets can share
-pages, so do not add them to get unique physical RAM. The disk figure does not
-include filesystem allocation overhead, temporary files, Windows caches, or Rust
-build artifacts. An older running service cannot answer the stats request; restart
-it with the updated binary to see totals. The ordinary search request remains v1.
-
 Results include matching file and folder **names**, with their full location in the
 Path column. Enter opens the selected item, including an app's `.exe` or a shortcut
 when that file is indexed. This is not a general app catalog or a search of text
@@ -80,9 +71,8 @@ run `bs-window.exe --hidden` to do that manually. The drives shown in Settings a
 NTFS drives eligible for the service; changing the indexed drives is deferred because
 the current service and pipe have no per-user drive filter. The skipped-folder result
 count and per-folder overrides are also deferred: the v1 index holds no skipped-folder
-contents, so any count here would be misleading. Neither the pipe protocol nor index
-model was changed for those search features; only the later read-only resource stats
-use a separate protocol version.
+contents, so any count here would be misleading. The search pipe protocol and index
+model remain unchanged.
 
 The service checks for removable FAT/FAT32/exFAT drives every two seconds. It walks a
 new drive once, watches file and folder changes, and rebuilds that drive's index after
@@ -117,8 +107,41 @@ changed.
 Drives without a change journal get one (32 MB, the size Windows uses for the system
 drive), so their snapshot stays valid too.
 
-An installer is planned for Phase 5 but has not been built. Until then, service
-registration is manual or done with a temporary development test.
+## Installer
+
+`tools\installer` builds a small self-contained setup program (`better-search-setup.exe`)
+that embeds the three release binaries, so no WiX or .NET tooling is needed. It is a
+draft: the source builds and its `--inspect` mode reports the payload, but install and
+uninstall have **not** been run on any machine yet and the binary is **not code signed**.
+
+```powershell
+# Build the binaries first, then the setup program.
+cargo build --release
+cargo build --release --manifest-path tools\installer\Cargo.toml
+
+# Read-only: print the install folder and bundled payload sizes.
+.\tools\installer\target\release\better-search-setup.exe --inspect
+
+# Install (asks for one UAC prompt; writes to Program Files and registers the service).
+.\tools\installer\target\release\better-search-setup.exe
+```
+
+What the draft does if it is run:
+
+- Copies `bs-service.exe`, `bs-window.exe` and `bs.exe` into
+  `%ProgramFiles%\better_search`, and copies itself there as the uninstaller.
+- Registers and starts `better_search` as an auto-start service running as LocalSystem,
+  and adds a machine-wide `Run` entry that starts `bs-window.exe --hidden` at sign-in.
+- Refuses to run if the service, install folder or registry entries already exist, and
+  rolls back files, service and registry entries if any step fails.
+- Registers an entry in Apps & Features. Its Uninstall string runs
+  `better-search-setup.exe --uninstall`, which stops and deletes the service, removes
+  the files and registry entries, and asks (default No) before deleting the saved
+  snapshot and logs. It refuses to uninstall unless the install registration matches.
+  The uninstaller removes itself and its folder on the next reboot.
+
+Until this has been installed and uninstalled on a real machine, registering the
+service is still done by hand (`sc.exe create`) or with a temporary development test.
 
 ## The service
 

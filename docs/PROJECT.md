@@ -4,25 +4,16 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `06ce1f7` ("Show live resource stats in the search window").
+Last updated after commit `06ce1f7` ("Show live resource stats in the search window"). The
+working tree then removed that temporary stats display (back to protocol v1 only) and
+added the Phase 5 installer draft described in section 8.
 
-Temporary live resource stats in the window: a separate
-version 2 read-only stats request/reply was approved by the user; version 1 search
-messages, index arrays, and snapshot format are unchanged. The service reports its
-private committed memory, working set, index heap estimate, saved snapshot and log
-sizes, and its binary size. The window adds its own process memory and the adjacent
-window and CLI binary sizes. It polls on a background connection every two seconds
-while the panel is visible, and stops polling when hidden.
-Private memory is added across the two processes; index heap is already included.
-Working sets overlap through shared pages, and disk size excludes allocation slack,
-OS caches and build artifacts. If the service is absent or still running an older
-binary, the window labels unavailable values instead of inventing a total. The
-test-only elevated console service ran with an isolated ProgramData override and
-confirmed a normal-user window could show 1,674 matches plus live stats: 24.1 MiB
-combined private (21.8 MiB service + 2.3 MiB UI), 18.6 MiB index heap included
-within that memory, and 6.9 MiB on disk (snapshot, log, three binaries).
-`target/admin_run/stats_client.txt` contains the report. The sandbox was removed;
-the user's existing snapshot in `C:\ProgramData\better_search` was preserved.
+The temporary live resource display added at `06ce1f7` was removed at the
+user's request before packaging. Its isolated test measured 24.1 MiB combined
+private memory (21.8 MiB service + 2.3 MiB UI) and 6.9 MiB for the snapshot,
+log and three release binaries (`target/admin_run/stats_client.txt`). That test
+did not alter the user's existing snapshot in `C:\ProgramData\better_search`.
+The service and window once again use only the version 1 search protocol.
 
 ---
 
@@ -900,15 +891,57 @@ precedence over its backend work:
 - DPI awareness (per-monitor v2), dark and light theme following Windows.
 - Memory target for the window process: a few MB.
 
-### Phase 5: installer
+### Phase 5: installer (draft built; not yet installed or uninstalled)
 
-- One installer file (for example MSI via WiX, or a small custom Rust installer).
-- Installs `bs-service.exe` (service, starts automatically) and the window (started at
-  logon for each user), and sets the pipe and snapshot permissions.
-- One UAC prompt, at install.
-- Clean uninstall: stop and delete the service, remove files, the snapshot folder and
-  auto-start entries. Offer to keep or delete settings.
-- Code signing (so SmartScreen does not warn), and a version and update check later.
+**Draft at `tools/installer` (uncommitted as of this note).** WiX, `dotnet` and MSI
+packaging are not installed on the development machine, so Phase 5 is a small
+self-contained Rust program, package `better-search-setup`, binary
+`better-search-setup.exe`. `build.rs` and `include_bytes!` embed `bs-service.exe`,
+`bs-window.exe` and `bs.exe` from `target\release` into the one output file, and refuse
+to build if any is missing or not a Windows executable. The crate is separate from the
+workspace (`[workspace]` in its `Cargo.toml`), so `cargo test --workspace` does not
+cover it and its own `target\` is git-ignored.
+
+Modes:
+
+- No argument: install. `--inspect`: print versions, install folder and payload sizes
+  without touching the machine (read-only; safe to run).
+- `--install-elevated` / `--uninstall-elevated`: the internal steps an elevated copy
+  runs. A non-elevated start re-launches itself through `ShellExecuteW` `runas`, so the
+  user sees exactly one UAC prompt. The elevated step re-checks the token is elevated
+  and refuses otherwise.
+- `--uninstall`: the Apps & Features entry runs this; it elevates the same way.
+
+Install behaviour: requires the folder `%ProgramFiles%\better_search` and the registry
+entries to be absent, and the service not to exist, then copies the three binaries plus
+itself as the uninstaller, creates the `better_search` service (`SERVICE_AUTO_START`,
+LocalSystem, own process) and starts it, waits for `SERVICE_RUNNING`, and writes an HKLM
+`Run` entry (`bs-window.exe --hidden`) and the HKLM `...\Uninstall\better_search` keys
+(DisplayName, version, publisher, location, UninstallString, NoModify, NoRepair). Every
+step after `create_dir` is inside a rollback: on error it stops and deletes the service,
+removes the registry entries, deletes the written files and removes the folder.
+The window auto-start is machine-wide because the service is, so the panel appears for
+every user; the snapshot and pipe keep their own per-service protection.
+
+Uninstall behaviour: refuses unless the installer's own `InstallLocation` matches the
+expected folder (so it never deletes a service someone else registered), stops and
+deletes the service, removes the registry entries and the three binaries, then asks
+(default **No**) whether to delete the saved `index.bin` and logs. It removes only those
+named files and then the now-empty data folder; it never deletes unknown files
+recursively. The uninstaller queues itself and its folder for deletion on the next
+reboot (`MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT`), because Windows cannot delete
+a running executable.
+
+Not done yet, and the reason this is a draft:
+
+- **Install and uninstall have not been executed on any machine.** They must be tested
+  end to end (install → service starts → unelevated window searches → uninstall →
+  cleanup) and are not to be run without the user's explicit approval. The delayed
+  self-delete has not been observed on a real reboot either.
+- The binary is **not code signed**, so SmartScreen will warn. Signing and a version or
+  update check are still open, as originally planned.
+- The original Phase 5 plan is otherwise unchanged: one installer file, one UAC prompt,
+  clean uninstall offering to keep or delete settings, and later code signing.
 
 ### Later ideas (not decided)
 
@@ -927,9 +960,14 @@ precedence over its backend work:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  89 workspace tests pass (index crate 33, query crate 18, engine crate 9,
-  service crate 11, pipe crate 7, ntfs crate 3, cli crate 3, window crate 5).
+  85 workspace tests pass (index crate 33, query crate 18, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
+- **Installer crate checks** (it is outside the workspace): build the release binaries
+  first, then `cargo fmt`, `cargo test`, and
+  `cargo clippy --all-targets -- -D warnings` with
+  `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored.
+  Only `--inspect` is safe to run; never run install or uninstall without asking first.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList

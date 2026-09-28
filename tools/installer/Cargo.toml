@@ -1,0 +1,22 @@
+[package]
+name = "better-search-setup"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Built separately, after the three release binaries. The packaging step embeds
+# them in one distributable exe; it never writes to the machine during the build.
+[workspace]
+
+[dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
