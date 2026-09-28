@@ -71,6 +71,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs-window"
+version = "0.1.0"
+dependencies = [
+ "bs-pipe",
+ "windows-sys",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

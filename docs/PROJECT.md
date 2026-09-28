@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `8cb2f4c` ("Keep profile folders outside Users private").
+Last updated for Phase 4 after commit `939d0ff` ("Record the audit follow-up in the project docs").
 
 ---
 
@@ -44,6 +44,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `11970b2` | Security fixes from an audit: planted data folders are moved aside, the client refuses a pipe the service did not create |
 | `c5a9a6d` | Docs for those fixes, plus corrections the audit found in the Phase 3 docs |
 | `8cb2f4c` | Profile folders outside `Users` are private too; users epoch fix for a renamed users folder; missing tests |
+| `939d0ff` | Record the Phase 3 security audit follow-up in the project docs |
 
 ## 4. Current results on the development machine
 
@@ -95,11 +96,21 @@ History of the main numbers, to show what each change bought:
 | `913618b` (universal clutter rules) | 18.4 MB | 4.5 MB | 60 ms | 0.7–1.3 ms |
 | `9c479c7` (service, pipe, privacy) | 18.8 MB | 4.5 MB | 134 ms (service) | 2.2–2.5 ms fresh (`bs --bench`, see above), plus 0.1–0.2 ms pipe |
 
+**Phase 4 window smoke test, not a Phase 3 final measurement.** Saved reports
+`target/admin_run/ui_smoke.txt` and `ui_client.txt` measured the release window:
+2,387,968 bytes private and 16,175,104 bytes working set after showing the
+missing-service state and exercising settings, Esc, hotkey and slide animation;
+5,693,440 bytes private and 27,516,928 bytes working set while showing 200
+virtual rows for `readme` through the real service (1,674 visible matches).
+The shell image list and common controls account for much of the working set.
+This is one session, not a side-by-side performance comparison. The temporary
+service was deleted after the test, along with its ProgramData folder.
+
 ---
 
 ## 5. Architecture
 
-A Cargo workspace with seven crates:
+A Cargo workspace with eight crates:
 
 | Crate | Package | Purpose |
 |---|---|---|
@@ -110,6 +121,7 @@ A Cargo workspace with seven crates:
 | `crates/pipe` | `bs-pipe` | Message format of the service's named pipe, and a client for it |
 | `crates/service` | `bs-service` (binary `bs-service.exe`) | Background service: owns the index, answers searches |
 | `crates/cli` | `bs-cli` (binary `bs`) | Console tools: index and search locally, `bs query` through the service |
+| `crates/ui` | `bs-window` (binary `bs-window.exe`) | Unelevated native Win32 panel, tray, hotkey, edge hover, per-user settings |
 
 Dependencies are deliberately few: `windows-sys` (raw Win32 bindings), `hashbrown`,
 `zstd`, `memchr`, `rayon`. Release profile: `opt-level=3`, LTO, one codegen unit,
@@ -550,6 +562,38 @@ silent under `--bench` so the numbers are not disturbed. `bs query` needs no adm
 rights: it prints the same hits the service would return, with `-n` to change the limit,
 and reports a clear message when the service is not running.
 
+### 5.11 The search window (`bs-window.exe`, `crates/ui`)
+
+- A native Win32 process with per-monitor v2 DPI awareness and no elevation. Its one
+  worker thread owns `bs_pipe::Client`, keeps a connection between keystrokes for type-ahead
+  narrowing, coalesces pending edits and posts results to the window thread. A serial
+  number drops stale replies. Failed connections retry on later searches; loading and
+  missing-service states retry while visible. Denied and bad-request states are distinct.
+  It does not read the service's protected data folder.
+- The panel has an edit box, status line, and an owner-data list view (up to 200
+  displayed hits, with the accurate allowed-match count from the service). Name and path
+  columns use the shell's shared small-icon image list. `SHGetFileInfoW` uses synthetic
+  file attributes and an extension/folder cache, not a disk lookup for every row.
+  Enter opens, Ctrl+Enter selects the item in Explorer, arrows navigate, Esc hides,
+  and a result menu offers Open, Open folder and Copy path.
+- A tray icon provides Open, Settings, Pause and Quit. Pause suspends **window queries
+  only**, not the service's journaling and saving. The global hotkey defaults to Alt+Space;
+  if Windows or another app owns it, the tray still works and Settings can change it.
+  A transparent non-activating four-pixel edge zone on each monitor waits 280 ms before
+  sliding the panel in; it can be disabled or moved to the left edge. Window positioning
+  and child layout scale with the monitor DPI.
+- Per-user settings live in `%LOCALAPPDATA%\better_search\window.cfg`. The theme follows
+  Windows' app light/dark preference on settings changes (title bar, list and controls).
+  Start with Windows is off until explicitly enabled in Settings; it only changes the
+  current user's `HKCU\...\Run` value, starts the panel hidden in the tray, and requires
+  no admin rights. The current service
+  drives are listed as fixed NTFS candidates, not presented as an editable filter.
+- The clutter safety net is **deferred by user decision**. The v1 index has no entries
+  inside skipped folders, so neither a per-query skipped-result count nor a per-folder
+  unskip toggle can honestly work without more backend state. The settings page explains
+  this instead of displaying invented counts. Pipe version 1, the index arrays, flags,
+  snapshot format and clutter rules are unchanged.
+
 ---
 
 ## 6. Decisions and the reasons behind them
@@ -592,6 +636,10 @@ and reports a clear message when the service is not running.
 | Service accounts (LocalSystem, LocalService, NetworkService) are not profiles | No person searches as them, and hiding their folders would only hide system files from administrators |
 | Shared 64-connection limit, no per-user cap | The caller is known only after its first message, so a per-user cap cannot count silent connections; the worst case is a local slowdown, not exposed data |
 | `bs query` in the existing console tool, not a new binary | Keeps one small tool; the pipe client is in `bs-pipe` so the UI can reuse it |
+| One persistent window connection and a worker thread | Type-ahead narrowing works across keystrokes, and blocking pipe I/O cannot freeze input or painting |
+| Virtual list and cached shell system icons | Only visible rows request text/icons; an extension-level cache avoids filesystem I/O and a per-result icon allocation |
+| Per-user settings, not service configuration | Hotkey/hover/startup need no admin rights; changing service-wide indexed drives requires a separate backend design |
+| No fake skipped-folder count or drive filtering in the UI | Protocol v1 cannot return skipped contents or search a subset of drives accurately; the user explicitly deferred the locked protocol/index changes |
 
 ## 7. Locked in (do not change without discussing)
 
@@ -638,9 +686,9 @@ once at install.
 
 **Status:** steps 1-5 are built and verified end to end, with an elevated temporary
 service (`target\admin_run\run8.ps1` to `run11.ps1`), a non-elevated client and the
-release binaries. Steps 6 (removable non-NTFS drives) and 7 (final measurements at the
-end of the phase) remain. The step text below is the plan as it was written; where the
-result differed, the difference is noted.
+release binaries. Steps 6 (removable non-NTFS drives) and 7 (final measurements) are
+**deferred until after Phase 4**, not dropped. The step text below is the plan as it
+was written; where the result differed, the difference is noted.
 
 **Audit after step 5.** A review of the Phase 3 code found these, all handled:
 
@@ -707,7 +755,8 @@ result differed, the difference is noted.
    the pipe and prints the results, so everything can be tested without the UI.
    Built as `bs query` inside the existing tool, with `--bench` for round trip, service
    time and overhead, and `-n` for the limit.
-6. **Removable non-NTFS drives (FAT, FAT32, exFAT: USB sticks, SD cards).**
+6. **Deferred until after Phase 4: removable non-NTFS drives (FAT, FAT32, exFAT:
+   USB sticks, SD cards).**
    - Indexed on plug-in by walking folders (`FindFirstFileExW` with
      `FIND_FIRST_EX_LARGE_FETCH`, `FindExInfoBasic`); kept current with
      `ReadDirectoryChangesW`; dropped when the drive is removed.
@@ -718,8 +767,8 @@ result differed, the difference is noted.
    - NTFS-formatted removable drives could use the journal path, but that needs care
      (the drive can disappear at any time).
    - Network drives are excluded.
-7. **Measurements** on the real drives: service memory, start time, search round trip
-   through the pipe, idle CPU.
+7. **Deferred until after Phase 4: measurements** on the real drives: service memory,
+   start time, search round trip through the pipe, idle CPU.
 
 **Testing the service during development:** installing a service changes the system,
 so ask the user before registering it. Use a clearly named temporary service (for
@@ -737,7 +786,37 @@ and wrote its results to text files. Two things to watch:
 - Check that the service and `C:\ProgramData\better_search` are gone (as the user asked)
   before the next run, and start from a clean state.
 
-### Phase 4: search window
+### Phase 4: search window (native window built; backend extensions deferred)
+
+**Result after `939d0ff`:** `crates/ui` builds `bs-window.exe` and implements the
+window, virtual results, icons, actions, tray, configurable hotkey, delayed hover
+slide, DPI/theme handling and per-user settings described in 5.11. Built in the
+requested order: pipe-backed window, tray/hotkey, then hover/settings. A live
+non-elevated window queried the temporary elevated service on the real drives;
+`target/admin_run/ui_client.txt` records the match count, rows and memory. The
+service test script (`run_ui_service.ps1`) deleted `better_search_dev` and
+`C:\ProgramData\better_search`; absence was checked afterwards. The unavailable
+state, settings navigation, Esc, hotkey and slide were exercised without elevation
+in `run_ui_smoke.ps1`; `run_ui_hidden.ps1` checked tray-first startup. The loading/denied
+states, context actions and theme changes
+are implemented but were not exercised end to end in that smoke test.
+
+**Deferred by user decision:** the skipped-folder result count and per-folder
+overrides. Neither the pipe protocol nor index model may change for this increment.
+The current v1 index knows the skipped folder names, but not the names/counts under
+them. A correct on-demand option needs a versioned request/reply, bounded subtree
+indexing or traversal outside the keystroke path, per-user override state, live
+change handling, snapshot compatibility, and the same privacy filtering for both
+counts and hits. Scanning every skipped subtree on every keystroke would destroy
+interactive speed; indexing it all by default would undo the 85% clutter saving.
+Decide and approve that design before touching those locked pieces. The window
+also shows the current fixed NTFS drives read-only: client-side filtering of only
+200 returned hits would give wrong rankings and counts, while service-wide drive
+changes would require administrator configuration and a rescan. A future accurate
+per-user drive filter also needs a versioned request and a filtered search pass.
+
+The following bullets are the original Phase 4 plan; the deferrals above take
+precedence over its backend work:
 
 - Native Win32 window in Rust, no admin rights, talks to the service over the pipe.
 - **Access:** tray icon (menu: open, settings, pause, quit); global hotkey **Alt+Space**
@@ -785,9 +864,9 @@ and wrote its results to text files. Two things to watch:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  At `8cb2f4c`: 79 workspace tests pass (index crate 33, query crate 18, engine crate 9,
-  service crate 7, pipe crate 6, ntfs crate 3, cli crate 3), clippy clean, release build
-  produced `bs.exe`, `bs-service.exe` and the example at about 1 MB each.
+  Phase 4: 82 workspace tests pass (index crate 33, query crate 18, engine crate 9,
+  service crate 7, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
+  The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList
@@ -805,6 +884,12 @@ and wrote its results to text files. Two things to watch:
 - **Live tests must run outside `D:\better_search\target`:** that folder sits next to
   `Cargo.toml`, so the clutter rules skip it. Use a folder such as `D:\bsprobe_live` and
   delete it afterwards.
+- **Window integration tests:** ignored scripts `target\admin_run\run_ui_smoke.ps1`,
+  `run_ui_hidden.ps1`, `run_ui_service.ps1` and `run_ui_client.ps1` wrote
+  `ui_smoke.txt`, `ui_hidden.txt`, `ui_service.txt` and `ui_client.txt`. One elevated
+  service script at a time, with a non-elevated
+  client while it waits. The scripts refuse pre-existing service/data state, and the
+  elevated script deletes only the test service and the folder it created.
 - **Shell:** Windows PowerShell 5.1. No `&&` / `||`; use `;` and `$LASTEXITCODE`. Run
   cargo through `cmd /c "... 2>&1"` so stderr output does not produce a false error
   exit code. Two PowerShell traps hit in practice: `r` is an alias for `Invoke-History`

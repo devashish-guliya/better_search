@@ -4,9 +4,8 @@ Very fast file and folder name search for Windows.
 
 The index is kept in memory by a background service. It reads the file list of NTFS
 drives directly, follows the NTFS change journal so it stays current, and saves a
-compressed snapshot so the next start is instant. A small console client searches it
-through a named pipe without admin rights; the search window (later) will use the same
-pipe.
+compressed snapshot so the next start is instant. The console client and a native Win32
+search window search it through a named pipe without admin rights.
 
 The full design record (decisions, what is settled, and the plan for the next phases) is
 in [docs/PROJECT.md](docs/PROJECT.md).
@@ -22,11 +21,15 @@ in [docs/PROJECT.md](docs/PROJECT.md).
 | `crates/pipe` | Message format of the service's named pipe, and a client for it |
 | `crates/service` | `bs-service.exe`: the background service that owns the index |
 | `crates/cli` | `bs`: console tool that indexes and searches locally, and `bs query` through the service |
+| `crates/ui` | `bs-window.exe`: native search panel, virtual results, tray, hotkey, hover zone, per-user settings |
 
 ## Usage
 
 ```powershell
 cargo build --release
+
+# Launch the unelevated search window. Keep the service running for results.
+.\target\release\bs-window.exe
 
 # Search through the running service (no admin rights).
 .\target\release\bs.exe query readme
@@ -47,6 +50,24 @@ cargo build --release
 .\target\release\bs.exe --walk $env:USERPROFILE
 .\target\release\bs.exe --synthetic 5000000 --bench
 ```
+
+The window starts with Alt+Space (if Windows has not reserved it) and a short hover at
+the right screen edge. Double-click its tray icon to open it; right-click for Open,
+Settings, Pause or Quit. Pause stops window searches, not the background index. Type to
+search, use the arrow keys, Enter to open, Ctrl+Enter to select the result in Explorer,
+or right-click a result for Open, Open folder and Copy path. Esc hides the window.
+The status line distinguishes a stopped service, an index still loading and access
+denied. The window retries while a service is starting.
+
+Settings let you change the hotkey and edge side, disable edge hover, and explicitly
+enable per-user start at sign-in (HKCU only). Window settings are saved at
+`%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
+run `bs-window.exe --hidden` to do that manually. The drives shown in Settings are the fixed
+NTFS drives eligible for the service; changing the indexed drives is deferred because
+the current service and pipe have no per-user drive filter. The skipped-folder result
+count and per-folder overrides are also deferred: the v1 index holds no skipped-folder
+contents, so any count here would be misleading. Neither the pipe protocol nor index
+model was changed for the window.
 
 In the interactive prompt, type a query to search. Commands:
 
