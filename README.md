@@ -110,9 +110,9 @@ drive), so their snapshot stays valid too.
 ## Installer
 
 `tools\installer` builds a small self-contained setup program (`better-search-setup.exe`)
-that embeds the three release binaries, so no WiX or .NET tooling is needed. It is a
-draft: the source builds and its `--inspect` mode reports the payload, but install and
-uninstall have **not** been run on any machine yet and the binary is **not code signed**.
+that embeds the three release binaries, so no WiX or .NET tooling is needed. Install,
+search and uninstall were tested end to end on the development machine; the binary is
+still **not code signed**, so SmartScreen warns.
 
 ```powershell
 # Build the binaries first, then the setup program.
@@ -140,8 +140,14 @@ What the draft does if it is run:
   snapshot and logs. It refuses to uninstall unless the install registration matches.
   The uninstaller removes itself and its folder on the next reboot.
 
-Until this has been installed and uninstalled on a real machine, registering the
-service is still done by hand (`sc.exe create`) or with a temporary development test.
+Verified end to end on this machine: install started the service and the unelevated
+window showed "1674 matches" for `readme`, and uninstall removed the service, the
+files and the registry entries while keeping the snapshot. The one remaining file, the
+uninstaller itself, needs `Program Files` write access to delete and is queued for
+removal on the next reboot. The binary is not code signed, so SmartScreen will warn.
+
+Registering the service can also still be done by hand (`sc.exe create`) or with a
+temporary development test.
 
 ## The service
 

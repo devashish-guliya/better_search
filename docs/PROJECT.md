@@ -6,7 +6,8 @@ chat session) continuing the work. Keep it current when decisions change.
 
 Last updated after commit `06ce1f7` ("Show live resource stats in the search window"). The
 working tree then removed that temporary stats display (back to protocol v1 only) and
-added the Phase 5 installer draft described in section 8.
+added the Phase 5 installer (section 8), which was installed, searched with and
+uninstalled once end to end on the development machine with the user's approval.
 
 The temporary live resource display added at `06ce1f7` was removed at the
 user's request before packaging. Its isolated test measured 24.1 MiB combined
@@ -891,9 +892,9 @@ precedence over its backend work:
 - DPI awareness (per-monitor v2), dark and light theme following Windows.
 - Memory target for the window process: a few MB.
 
-### Phase 5: installer (draft built; not yet installed or uninstalled)
+### Phase 5: installer (built and tested end to end on the development machine)
 
-**Draft at `tools/installer` (uncommitted as of this note).** WiX, `dotnet` and MSI
+**Built at `tools/installer`.** WiX, `dotnet` and MSI
 packaging are not installed on the development machine, so Phase 5 is a small
 self-contained Rust program, package `better-search-setup`, binary
 `better-search-setup.exe`. `build.rs` and `include_bytes!` embed `bs-service.exe`,
@@ -932,14 +933,33 @@ recursively. The uninstaller queues itself and its folder for deletion on the ne
 reboot (`MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT`), because Windows cannot delete
 a running executable.
 
-Not done yet, and the reason this is a draft:
+**End-to-end test on the development machine (2026-09-28).** With the user's approval
+the draft was installed and uninstalled once, on the real C:, D:, E: drives, using the
+ignored elevated scripts `target\admin_run\phase5_install.ps1`,
+`phase5_window.ps1`/`phase5_window_ui.ps1` and `phase5_uninstall.ps1` (reports
+`phase5_install.txt`, `phase5_window.txt`, `phase5_ui*.png`, `phase5_uninstall.txt`):
 
-- **Install and uninstall have not been executed on any machine.** They must be tested
-  end to end (install → service starts → unelevated window searches → uninstall →
-  cleanup) and are not to be run without the user's explicit approval. The delayed
-  self-delete has not been observed on a real reboot either.
+- Install produced one started `better_search` service (Automatic, LocalSystem,
+  `"C:\Program Files\better_search\bs-service.exe"`), the four files in
+  `%ProgramFiles%\better_search`, the `Run` value
+  `"…\bs-window.exe" --hidden`, and the full Apps & Features uninstall record. It
+  loaded the existing snapshot (609,218 entries, 18.8 MB index) in 249 ms.
+- Unelevated `bs.exe query readme` returned 1,674 matches in ~11 ms round trip, and the
+  installed window, launched unelevated, showed "better_search · 1674 matches" with
+  `readme` results in its Name/Path columns.
+- Uninstall removed the service (SCM 1060 afterwards), the `Run` value and the uninstall
+  key, deleted the three binaries, and kept the snapshot and log when the prompt's
+  default (No) was chosen. The uninstall queue (`MoveFileExW`) held the uninstaller and
+  its folder for reboot-time deletion, which is why one
+  `better-search-setup.exe` remains in the folder until the next reboot; Program Files
+  needs elevation, so a normal shell cannot remove it sooner.
+
+Still open after the test:
+
+- The delayed self-delete was confirmed only through the queued
+  `PendingFileRenameOperations` entries, not by observing a reboot.
 - The binary is **not code signed**, so SmartScreen will warn. Signing and a version or
-  update check are still open, as originally planned.
+  update check remain open, as originally planned.
 - The original Phase 5 plan is otherwise unchanged: one installer file, one UAC prompt,
   clean uninstall offering to keep or delete settings, and later code signing.
 
@@ -967,7 +987,10 @@ Not done yet, and the reason this is a draft:
   first, then `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` with
   `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored.
-  Only `--inspect` is safe to run; never run install or uninstall without asking first.
+  Only `--inspect` is safe to run unattended; install and uninstall were run once with
+  the user's approval through `target\admin_run\phase5_install.ps1`,
+  `phase5_window*.ps1` and `phase5_uninstall.ps1`, and must still not be run again
+  without asking.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList
