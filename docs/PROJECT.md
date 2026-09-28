@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `734b61b` ("Add transient indexes for removable FAT-family drives").
+Last updated after commit `06ce1f7` ("Show live resource stats in the search window").
 
 Temporary live resource stats in the window: a separate
 version 2 read-only stats request/reply was approved by the user; version 1 search
@@ -66,6 +66,8 @@ Out of scope: searching file **contents**. Only names are searched.
 | `c626267` | Phase 4 native search window, tray, hotkey, hover, settings, and deferred backend decisions |
 | `7d9de03` | Record the Phase 4 implementation commit in project history |
 | `734b61b` | Memory-only removable FAT-family indexes, fixture tests, and final fixed-drive service measurements |
+| `ba13883` | Record the removable support commit in project history |
+| `06ce1f7` | Read-only version 2 stats request and temporary live memory/disk display in the search window |
 
 ## 4. Current results on the development machine
 
