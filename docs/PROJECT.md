@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated for the removable-drive implementation and its final service measurements.
+Last updated after commit `734b61b` ("Add transient indexes for removable FAT-family drives").
 
 ---
 
@@ -46,6 +46,8 @@ Out of scope: searching file **contents**. Only names are searched.
 | `8cb2f4c` | Profile folders outside `Users` are private too; users epoch fix for a renamed users folder; missing tests |
 | `939d0ff` | Record the Phase 3 security audit follow-up in the project docs |
 | `c626267` | Phase 4 native search window, tray, hotkey, hover, settings, and deferred backend decisions |
+| `7d9de03` | Record the Phase 4 implementation commit in project history |
+| `734b61b` | Memory-only removable FAT-family indexes, fixture tests, and final fixed-drive service measurements |
 
 ## 4. Current results on the development machine
 
