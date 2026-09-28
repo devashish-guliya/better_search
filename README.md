@@ -59,6 +59,20 @@ or right-click a result for Open, Open folder and Copy path. Esc hides the windo
 The status line distinguishes a stopped service, an index still loading and access
 denied. The window retries while a service is starting.
 
+While visible, the search panel shows resource estimates refreshed every two seconds: combined
+service and window **private committed memory**, their individual working sets,
+the index heap (already included in service private memory), and disk bytes for
+the saved snapshot, service log and three executables. Working sets can share
+pages, so do not add them to get unique physical RAM. The disk figure does not
+include filesystem allocation overhead, temporary files, Windows caches, or Rust
+build artifacts. An older running service cannot answer the stats request; restart
+it with the updated binary to see totals. The ordinary search request remains v1.
+
+Results include matching file and folder **names**, with their full location in the
+Path column. Enter opens the selected item, including an app's `.exe` or a shortcut
+when that file is indexed. This is not a general app catalog or a search of text
+inside full folder paths. Contents of skipped clutter folders are absent by design.
+
 Settings let you change the hotkey and edge side, disable edge hover, and explicitly
 enable per-user start at sign-in (HKCU only). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
@@ -67,7 +81,8 @@ NTFS drives eligible for the service; changing the indexed drives is deferred be
 the current service and pipe have no per-user drive filter. The skipped-folder result
 count and per-folder overrides are also deferred: the v1 index holds no skipped-folder
 contents, so any count here would be misleading. Neither the pipe protocol nor index
-model was changed for the window.
+model was changed for those search features; only the later read-only resource stats
+use a separate protocol version.
 
 The service checks for removable FAT/FAT32/exFAT drives every two seconds. It walks a
 new drive once, watches file and folder changes, and rebuilds that drive's index after

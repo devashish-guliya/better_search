@@ -4,12 +4,13 @@
 mod hover;
 mod search;
 mod settings;
+mod stats;
 
 use std::collections::HashMap;
 use std::ptr::{null, null_mut};
 use std::sync::mpsc::{Receiver, Sender};
 
-use bs_pipe::{Hit, Status};
+use bs_pipe::{Hit, StatsReply, Status};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
 use windows_sys::Win32::Graphics::Gdi::{
@@ -90,8 +91,11 @@ struct App {
     edit: HWND,
     list: HWND,
     status_label: HWND,
+    stats_labels: [HWND; 4],
     sender: Option<Sender<search::Request>>,
     results: Option<Receiver<search::ResultMessage>>,
+    stats_results: Option<Receiver<stats::Reading>>,
+    stats_stop: Option<Sender<()>>,
     serial: u64,
     hits: Vec<Hit>,
     names: Vec<Vec<u16>>,
@@ -118,8 +122,11 @@ impl App {
             edit: null_mut(),
             list: null_mut(),
             status_label: null_mut(),
+            stats_labels: [null_mut(); 4],
             sender: None,
             results: None,
+            stats_results: None,
+            stats_stop: None,
             serial: 0,
             hits: Vec::new(),
             names: Vec::new(),
@@ -235,6 +242,47 @@ impl App {
                     wide(&self.status).as_ptr(),
                 )
             };
+        }
+    }
+
+    fn update_stats(&self, reading: stats::Reading) {
+        let window = stats::window_memory();
+        let lines = match reading {
+            stats::Reading::Service(reply) => stats_lines(window, Some(&reply)),
+            stats::Reading::Unavailable => {
+                let ui = window.map_or_else(|| "?".into(), |m| stats::size(m.private));
+                [
+                    format!("Private memory: UI {ui}; service offline"),
+                    "Working set: service unavailable".into(),
+                    "Index heap: unavailable".into(),
+                    "Disk: unavailable while service is offline".into(),
+                ]
+            }
+            stats::Reading::Unsupported => {
+                let ui = window.map_or_else(|| "?".into(), |m| stats::size(m.private));
+                [
+                    format!("Private memory: UI {ui}; service stats unavailable"),
+                    "Restart the service with the updated bs-service.exe".into(),
+                    "Index heap: unavailable".into(),
+                    "Disk: unavailable from older service".into(),
+                ]
+            }
+            stats::Reading::Denied => [
+                "Resource stats: access denied".into(),
+                "The service could not identify this user".into(),
+                "Index heap: unavailable".into(),
+                "Disk: unavailable".into(),
+            ],
+        };
+        for (&control, text) in self.stats_labels.iter().zip(lines) {
+            if !control.is_null() {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                        control,
+                        wide(&text).as_ptr(),
+                    )
+                };
+            }
         }
     }
 
@@ -464,6 +512,9 @@ impl App {
             ShowWindow(self.edit, SW_HIDE);
             ShowWindow(self.list, SW_HIDE);
             ShowWindow(self.status_label, SW_HIDE);
+            for &label in &self.stats_labels {
+                ShowWindow(label, SW_HIDE);
+            }
         }
         for &control in &self.controls {
             unsafe { ShowWindow(control, SW_SHOW) };
@@ -508,6 +559,9 @@ impl App {
             ShowWindow(self.edit, SW_SHOW);
             ShowWindow(self.list, SW_SHOW);
             ShowWindow(self.status_label, SW_SHOW);
+            for &label in &self.stats_labels {
+                ShowWindow(label, SW_SHOW);
+            }
             SetFocus(self.edit);
         }
         self.layout(hwnd);
@@ -610,9 +664,19 @@ impl App {
                     pad,
                     pad + scale(hwnd, 40),
                     width,
-                    (rect.bottom - pad * 2 - scale(hwnd, 66)).max(0),
+                    (rect.bottom - pad * 2 - scale(hwnd, 142)).max(0),
                     1,
                 );
+                for (i, &label) in self.stats_labels.iter().enumerate() {
+                    MoveWindow(
+                        label,
+                        pad,
+                        rect.bottom - pad - scale(hwnd, 99 - 19 * i as i32),
+                        width,
+                        scale(hwnd, 18),
+                        1,
+                    );
+                }
                 MoveWindow(
                     self.status_label,
                     pad,
@@ -684,6 +748,67 @@ impl App {
             InvalidateRect(self.list, null(), 1);
         }
     }
+}
+
+fn stats_lines(window: Option<stats::WindowMemory>, service: Option<&StatsReply>) -> [String; 4] {
+    let Some(service) = service else {
+        return [
+            "Private memory: unavailable".into(),
+            "Working set: unavailable".into(),
+            "Index heap: unavailable".into(),
+            "Disk: unavailable".into(),
+        ];
+    };
+    let fmt = |bytes: Option<u64>| bytes.map_or_else(|| "?".into(), stats::size);
+    let total_private = window
+        .map(|m| m.private)
+        .zip(service.service_private)
+        .map(|(ui, svc)| ui.saturating_add(svc));
+    let private = format!(
+        "Private: {} (svc {} + UI {})",
+        fmt(total_private),
+        fmt(service.service_private),
+        fmt(window.map(|m| m.private))
+    );
+    let working_set = format!(
+        "Working sets: svc {} + UI {} (overlap)",
+        fmt(service.service_working_set),
+        fmt(window.map(|m| m.working_set))
+    );
+    let index = format!(
+        "Index heap: {} (included in service private)",
+        fmt(service.index_heap)
+    );
+    let ui_binary = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::metadata(path).ok().map(|m| m.len()));
+    let cli_binary = std::env::current_exe().ok().and_then(|path| {
+        std::fs::metadata(path.with_file_name("bs.exe"))
+            .ok()
+            .map(|m| m.len())
+    });
+    let files = [
+        service.snapshot_disk,
+        service.log_disk,
+        service.service_binary_disk,
+        ui_binary,
+        cli_binary,
+    ];
+    let disk = if files.iter().all(Option::is_some) {
+        format!(
+            "Disk: {} (snapshot {}, log {}, 3 binaries)",
+            fmt(Some(files.into_iter().flatten().sum())),
+            fmt(service.snapshot_disk),
+            fmt(service.log_disk)
+        )
+    } else {
+        format!(
+            "Disk: partial (snapshot {}, log {}; binary or snapshot missing)",
+            fmt(service.snapshot_disk),
+            fmt(service.log_disk)
+        )
+    };
+    [private, working_set, index, disk]
 }
 
 fn message(hwnd: HWND, text: &str) {
@@ -891,6 +1016,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 )
             };
             app.status_label = control(hwnd, &wide("STATIC"), "", STATUS_ID, WS_VISIBLE);
+            for label in &mut app.stats_labels {
+                *label = control(hwnd, &wide("STATIC"), "Waiting for stats…", 0, WS_VISIBLE);
+            }
             unsafe {
                 SetWindowSubclass(app.edit, Some(child_proc), EDIT_ID, hwnd as usize);
                 SetWindowSubclass(app.list, Some(child_proc), LIST_ID, hwnd as usize);
@@ -991,6 +1119,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let (sender, results) = search::start(hwnd);
             app.sender = Some(sender);
             app.results = Some(results);
+            let (stats_results, stats_stop) = stats::start(hwnd);
+            app.stats_results = Some(stats_results);
+            app.stats_stop = Some(stats_stop);
             app.theme(hwnd);
             app.register_hotkey(hwnd);
             unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
@@ -1118,6 +1249,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
+        stats::WM_STATS_RESULT => {
+            if let Some(results) = &app.stats_results
+                && let Some(reading) = results.try_iter().last()
+            {
+                app.update_stats(reading);
+            }
+            0
+        }
         WM_NOTIFY => {
             let hdr = unsafe { &*(l as *const NMHDR) };
             if hdr.hwndFrom == app.list {
@@ -1203,6 +1342,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             unsafe { Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd)) };
             app.sender.take();
             app.results.take();
+            app.stats_results.take();
+            app.stats_stop.take();
             unsafe { PostQuitMessage(0) };
             0
         }
@@ -1297,6 +1438,30 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_do_not_double_count_index_or_working_set() {
+        let service = StatsReply {
+            status: Status::Ok,
+            service_private: Some(20 * 1024 * 1024),
+            service_working_set: Some(25 * 1024 * 1024),
+            index_heap: Some(18 * 1024 * 1024),
+            snapshot_disk: None,
+            log_disk: Some(0),
+            service_binary_disk: Some(1234),
+        };
+        let lines = stats_lines(
+            Some(stats::WindowMemory {
+                private: 5 * 1024 * 1024,
+                working_set: 8 * 1024 * 1024,
+            }),
+            Some(&service),
+        );
+        assert!(lines[0].contains("25.0 MiB (svc 20.0 MiB + UI 5.0 MiB)"));
+        assert!(lines[1].contains("(overlap)"));
+        assert!(lines[2].contains("18.0 MiB (included"));
+        assert!(lines[3].contains("partial"));
+    }
 
     #[test]
     fn hotkey_control_round_trips_alt_space_and_combinations() {

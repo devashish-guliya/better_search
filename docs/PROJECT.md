@@ -6,6 +6,24 @@ chat session) continuing the work. Keep it current when decisions change.
 
 Last updated after commit `734b61b` ("Add transient indexes for removable FAT-family drives").
 
+Temporary live resource stats in the window: a separate
+version 2 read-only stats request/reply was approved by the user; version 1 search
+messages, index arrays, and snapshot format are unchanged. The service reports its
+private committed memory, working set, index heap estimate, saved snapshot and log
+sizes, and its binary size. The window adds its own process memory and the adjacent
+window and CLI binary sizes. It polls on a background connection every two seconds
+while the panel is visible, and stops polling when hidden.
+Private memory is added across the two processes; index heap is already included.
+Working sets overlap through shared pages, and disk size excludes allocation slack,
+OS caches and build artifacts. If the service is absent or still running an older
+binary, the window labels unavailable values instead of inventing a total. The
+test-only elevated console service ran with an isolated ProgramData override and
+confirmed a normal-user window could show 1,674 matches plus live stats: 24.1 MiB
+combined private (21.8 MiB service + 2.3 MiB UI), 18.6 MiB index heap included
+within that memory, and 6.9 MiB on disk (snapshot, log, three binaries).
+`target/admin_run/stats_client.txt` contains the report. The sandbox was removed;
+the user's existing snapshot in `C:\ProgramData\better_search` was preserved.
+
 ---
 
 ## 1. Goal
@@ -907,8 +925,8 @@ precedence over its backend work:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  85 workspace tests pass (index crate 33, query crate 18, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
+  89 workspace tests pass (index crate 33, query crate 18, engine crate 9,
+  service crate 11, pipe crate 7, ntfs crate 3, cli crate 3, window crate 5).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
