@@ -220,7 +220,11 @@ number, so each volume needs "record number → entry":
 - `UserContent`: under `<drive>\Users\<profile>\{Desktop, Documents, Downloads,
   Pictures, Videos, Music, OneDrive}`. Ranked higher.
 - `Noisy`: under `Windows`, `ProgramData`, `AppData`, `$`-folders at the drive root,
-  `Recovery`, `node_modules`, `.git` and similar. Ranked lower.
+  `Recovery`, `node_modules`, `.git` and similar. Ranked lower. Also folders named
+  `bun`, `.bun`, `vcpkg` or `certs`, and developer toolchains installed at a drive root
+  (`msys64`, `msys32`, `msys`, `cygwin`, `cygwin64`, `mingw64`, `mingw32`, `w64devkit`,
+  `strawberry`, `devkitpro`), so their share/zoneinfo and package data stop crowding
+  ordinary name searches.
 - `Normal`: everything else.
 
 A child inherits its parent's class unless its own name changes it. The classes are
@@ -280,7 +284,7 @@ snapshot size, start time and search time several times over.
 stays searchable (you can still find `node_modules` or `WinSxS`). A skipped folder has
 the `SKIPPED` flag; nothing below it is in the index.
 
-**Rules** (all in `crates/index/src/lib.rs`), current version `SKIP_RULES_VERSION = 2`:
+**Rules** (all in `crates/index/src/lib.rs`), current version `SKIP_RULES_VERSION = 3`:
 
 1. **Drive roots:** folders starting with `$` (like `$Recycle.Bin`) and
    `System Volume Information`.
@@ -358,9 +362,13 @@ the `SKIPPED` flag; nothing below it is in the index.
   Unicode lowercasing.
 - **Name score** (0 means no match), per term the best of: exact name > prefix > word
   start (after punctuation, camelCase boundary, letter/digit boundary) > substring.
-  Extras: prefix followed only by an extension counts as an exact stem match; `.exe`,
-  `.lnk`, `.url`, `.appref-ms` get a boost; `.dll`, `.mui`, `.tmp`, `.log`, `.etl`,
-  `.cat`, `.manifest`, `.pf`, `.pyc` get a penalty; longer names lose a little.
+  Extras: a name that is exactly the query plus one extension is an exact stem match;
+  when that extension is **launchable** (`.exe`, `.com`, `.bat`, `.cmd`, `.msi`, `.lnk`,
+  `.url`, `.appref-ms`) it becomes the highest tier, so the app a user means
+  (`factory.exe`) outranks folders and installers that only share the prefix.
+  Launchable extensions elsewhere get +10; `.dll`, `.mui`, `.tmp`, `.log`, `.etl`,
+  `.cat`, `.manifest`, `.pf`, `.pyc` and the certificate/runtime types `.pem`, `.pid`,
+  `.crt`, `.key`, `.pdb`, `.lib`, `.obj`, `.ilk` get −10; longer names lose a little.
 - **Pass 2, per entry:** name score plus location (`UserContent` +25, `Noisy` −45),
   folders +3, hidden −20. Each thread keeps only the best `limit` hits in a small heap,
   so the full match list is never built, even for millions of matches. Ties go to the
@@ -989,7 +997,7 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  85 workspace tests pass (index crate 33, query crate 18, engine crate 9,
+  88 workspace tests pass (index crate 34, query crate 20, engine crate 9,
   service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries

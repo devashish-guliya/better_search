@@ -196,10 +196,47 @@ impl Session {
 }
 
 const EXACT: i32 = 100;
+/// A launchable file named exactly after the query (`factory.exe`). This is the app
+/// the user meant, so it outranks folders and installers that merely share a prefix.
+const APP_STEM: i32 = 120;
 const EXACT_STEM: i32 = 90;
 const PREFIX: i32 = 70;
 const WORD_START: i32 = 50;
 const SUBSTRING: i32 = 30;
+
+/// Extensions the user launches: programs and shortcuts.
+const LAUNCHABLE: &[&[u8]] = &[
+    b"exe",
+    b"com",
+    b"bat",
+    b"cmd",
+    b"msi",
+    b"lnk",
+    b"url",
+    b"appref-ms",
+];
+
+/// Extensions that are almost never the file someone searched for by name: binaries,
+/// runtime files, logs and certificates.
+const DEMOTED: &[&[u8]] = &[
+    b"dll",
+    b"mui",
+    b"tmp",
+    b"log",
+    b"etl",
+    b"cat",
+    b"manifest",
+    b"pf",
+    b"pyc",
+    b"pem",
+    b"pid",
+    b"crt",
+    b"key",
+    b"pdb",
+    b"lib",
+    b"obj",
+    b"ilk",
+];
 
 /// Pass 2: turns per-name scores into the best entries.
 fn rank(
@@ -384,31 +421,32 @@ fn classify(lower: &[u8], pos: usize, needle_len: usize, upper: impl Fn(usize) -
 fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
     let mut score = total / query.terms.len() as i32;
 
-    if let [term] = query.terms.as_slice() {
-        let n = term.needle().len();
-        if score == PREFIX && lower.get(n) == Some(&b'.') && !lower[n + 1..].contains(&b'.') {
-            score = EXACT_STEM;
+    // The name is exactly the query plus a single extension (`factory.exe`, `notes.txt`).
+    let stem_extension = match query.terms.as_slice() {
+        [term] if score == PREFIX => {
+            let n = term.needle().len();
+            if lower.get(n) == Some(&b'.') && !lower[n + 1..].contains(&b'.') {
+                Some(&lower[n + 1..])
+            } else {
+                None
+            }
         }
-    }
+        _ => None,
+    };
 
-    if let Some(dot) = memchr::memrchr(b'.', lower) {
-        const BOOSTED: &[&[u8]] = &[b"exe", b"lnk", b"url", b"appref-ms"];
-        const DEMOTED: &[&[u8]] = &[
-            b"dll",
-            b"mui",
-            b"tmp",
-            b"log",
-            b"etl",
-            b"cat",
-            b"manifest",
-            b"pf",
-            b"pyc",
-        ];
-        let ext = &lower[dot + 1..];
-        if BOOSTED.contains(&ext) {
-            score += 10;
-        } else if DEMOTED.contains(&ext) {
-            score -= 10;
+    match stem_extension {
+        // A launchable file named exactly after the query is the app the user meant.
+        Some(extension) if LAUNCHABLE.contains(&extension) => score = APP_STEM,
+        Some(_) => score = EXACT_STEM,
+        None => {
+            if let Some(dot) = memchr::memrchr(b'.', lower) {
+                let extension = &lower[dot + 1..];
+                if LAUNCHABLE.contains(&extension) {
+                    score += 10;
+                } else if DEMOTED.contains(&extension) {
+                    score -= 10;
+                }
+            }
         }
     }
 
@@ -561,6 +599,35 @@ mod tests {
     fn exact_name_without_extension_ranks_above_longer_prefix() {
         let index = index_of(&["a\\notepad_backup.txt", "a\\notepad.exe"]);
         assert_eq!(paths(&index, "notepad", 10)[0], "T:\\a\\notepad.exe");
+    }
+
+    #[test]
+    fn launchable_app_outranks_folders_and_installers() {
+        let index = index_of(&[
+            "Users\\hp\\Desktop\\Factory.lnk",
+            "Users\\hp\\Downloads\\Factory-0.28.0 Setup.exe",
+            "msys64\\share\\zoneinfo\\Factory",
+            "Users\\hp\\bin\\factory.exe",
+        ]);
+        let order = paths(&index, "factory", 10);
+        let position = |suffix: &str| order.iter().position(|p| p.ends_with(suffix)).unwrap();
+        let app = position("factory.exe");
+        assert!(app < position("zoneinfo\\Factory"), "{order:?}");
+        assert!(app < position("Setup.exe"), "{order:?}");
+        // The Desktop shortcut to the app is a launchable match too, so it leads.
+        assert_eq!(order[0], "T:\\Users\\hp\\Desktop\\Factory.lnk");
+    }
+
+    #[test]
+    fn certificate_and_runtime_types_are_demoted() {
+        let index = index_of(&[
+            "a\\factory.exe",
+            "a\\factory-ai-root.pem",
+            "a\\factory-desktop-cdp-25828.pid",
+        ]);
+        let order = paths(&index, "factory", 10);
+        assert_eq!(order[0], "T:\\a\\factory.exe");
+        assert_eq!(order.len(), 3);
     }
 
     #[test]

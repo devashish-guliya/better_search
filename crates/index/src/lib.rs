@@ -38,7 +38,7 @@ pub mod flags {
 
 /// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
 /// change so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 2;
+pub const SKIP_RULES_VERSION: u32 = 3;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1439,6 +1439,11 @@ const NOISY_ANYWHERE: &[&[u8]] = &[
     b".gradle",
     b".m2",
     b".nuget",
+    // Package stores and certificate folders: tool output, not user files.
+    b"bun",
+    b".bun",
+    b"vcpkg",
+    b"certs",
 ];
 
 const NOISY_AT_ROOT: &[&[u8]] = &[
@@ -1448,6 +1453,18 @@ const NOISY_AT_ROOT: &[&[u8]] = &[
     b"recovery",
     b"system volume information",
     b"msocache",
+    // Developer toolchains installed at a drive root. Their share/zoneinfo and
+    // package data otherwise crowd ordinary name searches.
+    b"msys64",
+    b"msys32",
+    b"msys",
+    b"cygwin",
+    b"cygwin64",
+    b"mingw64",
+    b"mingw32",
+    b"w64devkit",
+    b"strawberry",
+    b"devkitpro",
 ];
 
 const USER_CONTENT: &[&[u8]] = &[
@@ -1872,6 +1889,40 @@ mod tests {
             Location::Noisy
         );
         assert_eq!(loc("C:\\code\\app\\index.js"), Location::Normal);
+    }
+
+    #[test]
+    fn dev_tool_trees_are_noisy() {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 5);
+        b.push(1, 5, "msys64", true, false);
+        b.push(2, 1, "share", true, false);
+        b.push(3, 2, "zoneinfo", true, false);
+        b.push(4, 3, "Factory", false, false);
+        b.push(6, 5, "Users", true, false);
+        b.push(7, 6, "bob", true, false);
+        b.push(8, 7, "bin", true, false);
+        b.push(9, 8, "factory.exe", false, false);
+        b.push(10, 7, "bun", true, false);
+        b.push(11, 10, "install", true, false);
+        b.push(12, 11, "cache", true, false);
+        b.push(13, 12, "factory.js", false, false);
+        b.end_volume();
+        let index = b.finish();
+        let location = |path: &str| index.location(find(&index, path));
+        assert_eq!(
+            location("C:\\msys64\\share\\zoneinfo\\Factory"),
+            Location::Noisy
+        );
+        assert_eq!(
+            location("C:\\Users\\bob\\bun\\install\\cache\\factory.js"),
+            Location::Noisy
+        );
+        // A plain folder named "bin" is not noisy.
+        assert_eq!(
+            location("C:\\Users\\bob\\bin\\factory.exe"),
+            Location::Normal
+        );
     }
 
     #[test]

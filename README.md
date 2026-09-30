@@ -71,6 +71,11 @@ Path column. Enter opens the selected item, including an app's `.exe` or a short
 when that file is indexed. This is not a general app catalog or a search of text
 inside full folder paths. Contents of skipped clutter folders are absent by design.
 
+Results are ranked so the likely target comes first: typing an app's name puts the
+launchable file (`.exe`, `.lnk`, `.bat`, ...) above folders and installers that share
+the name, certificate and runtime files (`.pem`, `.pid`, `.dll`, ...) are pushed down,
+and developer toolchains (`msys64`, `cygwin`, package caches) rank as low-value.
+
 Settings let you change the hotkey and edge side, disable edge hover, and explicitly
 enable per-user start at sign-in (HKCU only). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
