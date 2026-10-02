@@ -225,7 +225,18 @@ number, so each volume needs "record number → entry":
   (`msys64`, `msys32`, `msys`, `cygwin`, `cygwin64`, `mingw64`, `mingw32`, `w64devkit`,
   `strawberry`, `devkitpro`), so their share/zoneinfo and package data stop crowding
   ordinary name searches.
+- `AppFiles`: a program's own files, recognised by shape alone with no app names:
+  two or more folders below `Program Files\<app>` (or `Program Files (x86)`), Squirrel
+  `app-<digit>…` version folders, and dot-folders directly in a profile (`.vscode`,
+  `.docker`). The app's own folder and the files directly inside it stay `Normal`.
+  Ranked lower (−30) but still found. Programs installed elsewhere are not guessed at.
+- `StartMenu`: a `Start Menu\Programs` folder and everything below it, even though
+  it sits inside `ProgramData` or `AppData`. Ranked higher (+30), because installed
+  programs register their shortcuts there.
 - `Normal`: everything else.
+
+The class is stored in three flag bits (two at bits 2–3, one at bit 6) so older saved
+indexes read the same. `SKIP_RULES_VERSION` is 4, which triggers one rescan.
 
 A child inherits its parent's class unless its own name changes it. The classes are
 recomputed when folders move.
@@ -369,7 +380,7 @@ the `SKIPPED` flag; nothing below it is in the index.
   Launchable extensions elsewhere get +10; `.dll`, `.mui`, `.tmp`, `.log`, `.etl`,
   `.cat`, `.manifest`, `.pf`, `.pyc` and the certificate/runtime types `.pem`, `.pid`,
   `.crt`, `.key`, `.pdb`, `.lib`, `.obj`, `.ilk` get −10; longer names lose a little.
-- **Pass 2, per entry:** name score plus location (`UserContent` +25, `Noisy` −45),
+- **Pass 2, per entry:** name score plus location (`UserContent` +25, `StartMenu` +30, `AppFiles` −30, `Noisy` −45),
   folders +3, hidden −20. Each thread keeps only the best `limit` hits in a small heap,
   so the full match list is never built, even for millions of matches. Ties go to the
   lower entry number, so results are deterministic.
@@ -997,7 +1008,7 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  88 workspace tests pass (index crate 34, query crate 20, engine crate 9,
+  91 workspace tests pass (index crate 36, query crate 21, engine crate 9,
   service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries

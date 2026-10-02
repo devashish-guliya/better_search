@@ -1,4 +1,4 @@
-//! Compact in-memory index of file and folder names.
+﻿//! Compact in-memory index of file and folder names.
 //!
 //! Data is stored as parallel arrays (one slot per entry) instead of one struct per file:
 //! each entry costs a name id, a parent index and a flags byte. Names are UTF-8, stored
@@ -29,7 +29,10 @@ pub mod flags {
     /// Hidden or system attribute.
     pub const HIDDEN: u8 = 1 << 1;
     pub const LOCATION_SHIFT: u8 = 2;
-    pub const LOCATION_MASK: u8 = 0b11 << LOCATION_SHIFT;
+    /// The location class is three bits: two at `LOCATION_SHIFT` and a high bit apart
+    /// from them, so that older saved indexes (high bit clear) read the same.
+    pub const LOCATION_HIGH: u8 = 1 << 6;
+    pub const LOCATION_MASK: u8 = (0b11 << LOCATION_SHIFT) | LOCATION_HIGH;
     /// Removed entry, kept in place until the next [`crate::Index::compact`].
     pub const DELETED: u8 = 1 << 4;
     /// Folder whose contents are left out of the index (see [`crate::Index::skip_clutter`]).
@@ -38,7 +41,7 @@ pub mod flags {
 
 /// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
 /// change so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 3;
+pub const SKIP_RULES_VERSION: u32 = 4;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,22 +51,44 @@ pub enum Location {
     UserContent,
     /// Inside system or clutter folders such as Windows, AppData or node_modules.
     Noisy,
+    /// Inside an installed program's own files: below `Program Files\<app>`, a
+    /// versioned `app-1.2.3` folder, or a tool's dot-folder in a profile.
+    AppFiles,
+    /// Inside a Start Menu `Programs` folder, where installed programs register
+    /// their shortcuts.
+    StartMenu,
 }
 
 impl Location {
     fn to_bits(self) -> u8 {
-        let raw = match self {
+        let raw: u8 = match self {
             Location::Normal => 0,
             Location::UserContent => 1,
             Location::Noisy => 2,
+            Location::AppFiles => 3,
+            Location::StartMenu => 4,
         };
-        raw << flags::LOCATION_SHIFT
+        let high = if raw & 4 != 0 {
+            flags::LOCATION_HIGH
+        } else {
+            0
+        };
+        ((raw & 3) << flags::LOCATION_SHIFT) | high
     }
 
     pub fn from_flags(entry_flags: u8) -> Self {
-        match (entry_flags & flags::LOCATION_MASK) >> flags::LOCATION_SHIFT {
+        let low = (entry_flags >> flags::LOCATION_SHIFT) & 3;
+        if entry_flags & flags::LOCATION_HIGH != 0 {
+            return if low == 0 {
+                Location::StartMenu
+            } else {
+                Location::Normal
+            };
+        }
+        match low {
             1 => Location::UserContent,
             2 => Location::Noisy,
+            3 => Location::AppFiles,
             _ => Location::Normal,
         }
     }
@@ -1739,10 +1764,19 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
     let Some(parent) = index.parent(entry) else {
         return Location::Normal;
     };
+    let name = index.name_folded(entry);
+    // Start Menu folders sit inside ProgramData and AppData, so this must come before
+    // the check that lets Noisy spread to everything below.
+    if inherited == Location::StartMenu
+        || (name == b"programs"
+            && index.is_dir(entry)
+            && index.name_folded(parent) == b"start menu")
+    {
+        return Location::StartMenu;
+    }
     if inherited == Location::Noisy {
         return Location::Noisy;
     }
-    let name = index.name_folded(entry);
     let at_root = index.parent(parent).is_none();
     // NTFS metadata files and folders ($Extend, $Recycle.Bin, ...) live at the root.
     if at_root && name.starts_with(b"$") {
@@ -1762,8 +1796,49 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
                 return Location::UserContent;
             }
         }
+        if inherited == Location::Normal && is_app_internal(index, parent, name) {
+            return Location::AppFiles;
+        }
+    }
+    // Files directly inside an app's folder are not internals, but the folders and
+    // files below `Program Files\<app>\<folder>` are.
+    if inherited == Location::Normal && program_files_depth(index, parent) == Some(2) {
+        return Location::AppFiles;
     }
     inherited
+}
+
+/// Folders that belong to a program rather than to the person using it, recognised by
+/// name alone: Squirrel-style `app-1.2.3` version folders, and dot-folders that tools
+/// keep directly in a profile (`.vscode`, `.docker`, ...).
+fn is_app_internal(index: &Index, parent: u32, name: &[u8]) -> bool {
+    if name.starts_with(b"app-") && name.get(4).is_some_and(u8::is_ascii_digit) {
+        return true;
+    }
+    if name.len() > 1 && name.starts_with(b".") {
+        return index
+            .parent(parent)
+            .is_some_and(|users| index.is_users_folder(users));
+    }
+    false
+}
+
+/// How many folders deep `entry` is below a drive's `Program Files` or
+/// `Program Files (x86)` folder: 0 for the folder itself, 1 for an app's folder.
+/// `None` when it is not below one, or deeper than 3 levels.
+fn program_files_depth(index: &Index, entry: u32) -> Option<usize> {
+    let mut current = entry;
+    for depth in 0..=3 {
+        let name = index.name_folded(current);
+        let parent = index.parent(current)?;
+        if index.parent(parent).is_none() {
+            let is_pf = index.is_dir(current)
+                && (name == b"program files" || name == b"program files (x86)");
+            return is_pf.then_some(depth);
+        }
+        current = parent;
+    }
+    None
 }
 
 /// `C:\Profiles\anna` as `["c:", "profiles", "anna"]`, or `None` for paths that are not
@@ -1926,6 +2001,110 @@ mod tests {
     }
 
     #[test]
+    fn program_internals_are_app_files() {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 0);
+        b.push(1, 0, "Program Files", true, false);
+        b.push(2, 1, "Foo", true, false);
+        b.push(3, 2, "foo.exe", false, false);
+        b.push(4, 2, "plugins", true, false);
+        b.push(5, 4, "readme.md", false, false);
+        b.push(6, 0, "Users", true, false);
+        b.push(7, 6, "bob", true, false);
+        b.push(8, 7, ".vscode", true, false);
+        b.push(9, 8, "settings.json", false, false);
+        b.push(10, 7, "app-1.2.3", true, false);
+        b.push(11, 10, "update.dll", false, false);
+        b.push(12, 7, "apple", true, false);
+        b.push(13, 12, ".hidden", true, false);
+        b.push(14, 0, "Games", true, false);
+        b.push(15, 14, "Doom", true, false);
+        b.push(16, 15, "data", true, false);
+        b.push(17, 16, "readme.md", false, false);
+        b.push(18, 1, "Vendor", true, false);
+        b.push(19, 18, "Tool", true, false);
+        b.push(20, 19, "bin", true, false);
+        b.push(21, 20, "tool.exe", false, false);
+        b.end_volume();
+        let index = b.finish();
+        let location = |path: &str| index.location(find(&index, path));
+        let app = Location::AppFiles;
+        assert_eq!(location("C:\\Program Files\\Foo"), Location::Normal);
+        assert_eq!(
+            location("C:\\Program Files\\Foo\\foo.exe"),
+            Location::Normal
+        );
+        assert_eq!(
+            location("C:\\Program Files\\Foo\\plugins"),
+            Location::Normal
+        );
+        assert_eq!(location("C:\\Program Files\\Foo\\plugins\\readme.md"), app);
+        assert_eq!(location("C:\\Program Files\\Vendor\\Tool\\bin"), app);
+        assert_eq!(
+            location("C:\\Program Files\\Vendor\\Tool\\bin\\tool.exe"),
+            app
+        );
+        assert_eq!(location("C:\\Users\\bob\\.vscode"), app);
+        assert_eq!(location("C:\\Users\\bob\\.vscode\\settings.json"), app);
+        assert_eq!(location("C:\\Users\\bob\\app-1.2.3\\update.dll"), app);
+        // Dot-folders count only directly in a profile, and "apple" is not "app-<digit>".
+        assert_eq!(location("C:\\Users\\bob\\apple\\.hidden"), Location::Normal);
+        // Folders outside Program Files are not guessed at.
+        assert_eq!(
+            location("C:\\Games\\Doom\\data\\readme.md"),
+            Location::Normal
+        );
+    }
+
+    #[test]
+    fn start_menu_programs_are_boosted_even_inside_noisy_folders() {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 0);
+        b.push(1, 0, "ProgramData", true, false);
+        b.push(2, 1, "Microsoft", true, false);
+        b.push(3, 2, "Windows", true, false);
+        b.push(4, 3, "Start Menu", true, false);
+        b.push(5, 4, "Programs", true, false);
+        b.push(6, 5, "Google Chrome.lnk", false, false);
+        b.push(7, 5, "Accessories", true, false);
+        b.push(8, 7, "Paint.lnk", false, false);
+        b.push(9, 3, "Templates", true, false);
+        b.push(10, 9, "x.dat", false, false);
+        b.end_volume();
+        let index = b.finish();
+        let location = |path: &str| index.location(find(&index, path));
+        let base = "C:\\ProgramData\\Microsoft\\Windows\\";
+        let menu = Location::StartMenu;
+        assert_eq!(location(&format!("{base}Start Menu\\Programs")), menu);
+        assert_eq!(
+            location(&format!("{base}Start Menu\\Programs\\Google Chrome.lnk")),
+            menu
+        );
+        assert_eq!(
+            location(&format!(
+                "{base}Start Menu\\Programs\\Accessories\\Paint.lnk"
+            )),
+            menu
+        );
+        assert_eq!(
+            location(&format!("{base}Templates\\x.dat")),
+            Location::Noisy
+        );
+        for location in [
+            Location::Normal,
+            Location::UserContent,
+            Location::Noisy,
+            Location::AppFiles,
+            Location::StartMenu,
+        ] {
+            assert_eq!(
+                Location::from_flags(location.to_bits() | flags::DIR),
+                location
+            );
+        }
+    }
+
+    #[test]
     fn record_lookup_finds_entries() {
         let index = sample();
         let volume = &index.volumes()[0];
@@ -1950,11 +2129,11 @@ mod tests {
     fn decodes_utf16_names() {
         let mut b = IndexBuilder::new();
         b.begin_volume("X:", 0);
-        let name: Vec<u16> = "Résumé.PDF".encode_utf16().collect();
+        let name: Vec<u16> = "RÃ©sumÃ©.PDF".encode_utf16().collect();
         b.push_utf16(1, 0, &name, false, false);
         b.end_volume();
         let index = b.finish();
-        assert_eq!(index.full_path(1), "X:\\Résumé.PDF");
+        assert_eq!(index.full_path(1), "X:\\RÃ©sumÃ©.PDF");
     }
 
     #[test]

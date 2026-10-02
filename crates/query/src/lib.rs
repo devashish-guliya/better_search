@@ -341,6 +341,8 @@ fn final_score(name_score: u8, entry_flags: u8) -> i32 {
         Location::UserContent => 25,
         Location::Normal => 0,
         Location::Noisy => -45,
+        Location::AppFiles => -30,
+        Location::StartMenu => 30,
     };
     if entry_flags & flags::DIR != 0 {
         score += 3;
@@ -676,6 +678,27 @@ mod tests {
     fn demotes_noisy_locations() {
         let index = index_of(&["proj\\node_modules\\lodash\\index.js", "proj\\index.js"]);
         assert_eq!(paths(&index, "index.js", 10)[0], "T:\\proj\\index.js");
+    }
+
+    #[test]
+    fn demotes_program_internals_and_boosts_start_menu_shortcuts() {
+        let index = index_of(&[
+            "Program Files\\Acme\\plugins\\Acme Notes.txt",
+            "work\\Acme Notes.txt",
+        ]);
+        assert_eq!(
+            paths(&index, "acme notes", 10)[0],
+            "T:\\work\\Acme Notes.txt"
+        );
+
+        let index = index_of(&[
+            "Users\\bob\\Downloads\\Acme Setup.exe",
+            "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Acme Setup.lnk",
+        ]);
+        assert_eq!(
+            paths(&index, "acme setup", 10)[0],
+            "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Acme Setup.lnk"
+        );
     }
 
     #[test]
