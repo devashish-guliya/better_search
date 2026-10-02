@@ -14,7 +14,7 @@ const KEEP_ENTRIES: usize = 1500;
 /// An open counts half as much after this many days.
 const HALF_LIFE_DAYS: f64 = 14.0;
 /// The largest score bonus history can give. Name matches stay more important.
-const MAX_BOOST: i32 = 30;
+const MAX_BOOST: i32 = 60;
 /// Weights below this are forgotten.
 const FORGET_BELOW: f64 = 0.05;
 
@@ -241,7 +241,7 @@ impl History {
     /// often and how recently it was, and never above `MAX_BOOST`.
     pub fn boost(&self, path: &str, now: u64) -> i32 {
         self.entries.get(&key(path)).map_or(0, |e| {
-            ((8.0 * e.weight_at(now).ln_1p()) as i32).clamp(0, MAX_BOOST)
+            ((16.0 * e.weight_at(now).ln_1p()) as i32).clamp(0, MAX_BOOST)
         })
     }
 }

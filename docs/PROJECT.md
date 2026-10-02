@@ -671,6 +671,7 @@ and reports a clear message when the service is not running.
   returned. The file keeps at most 2,000 paths (the weakest 500 go when it overflows),
   forgets weights under 0.05, and is written by temp file and rename. Settings has a
   checkbox (`history=` in `window.cfg`, default on) and a "Clear open history" button.
+- **Kind ranking.** Name-score nudges by extension: launchable +15 (installers -20), documents +14, media +9, source/config -8, generated (`.class`, `.o`, `.map`, `.lock`...) -10; folders +6; Start Menu shortcuts +60; a name equal to the query (stem or whole) gets +40 (files only, not launchable stems that already score 120). Exact stems skip the length penalty. Frecency now adds `min(60, 16 ln(1+w))`. Start Menu shortcuts with the same name in equally named parent folders collapse to the best one. `SKIP_RULES_VERSION` 6 adds `.idea`, `.eggs`, `.sass-cache`; the service rescans when the stored version differs.
 - **Hidden system matches.** A measurement of the real index (`bs report <index.bin>`)
   found 94% of entries in system, app-data or program folders and 3.8% in ordinary
   locations. The window therefore asks the service to hide those by default and shows

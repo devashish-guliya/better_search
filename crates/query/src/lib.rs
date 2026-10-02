@@ -348,9 +348,54 @@ const LAUNCHABLE: &[&[u8]] = &[
     b"appref-ms",
 ];
 
+/// Documents a consumer user opens: office files, PDFs, notes, e-books and archives.
+const DOCUMENTS: &[&[u8]] = &[
+    b"pdf", b"doc", b"docx", b"odt", b"rtf", b"txt", b"md", b"xls", b"xlsx", b"ods", b"csv",
+    b"ppt", b"pptx", b"odp", b"key", b"pages", b"numbers", b"epub", b"mobi", b"zip", b"rar", b"7z",
+];
+
+/// Photos, video and audio: just under documents.
+const MEDIA: &[&[u8]] = &[
+    b"jpg", b"jpeg", b"png", b"gif", b"bmp", b"webp", b"heic", b"tif", b"tiff", b"svg", b"mp4",
+    b"mkv", b"mov", b"avi", b"webm", b"wmv", b"mp3", b"wav", b"flac", b"m4a", b"aac", b"ogg",
+];
+
+/// Source and configuration files a developer wrote: shown, but after everything a
+/// regular user is likelier to want.
+const CODE: &[&[u8]] = &[
+    b"rs", b"py", b"js", b"jsx", b"ts", b"tsx", b"json", b"h", b"hpp", b"c", b"cc", b"cpp", b"cs",
+    b"java", b"go", b"rb", b"php", b"kt", b"swift", b"toml", b"yaml", b"yml", b"xml", b"ini",
+    b"cfg", b"conf", b"sh", b"ps1", b"css", b"scss", b"html", b"htm", b"sql", b"gradle",
+];
+
+const DOCUMENT_BONUS: i32 = 14;
+const MEDIA_BONUS: i32 = 9;
+const CODE_PENALTY: i32 = 8;
+const APP_BONUS: i32 = 15;
+/// Added to names that equal the query (with or without an extension) so they outrank
+/// every kind and location preference.
+const EXACT_BONUS: i32 = 40;
+
+/// How the file type shifts a score: apps, then documents, then media; code last.
+fn kind_bonus(extension: &[u8]) -> i32 {
+    if DOCUMENTS.contains(&extension) {
+        DOCUMENT_BONUS
+    } else if MEDIA.contains(&extension) {
+        MEDIA_BONUS
+    } else if CODE.contains(&extension) {
+        -CODE_PENALTY
+    } else {
+        0
+    }
+}
+
 /// Extensions that are almost never the file someone searched for by name: binaries,
 /// runtime files, logs and certificates.
 const DEMOTED: &[&[u8]] = &[
+    b"class",
+    b"o",
+    b"map",
+    b"lock",
     b"dll",
     b"mui",
     b"tmp",
@@ -407,7 +452,29 @@ fn rank(
             },
         )
         .reduce(|| TopK::new(limit), TopK::merge);
-    top.into_result()
+    dedupe_shortcuts(index, top.into_result())
+}
+
+/// The same app often has a Start Menu shortcut for all users and another for the
+/// current user. Only the better-ranked one is listed.
+fn dedupe_shortcuts(index: &Index, mut result: SearchResult) -> SearchResult {
+    let mut seen = std::collections::HashSet::new();
+    let before = result.hits.len();
+    result.hits.retain(|hit| {
+        let f = index.flags()[hit.entry as usize];
+        let shortcut = f & flags::DIR == 0 && Location::from_flags(f) == Location::StartMenu;
+        // Same file name inside equally named folders; "Uninstall.lnk" of two apps
+        // sits in differently named folders and both stay.
+        let key = (
+            index.name_ids()[hit.entry as usize],
+            index
+                .parent(hit.entry)
+                .map(|p| index.name_ids()[p as usize]),
+        );
+        !shortcut || seen.insert(key)
+    });
+    result.total_matches -= before - result.hits.len();
+    result
 }
 
 /// Pass 1: one score per unique name; 0 means no match. With `candidates`, only those
@@ -490,10 +557,16 @@ fn final_score(name_score: u8, entry_flags: u8) -> i32 {
         // Shortcuts are the entries that launch installed programs. The folders that
         // group them are ordinary folders.
         Location::StartMenu if entry_flags & flags::DIR != 0 => 0,
-        Location::StartMenu => 50,
+        Location::StartMenu => 60,
     };
+    // Folders rank below documents and media but above code and unknown files.
     if entry_flags & flags::DIR != 0 {
-        score += 3;
+        score += 6;
+    }
+    // Folders are left out so a program's own folder never outranks its shortcut, and
+    // so are exact launchable names, which already have their own boost.
+    if (EXACT_STEM..APP_STEM).contains(&i32::from(name_score)) && entry_flags & flags::DIR == 0 {
+        score += EXACT_BONUS;
     }
     if entry_flags & flags::HIDDEN != 0 {
         score -= 20;
@@ -587,7 +660,7 @@ fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
     match stem_extension {
         // A launchable file named exactly after the query is the app the user meant.
         Some(extension) if LAUNCHABLE.contains(&extension) => score = APP_STEM,
-        Some(_) => score = EXACT_STEM,
+        Some(extension) => score = EXACT_STEM + kind_bonus(extension).max(0),
         None => {
             if let Some(dot) = memchr::memrchr(b'.', lower) {
                 let extension = &lower[dot + 1..];
@@ -596,17 +669,22 @@ fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
                     if extension == b"msi" || looks_like_installer(lower) {
                         score -= 20;
                     } else {
-                        score += 10;
+                        score += APP_BONUS;
                     }
                 } else if DEMOTED.contains(&extension) {
                     score -= 10;
+                } else {
+                    score += kind_bonus(extension);
                 }
             }
         }
     }
 
-    let extra = lower.len().saturating_sub(query.needle_len);
-    score -= (extra / 4).min(15) as i32;
+    // The extension of an exact stem match is not extra text.
+    if stem_extension.is_none() {
+        let extra = lower.len().saturating_sub(query.needle_len);
+        score -= (extra / 4).min(15) as i32;
+    }
     score.clamp(1, 255) as u8
 }
 
@@ -758,6 +836,54 @@ mod tests {
                 "T:\\dir\\unreported"
             ]
         );
+    }
+
+    #[test]
+    fn kinds_rank_apps_then_documents_then_media_then_folders_then_code() {
+        let index = index_of(&[
+            "d\\budget.rs",
+            "d\\budget_folder\\x",
+            "d\\budget_song.mp3",
+            "d\\budget_plan.pdf",
+            "d\\budget_app.exe",
+        ]);
+        let names: Vec<String> = paths(&index, "budget_", 10)
+            .into_iter()
+            .filter(|p| p.matches('\\').count() == 2)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "T:\\d\\budget_app.exe",
+                "T:\\d\\budget_plan.pdf",
+                "T:\\d\\budget_song.mp3",
+                "T:\\d\\budget_folder",
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_start_menu_shortcuts_are_listed_once() {
+        let all_users = "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs";
+        let user = "Users\\bob\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs";
+        let index = index_of(&[
+            &format!("{all_users}\\Access.lnk"),
+            &format!("{user}\\Access.lnk"),
+            &format!("{all_users}\\Foo\\Uninstall.lnk"),
+            &format!("{all_users}\\Bar\\Uninstall.lnk"),
+        ]);
+        let q = Query::parse("access").unwrap();
+        let result = search(&index, &q, 10);
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.total_matches, 1);
+        let q = Query::parse("uninstall").unwrap();
+        assert_eq!(search(&index, &q, 10).hits.len(), 2);
+    }
+
+    #[test]
+    fn exact_name_beats_the_app_preference() {
+        let index = index_of(&["d\\ac.pdf", "d\\access.exe"]);
+        assert_eq!(paths(&index, "ac", 10)[0], "T:\\d\\ac.pdf");
     }
 
     #[test]
@@ -930,7 +1056,7 @@ mod tests {
         // Start Menu folders get no boost of their own.
         let index = index_of(&[
             "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Git\\Git Bash.lnk",
-            "Users\\bob\\Documents\\Git",
+            "Users\\bob\\Documents\\Git\\readme",
         ]);
         let found = paths(&index, "git", 10);
         assert_eq!(
@@ -945,7 +1071,7 @@ mod tests {
             "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Visual Studio Code.lnk",
             "docs\\very_serious_charts.txt",
             "docs\\Visual Studios Code Notes.txt",
-            "docs\\vsc.txt",
+            "docs\\vscode.md",
             "docs\\Vsc Extra.txt",
             "docs\\Video\\Setup\\Cache",
         ]);
@@ -956,7 +1082,7 @@ mod tests {
             "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Visual Studio Code.lnk"
         );
         assert!(found.contains(&"T:\\docs\\very_serious_charts.txt".to_string()));
-        assert!(found.contains(&"T:\\docs\\vsc.txt".to_string()));
+        assert!(found.contains(&"T:\\docs\\vscode.md".to_string()));
         // "Visual Studios Code Notes" spells vscn, not vsc.
         let acronym_only = paths(&index, "vscn", 10);
         assert_eq!(

@@ -41,7 +41,7 @@ pub mod flags {
 
 /// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
 /// change so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 5;
+pub const SKIP_RULES_VERSION: u32 = 6;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1559,6 +1559,10 @@ const SKIP_ANYWHERE: &[&[u8]] = &[
     b".serverless",
     // General caches
     b".cache",
+    // IDE and generated-site folders
+    b".idea",
+    b".eggs",
+    b".sass-cache",
 ];
 
 // Project marker bits: which kinds of project a folder holds, judged by the files

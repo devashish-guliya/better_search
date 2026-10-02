@@ -80,6 +80,8 @@ in your profile) rank lower, and Start Menu shortcuts rank higher. When a short 
 has few matches, word initials count too: `vsc` finds `Visual Studio Code`, `mrv` finds
 `MyReportViewer`.
 
+Kinds rank in this order: apps (Start Menu, Desktop and program shortcuts), documents (PDF, Office, text, notes, archives), photos/video/music, folders, then everything else, with source and config files last. A name that equals the query always wins, and history ranks above all of it. The same app's all-users and per-user Start Menu shortcuts are listed once.
+
 Matches inside system, app-data and program folders are hidden by default; the status
 line says how many were hidden, and Ctrl+H shows them for the current session.
 `bs report <index.bin>` prints how an index divides between these classes, and
