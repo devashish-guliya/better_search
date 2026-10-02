@@ -94,13 +94,126 @@ pub fn search_filtered(
     filter: Option<Filter<'_>>,
 ) -> SearchResult {
     let scores = score_names(index.names(), query, None);
-    if collect_matches(&scores, None, false).0 == 0 {
-        return SearchResult {
+    let result = if collect_matches(&scores, None, false).0 == 0 {
+        SearchResult {
             hits: Vec::new(),
             total_matches: 0,
-        };
+        }
+    } else {
+        rank(index, &scores, limit, filter)
+    };
+    add_acronyms(index, query, limit, filter, result)
+}
+
+/// Name score of an acronym match (`vsc` for `Visual Studio Code`): above a match in
+/// the middle of a word, below a prefix match.
+const ACRONYM: i32 = 60;
+
+/// Acronym queries are 2 to 6 letters.
+const ACRONYM_LENGTHS: std::ops::RangeInclusive<usize> = 2..=6;
+
+/// Acronyms are a fallback for searches with few ordinary matches. With more, the
+/// user is looking at plenty already, and the extra scan would cost every keystroke.
+const ACRONYM_BELOW: usize = 200;
+
+/// Adds names whose word initials spell the query. Only a single ASCII word of letters
+/// can be an acronym. Ordinary matches keep their score, so an acronym only wins
+/// where it also gets a boost from its location or type (a Start Menu shortcut).
+fn add_acronyms(
+    index: &Index,
+    query: &Query,
+    limit: usize,
+    filter: Option<Filter<'_>>,
+    found: SearchResult,
+) -> SearchResult {
+    let [term] = query.terms.as_slice() else {
+        return found;
+    };
+    if found.total_matches >= ACRONYM_BELOW {
+        return found;
     }
-    rank(index, &scores, limit, filter)
+    let word = term.needle();
+    if !query.ascii
+        || !ACRONYM_LENGTHS.contains(&word.len())
+        || !word.iter().all(u8::is_ascii_alphabetic)
+    {
+        return found;
+    }
+    let names = index.names();
+    let scores: Vec<u8> = (0..names.len() as u32)
+        .into_par_iter()
+        .with_min_len(1 << 14)
+        .map(|id| acronym_score(names, id, word))
+        .collect();
+    if !scores.iter().any(|&s| s != 0) {
+        return found;
+    }
+    let extra = rank(index, &scores, limit, filter);
+    if extra.total_matches == 0 {
+        return found;
+    }
+    let mut hits = found.hits;
+    let present: std::collections::HashSet<u32> = hits.iter().map(|h| h.entry).collect();
+    // An entry that matched both ways is counted once. Overlaps that fall outside the
+    // returned hits cannot be seen, so the total may be slightly high.
+    let mut duplicates = 0;
+    for hit in extra.hits {
+        if present.contains(&hit.entry) {
+            duplicates += 1;
+        } else {
+            hits.push(hit);
+        }
+    }
+    hits.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.entry.cmp(&b.entry)));
+    hits.truncate(limit);
+    SearchResult {
+        hits,
+        total_matches: found.total_matches + extra.total_matches - duplicates,
+    }
+}
+
+/// [`ACRONYM`] (adjusted for the file type) when the word initials of the name, without
+/// its extension, are exactly `word`; 0 otherwise.
+fn acronym_score(names: &NameTable, id: u32, word: &[u8]) -> u8 {
+    let folded = names.folded(id);
+    if folded.first() != word.first() {
+        return 0;
+    }
+    let start = names.range(id).start;
+    let extension = memchr::memrchr(b'.', folded)
+        .filter(|&dot| dot > 0 && folded.len() - dot <= 6)
+        .map(|dot| &folded[dot + 1..]);
+    let end = extension.map_or(folded.len(), |ext| folded.len() - ext.len() - 1);
+    let mut next = 0;
+    for i in 0..end {
+        let cur = folded[i];
+        if !cur.is_ascii_alphanumeric() {
+            continue;
+        }
+        let word_start = i == 0
+            || (!folded[i - 1].is_ascii_alphanumeric() && folded[i - 1].is_ascii())
+            || (folded[i - 1].is_ascii_lowercase()
+                && !names.is_upper(start + i - 1)
+                && cur.is_ascii_lowercase()
+                && names.is_upper(start + i));
+        if !word_start {
+            continue;
+        }
+        if next == word.len() || word[next] != cur {
+            return 0;
+        }
+        next += 1;
+    }
+    if next != word.len() {
+        return 0;
+    }
+    let mut score = ACRONYM;
+    match extension {
+        Some(ext) if LAUNCHABLE.contains(&ext) => score += 10,
+        Some(ext) if DEMOTED.contains(&ext) => score -= 10,
+        _ => {}
+    }
+    score as u8
 }
 
 /// Counts the names whose score is non-zero, and (when `keep` is set and there are few
@@ -191,7 +304,7 @@ impl Session {
             terms: query.term_bytes(),
             matched_names: stored,
         });
-        result
+        add_acronyms(index, query, limit, filter, result)
     }
 }
 
@@ -698,6 +811,44 @@ mod tests {
         assert_eq!(
             paths(&index, "acme setup", 10)[0],
             "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Acme Setup.lnk"
+        );
+    }
+
+    #[test]
+    fn word_initials_find_multi_word_names() {
+        let index = index_of(&[
+            "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Visual Studio Code.lnk",
+            "docs\\very_serious_charts.txt",
+            "docs\\Visual Studios Code Notes.txt",
+            "docs\\vsc.txt",
+            "docs\\Vsc Extra.txt",
+            "docs\\Video\\Setup\\Cache",
+        ]);
+        let found = paths(&index, "vsc", 10);
+        // The shortcut leads: its initials match and the Start Menu boost applies.
+        assert_eq!(
+            found[0],
+            "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Visual Studio Code.lnk"
+        );
+        assert!(found.contains(&"T:\\docs\\very_serious_charts.txt".to_string()));
+        assert!(found.contains(&"T:\\docs\\vsc.txt".to_string()));
+        // "Visual Studios Code Notes" spells vscn, not vsc.
+        let acronym_only = paths(&index, "vscn", 10);
+        assert_eq!(
+            acronym_only,
+            vec!["T:\\docs\\Visual Studios Code Notes.txt".to_string()]
+        );
+        // Not an acronym query: several terms, digits, or too short or long.
+        assert!(paths(&index, "vsc n", 10).is_empty());
+        assert!(paths(&index, "v", 10).len() > 1);
+    }
+
+    #[test]
+    fn camel_case_words_count_as_initials() {
+        let index = index_of(&["src\\MyReportViewer.cs", "src\\Myreportviewer.cs"]);
+        assert_eq!(
+            paths(&index, "mrv", 10),
+            vec!["T:\\src\\MyReportViewer.cs".to_string()]
         );
     }
 

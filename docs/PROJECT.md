@@ -384,6 +384,15 @@ the `SKIPPED` flag; nothing below it is in the index.
   folders +3, hidden −20. Each thread keeps only the best `limit` hits in a small heap,
   so the full match list is never built, even for millions of matches. Ties go to the
   lower entry number, so results are deterministic.
+- **Acronym fallback:** a query of one ASCII word, 2–6 letters, with fewer than 200
+  ordinary matches also finds names whose word initials spell it exactly (extension
+  ignored; words split at non-alphanumeric characters and camelCase). `vsc` finds
+  `Visual Studio Code.lnk`, `mrv` finds `MyReportViewer.cs`. An acronym match scores 60
+  (+10 launchable, −10 demoted type), then location applies, so a Start Menu shortcut
+  reaches 100. Results are merged with the ordinary ones. The scan reads every unique
+  name but the first-byte test skips nearly all of them; above the 200-match limit it is
+  skipped, so busy queries cost nothing extra (synthetic 2M entries: png, exe and readme
+  unchanged at 5–6 ms). Narrowing does not apply to it.
 - **Type-ahead narrowing (`Session`):** when the new query only adds characters to the
   previous one, only the names that matched before are re-checked. The cache resets when
   the index `generation` changes. Narrowing keeps a match list only up to 8192 names:
@@ -1017,7 +1026,7 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  96 workspace tests pass (index crate 36, query crate 21, engine crate 9,
+  98 workspace tests pass (index crate 36, query crate 23, engine crate 9,
   service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 8).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries

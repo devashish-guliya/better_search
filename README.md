@@ -74,7 +74,11 @@ inside full folder paths. Contents of skipped clutter folders are absent by desi
 Results are ranked so the likely target comes first: typing an app's name puts the
 launchable file (`.exe`, `.lnk`, `.bat`, ...) above folders and installers that share
 the name, certificate and runtime files (`.pem`, `.pid`, `.dll`, ...) are pushed down,
-and developer toolchains (`msys64`, `cygwin`, package caches) rank as low-value.
+and developer toolchains (`msys64`, `cygwin`, package caches) rank as low-value. A
+program's own files (below `Program Files\<app>`, `app-1.2.3` folders, tool dot-folders
+in your profile) rank lower, and Start Menu shortcuts rank higher. When a short search
+has few matches, word initials count too: `vsc` finds `Visual Studio Code`, `mrv` finds
+`MyReportViewer`.
 
 The window remembers what you open (on by default) and ranks those files higher the next
 time they match, with a bonus that grows with how often and how recently you opened
