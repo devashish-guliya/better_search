@@ -5,9 +5,12 @@ mod frecency;
 mod hover;
 mod search;
 mod settings;
+mod thumbs;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ptr::{null, null_mut};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
 use bs_pipe::{Hit, Status};
@@ -28,12 +31,14 @@ use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATT
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     EM_SETMARGINS, HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES,
-    INITCOMMONCONTROLSEX, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_IMAGE,
-    LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE,
-    LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, LVSIL_SMALL, NM_DBLCLK, NMHDR, NMLVDISPINFOW, SetWindowTheme, WC_LISTVIEWW,
+    ILC_COLOR32, INITCOMMONCONTROLSEX, ImageList_Add, ImageList_Create, ImageList_Destroy,
+    ImageList_Remove, ImageList_ReplaceIcon, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM,
+    LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS,
+    LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSIL_SMALL, NM_DBLCLK, NMHDR, NMLVDISPINFOW, SetWindowTheme,
+    WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
@@ -44,13 +49,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
-    RemoveWindowSubclass, SHFILEINFOW, SHGFI_SMALLICON, SHGFI_SYSICONINDEX,
-    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SetWindowSubclass, Shell_NotifyIconW, ShellExecuteW,
+    RemoveWindowSubclass, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
+    SHGetFileInfoW, SetWindowSubclass, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
+    ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
     GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION, IsWindowVisible, KillTimer,
     LoadCursorW, LoadIconW, MF_STRING, MSG, MoveWindow, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
@@ -86,6 +91,10 @@ const SETTINGS_BACK: usize = 306;
 const SETTINGS_HISTORY: usize = 307;
 const SETTINGS_CLEAR: usize = 308;
 const CHECKED: isize = 1;
+/// Result icons and previews, in pixels at 96 DPI.
+const ICON_SIZE: i32 = 32;
+/// Pictures kept before the image list starts over.
+const MAX_IMAGES: usize = 600;
 /// `EM_SETMARGINS` flags for the search box's inner text padding.
 const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
@@ -140,8 +149,18 @@ struct App {
     paths: Vec<Vec<u16>>,
     status: String,
     last_text: String,
+    /// Type icons by extension, as image list slots.
     icon_cache: HashMap<String, i32>,
+    /// The file's own picture by path, as image list slots.
+    path_icons: HashMap<String, i32>,
+    /// Paths sent to the thumbnail worker for the current result list.
+    requested: HashSet<String>,
     image_list: isize,
+    icon_size: i32,
+    image_count: usize,
+    thumb_sender: Option<Sender<thumbs::Request>>,
+    thumb_results: Option<Receiver<thumbs::Done>>,
+    thumb_generation: Arc<AtomicU64>,
     settings: settings::Settings,
     history: frecency::History,
     paused: bool,
@@ -178,7 +197,14 @@ impl App {
             status: "Type to search".into(),
             last_text: String::new(),
             icon_cache: HashMap::new(),
+            path_icons: HashMap::new(),
+            requested: HashSet::new(),
             image_list: 0,
+            icon_size: 0,
+            image_count: 0,
+            thumb_sender: None,
+            thumb_results: None,
+            thumb_generation: Arc::new(AtomicU64::new(0)),
             settings: settings::Settings::load(),
             history: frecency::History::load(),
             paused: false,
@@ -271,9 +297,12 @@ impl App {
                     self.names = reply
                         .hits
                         .iter()
-                        .map(|hit| wide(hit.path.rsplit('\\').next().unwrap_or(&hit.path)))
+                        .map(|hit| wide(&display_name(hit)))
                         .collect();
-                    self.paths = reply.hits.iter().map(|hit| wide(&hit.path)).collect();
+                    self.paths = reply.hits.iter().map(|hit| wide(&describe(hit))).collect();
+                    // Pictures still queued for the previous list are not needed now.
+                    self.thumb_generation.fetch_add(1, Ordering::Relaxed);
+                    self.requested.clear();
                     self.hits = reply.hits;
                     unsafe {
                         SendMessageW(self.list, LVM_SETITEMCOUNT, self.hits.len(), 0);
@@ -356,7 +385,30 @@ impl App {
         }
     }
 
+    /// Image list slot for row `index`: the file's own picture once the thumbnail
+    /// worker has made it, a type icon until then.
     fn icon(&mut self, index: usize) -> i32 {
+        let size = scale(self.list, ICON_SIZE);
+        if self.image_list == 0 || self.icon_size != size {
+            self.reset_images(size);
+        }
+        let hit = &self.hits[index];
+        if let Some(&slot) = self.path_icons.get(&hit.path) {
+            return slot;
+        }
+        if self.requested.insert(hit.path.clone())
+            && let Some(sender) = &self.thumb_sender
+        {
+            let _ = sender.send(thumbs::Request {
+                generation: self.thumb_generation.load(Ordering::Relaxed),
+                path: hit.path.clone(),
+                size,
+            });
+        }
+        self.type_icon(index)
+    }
+
+    fn type_icon(&mut self, index: usize) -> i32 {
         let hit = &self.hits[index];
         let name = hit.path.rsplit('\\').next().unwrap_or(&hit.path);
         let extension = (!hit.is_dir)
@@ -383,18 +435,37 @@ impl App {
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
-        // Use attributes, not actual disk I/O. The system image list owns the icons.
-        let images = unsafe {
+        // Use attributes, not actual disk I/O.
+        let found = unsafe {
             SHGetFileInfoW(
                 fake.as_ptr(),
                 attrs,
                 &mut info,
                 size_of::<SHFILEINFOW>() as u32,
-                SHGFI_SYSICONINDEX | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
             )
         };
-        if images != 0 && self.image_list == 0 {
-            self.image_list = images as isize;
+        let slot = if found != 0 && !info.hIcon.is_null() {
+            let slot = unsafe { ImageList_ReplaceIcon(self.image_list, -1, info.hIcon) };
+            unsafe { DestroyIcon(info.hIcon) };
+            self.image_count += 1;
+            slot
+        } else {
+            -1
+        };
+        self.icon_cache.insert(key, slot);
+        slot
+    }
+
+    /// Starts an empty image list of `size` pixels, after a DPI change or when the
+    /// list has grown large.
+    fn reset_images(&mut self, size: i32) {
+        if self.image_list != 0 && self.icon_size == size {
+            unsafe { ImageList_Remove(self.image_list, -1) };
+        } else {
+            let old = self.image_list;
+            self.image_list = unsafe { ImageList_Create(size, size, ILC_COLOR32, 64, 64) };
+            self.icon_size = size;
             unsafe {
                 SendMessageW(
                     self.list,
@@ -403,12 +474,44 @@ impl App {
                     self.image_list,
                 )
             };
+            if old != 0 {
+                unsafe { ImageList_Destroy(old) };
+            }
         }
-        if self.icon_cache.len() >= 512 {
-            self.icon_cache.clear();
+        self.image_count = 0;
+        self.icon_cache.clear();
+        self.path_icons.clear();
+        self.requested.clear();
+        // Pictures made for the old list would land in the wrong slots.
+        self.thumb_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn thumbnails_ready(&mut self) {
+        let Some(done) = &self.thumb_results else {
+            return;
+        };
+        let done: Vec<thumbs::Done> = done.try_iter().collect();
+        let mut added = false;
+        for picture in done {
+            if picture.bitmap.is_null() {
+                continue;
+            }
+            if picture.size == self.icon_size && self.requested.contains(&picture.path) {
+                let slot = unsafe { ImageList_Add(self.image_list, picture.bitmap, null_mut()) };
+                if slot >= 0 {
+                    self.image_count += 1;
+                    self.path_icons.insert(picture.path, slot);
+                    added = true;
+                }
+            }
+            unsafe { DeleteObject(picture.bitmap) };
         }
-        self.icon_cache.insert(key, info.iIcon);
-        info.iIcon
+        if self.image_count > MAX_IMAGES {
+            self.reset_images(self.icon_size);
+        }
+        if added || self.image_count == 0 {
+            unsafe { InvalidateRect(self.list, null(), 0) };
+        }
     }
 
     fn open_selected(&mut self, hwnd: HWND, folder: bool) {
@@ -774,6 +877,7 @@ impl App {
             return;
         }
         let text = match self.selected().and_then(|index| self.hits.get(index)) {
+            Some(hit) if is_app(hit) => format!("Enter opens {} · {}", display_name(hit), hit.path),
             Some(hit) => hit.path.clone(),
             None => self.status.clone(),
         };
@@ -1028,6 +1132,66 @@ fn decode_hotkey(value: u32) -> Option<(u32, u32)> {
     (key != 0 && modifiers != 0).then_some((modifiers, key))
 }
 
+/// Extensions of shortcuts, shown without it: `Excel` instead of `Excel.lnk`.
+const SHORTCUT_EXTENSIONS: &[&str] = &["lnk", "url", "appref-ms"];
+const PROGRAM_EXTENSIONS: &[&str] = &["exe", "msc", "cpl", "bat", "cmd", "com"];
+
+fn extension(hit: &Hit) -> Option<String> {
+    let name = hit.path.rsplit('\\').next()?;
+    (!hit.is_dir)
+        .then(|| {
+            name.rsplit_once('.')
+                .map(|(_, ext)| ext.to_ascii_lowercase())
+        })
+        .flatten()
+}
+
+/// Shortcuts and programs; web links are not apps.
+fn is_app(hit: &Hit) -> bool {
+    extension(hit).is_some_and(|ext| {
+        ext != "url"
+            && (SHORTCUT_EXTENSIONS.contains(&ext.as_str())
+                || PROGRAM_EXTENSIONS.contains(&ext.as_str()))
+    })
+}
+
+fn display_name(hit: &Hit) -> String {
+    let name = hit.path.rsplit('\\').next().unwrap_or(&hit.path);
+    match (extension(hit), name.rsplit_once('.')) {
+        (Some(ext), Some((stem, _))) if SHORTCUT_EXTENSIONS.contains(&ext.as_str()) => stem.into(),
+        _ => name.into(),
+    }
+}
+
+/// The second column: what an app or link is, in words, or the full path otherwise.
+fn describe(hit: &Hit) -> String {
+    let Some(ext) = extension(hit) else {
+        return hit.path.clone();
+    };
+    let lower = hit.path.to_lowercase();
+    let folder = hit.path.rsplit_once('\\').map_or("", |(parent, _)| parent);
+    let place = if lower
+        .rsplit_once('\\')
+        .is_some_and(|(parent, _)| parent.ends_with("\\desktop"))
+    {
+        "on the Desktop".to_string()
+    } else {
+        format!("in {folder}")
+    };
+    let in_windows = lower
+        .get(1..)
+        .is_some_and(|rest| rest.starts_with(":\\windows\\"));
+    let program = PROGRAM_EXTENSIONS.contains(&ext.as_str());
+    match ext.as_str() {
+        "lnk" | "appref-ms" if lower.contains("\\start menu\\programs\\") => "App".into(),
+        "lnk" | "appref-ms" => format!("App shortcut {place}"),
+        "url" => format!("Web link {place}"),
+        _ if program && in_windows => "Windows tool".into(),
+        _ if program => format!("App in {folder}"),
+        _ => hit.path.clone(),
+    }
+}
+
 fn scale(hwnd: HWND, value: i32) -> i32 {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     value * dpi as i32 / 96
@@ -1261,6 +1425,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let (sender, results) = search::start(hwnd);
             app.sender = Some(sender);
             app.results = Some(results);
+            let (sender, results) = thumbs::start(hwnd, Arc::clone(&app.thumb_generation));
+            app.thumb_sender = Some(sender);
+            app.thumb_results = Some(results);
             app.theme(hwnd);
             app.register_hotkey(hwnd);
             unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
@@ -1414,6 +1581,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     SWP_NOZORDER,
                 );
             }
+            0
+        }
+        thumbs::WM_THUMBNAIL => {
+            app.thumbnails_ready();
             0
         }
         search::WM_SEARCH_RESULT => {
@@ -1611,6 +1782,33 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn apps_and_links_are_labelled_in_words() {
+        let hit = |path: &str| Hit {
+            path: path.into(),
+            is_dir: false,
+            score: 0,
+        };
+        let menu = hit(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Excel.lnk");
+        assert_eq!(display_name(&menu), "Excel");
+        assert_eq!(describe(&menu), "App");
+        assert!(is_app(&menu));
+        let desk = hit(r"C:\Users\bob\Desktop\Zoom.lnk");
+        assert_eq!(describe(&desk), "App shortcut on the Desktop");
+        let link = hit(r"C:\Users\bob\Downloads\Bank.url");
+        assert_eq!(display_name(&link), "Bank");
+        assert_eq!(describe(&link), r"Web link in C:\Users\bob\Downloads");
+        assert!(!is_app(&link));
+        assert_eq!(
+            describe(&hit(r"C:\Windows\System32\cmd.exe")),
+            "Windows tool"
+        );
+        assert_eq!(describe(&hit(r"D:\Tools\x.exe")), r"App in D:\Tools");
+        let doc = hit(r"C:\Users\bob\Documents\a.pdf");
+        assert_eq!(display_name(&doc), "a.pdf");
+        assert_eq!(describe(&doc), r"C:\Users\bob\Documents\a.pdf");
+    }
 
     #[test]
     fn hotkey_control_round_trips_alt_space_and_combinations() {

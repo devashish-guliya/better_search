@@ -651,9 +651,15 @@ and reports a clear message when the service is not running.
   status line shows the selected result's full path (or a "No matches" state). A
   placeholder for the empty search box is attempted but does not yet render.
 - The panel has an edit box, status line, and an owner-data list view (up to 200
-  displayed hits, with the accurate allowed-match count from the service). Name and path
-  columns use the shell's shared small-icon image list. `SHGetFileInfoW` uses synthetic
-  file attributes and an extension/folder cache, not a disk lookup for every row.
+  displayed hits, with the accurate allowed-match count from the service). Rows use a
+  private 32 px image list (at most 600 images, reset when full): a type icon from
+  `SHGetFileInfoW` with synthetic attributes (cached per extension/folder) appears
+  at once, and a background STA thread (`thumbs.rs`, `IShellItemImageFactory`) then
+  replaces it with the real app icon for `.exe`/`.lnk`/`.url` and a thumbnail for
+  images, videos and documents. A generation counter drops requests for old searches.
+  Shortcuts are shown without `.lnk`/`.url`/`.appref-ms`, and the path column
+  describes apps in words (`App`, `App shortcut on the Desktop`, `Windows tool`,
+  `Web link`, `App in <folder>`).
   Enter opens, Ctrl+Enter selects the item in Explorer, arrows navigate, Esc hides,
   and a result menu offers Open, Open folder and Copy path.
 - A tray icon provides Open, Settings, Pause and Quit. Pause suspends **window queries
@@ -1039,8 +1045,8 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  112 workspace tests pass (index crate 37, query crate 34, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 9).
+  113 workspace tests pass (index crate 37, query crate 34, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 10).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
   first, then `cargo fmt`, `cargo test`, and
