@@ -643,21 +643,31 @@ and reports a clear message when the service is not running.
   It does not read the service's protected data folder.
 - **Look:** a small app manifest (`crates/ui/bs-window.manifest`, embedded by
   `crates/ui/build.rs` with the MSVC linker's `/MANIFESTINPUT`, no new dependency or
-  runtime) activates common controls v6 and declares per-monitor DPI awareness. The
-  window draws a flat light/dark palette (`Palette` in `main.rs`): rounded Win11 corners,
-  a themed caption/border/text color, a rounded outline "card" around the search field
-  and the list, borderless controls with inner padding, and a Segoe UI Variable font
-  (Segoe UI fallback) sized to the monitor DPI. The list is double-buffered and the
-  status line shows the selected result's full path (or a "No matches" state). A
-  placeholder for the empty search box is attempted but does not yet render.
-- The panel has an edit box, status line, and an owner-data list view (up to 200
-  displayed hits, with the accurate allowed-match count from the service). Rows use a
+  runtime) activates common controls v6 and declares per-monitor DPI awareness.
+  `draw.rs` holds the visual rules: a spacing scale (4/8/12/16 px), a type scale (search
+  12 pt, names 10.5 pt with matched letters semibold, second lines and footer 9 pt,
+  headings 9 pt semibold, Segoe UI Variable with a Segoe UI fallback, Segoe Fluent
+  Icons or MDL2 glyphs), colour roles (panel, surface, hover, selected, text,
+  secondary, edge, accent) on Windows 11's base colours, and the user's accent colour
+  (lightened on dark). Rounded Win11 corners and a caption matching the panel.
+- The panel has three bands: a rounded search field (search glyph, placeholder via
+  `EM_SETCUEBANNER`, accent underline while focused), the results, and a footer with
+  the result count and a `Ctrl+Enter` hint that gives way when the count needs the
+  room. Results are an owner-data, owner-drawn list view without a header (up to 200
+  hits). Each row is drawn off screen and copied in one step: icon, name with
+  matched letters in semibold (`rows::highlight`, including word initials), and a
+  second line saying what an app is or the folder a file is in, shortened in the
+  middle (`DT_PATH_ELLIPSIS`). The hovered or selected row gets a rounded fill, the
+  selected one an accent pill, and both show "Show in folder" and "Copy path"
+  buttons. When results have more than one kind they are grouped under headings
+  (Apps, Folders, Documents, Photos videos and music, Other files), sections in the
+  order of their best hit (`rows::group`); headings cannot be selected. Rows use a
   private 32 px image list (at most 600 images, reset when full): a type icon from
   `SHGetFileInfoW` with synthetic attributes (cached per extension/folder) appears
   at once, and a background STA thread (`thumbs.rs`, `IShellItemImageFactory`) then
   replaces it with the real app icon for `.exe`/`.lnk`/`.url` and a thumbnail for
   images, videos and documents. A generation counter drops requests for old searches.
-  Shortcuts are shown without `.lnk`/`.url`/`.appref-ms`, and the path column
+  Shortcuts are shown without `.lnk`/`.url`/`.appref-ms`, and the second line
   describes apps in words (`App`, `App shortcut on the Desktop`, `Windows tool`,
   `Web link`, `App in <folder>`).
 - Microsoft Store and other packaged (MSIX) apps have no shortcut file, so the index
@@ -670,7 +680,7 @@ and reports a clear message when the service is not running.
   is shown once. `Program Files\WindowsApps` (package files) is now app files
   (`SKIP_RULES_VERSION` 8).
   Enter opens, Ctrl+Enter selects the item in Explorer, arrows navigate, Esc hides,
-  and a result menu offers Open, Open folder and Copy path.
+  and a result menu offers Open, Show in folder and Copy path.
 - A tray icon provides Open, Settings, Pause and Quit. Pause suspends **window queries
   only**, not the service's journaling and saving. The global hotkey defaults to Alt+Space;
   if Windows or another app owns it, the tray still works and Settings can change it.
@@ -1054,8 +1064,8 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  114 workspace tests pass (index crate 37, query crate 34, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 11).
+  117 workspace tests pass (index crate 37, query crate 34, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 14).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
   first, then `cargo fmt`, `cargo test`, and

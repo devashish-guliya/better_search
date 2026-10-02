@@ -79,7 +79,9 @@ lists every PDF.
 Apps appear by name with their own icon (`Excel`, described as `App`, rather than
 `Excel.lnk`), and photos, videos and documents show a thumbnail. Microsoft Store apps
 (Calculator, Camera, Paint, Netflix, ...) are found too, even though they have no
-shortcut file.
+shortcut file. Results are grouped under Apps, Folders, Documents and so on, the letters
+you typed are bold, and hovering a result shows buttons to show it in its folder or copy
+its path.
 
 Results are ranked so the likely target comes first: typing an app's name puts the
 launchable file (`.exe`, `.lnk`, `.bat`, ...) above folders and installers that share

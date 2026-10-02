@@ -160,6 +160,31 @@ pub fn light_theme() -> bool {
     ok != 0 || value != 0
 }
 
+/// The user's Windows accent colour as a `COLORREF`, or Windows' default blue.
+pub fn accent_color() -> u32 {
+    use windows_sys::Win32::System::Registry::{RRF_RT_REG_DWORD, RegGetValueW};
+    let mut value = 0u32;
+    let mut bytes = size_of::<u32>() as u32;
+    // SAFETY: pointers refer to live buffers of the given size.
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            wide(r"Software\Microsoft\Windows\DWM").as_ptr(),
+            wide("AccentColor").as_ptr(),
+            RRF_RT_REG_DWORD,
+            null::<u32>() as *mut u32,
+            (&raw mut value).cast(),
+            &mut bytes,
+        )
+    };
+    // Stored as 0xAABBGGRR, which is a COLORREF plus alpha.
+    if ok == 0 {
+        value & 0x00ff_ffff
+    } else {
+        0x00d4_7800
+    }
+}
+
 /// The service currently indexes all fixed NTFS drives. Display the same eligible
 /// drives, but do not pretend this is a per-user filter or let a user reconfigure it.
 pub fn indexed_drives() -> String {

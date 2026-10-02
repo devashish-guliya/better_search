@@ -2,8 +2,10 @@
 //! Unelevated search UI. All index access goes through bs_pipe::Client in `search`.
 
 mod apps;
+mod draw;
 mod frecency;
 mod hover;
+mod rows;
 mod search;
 mod settings;
 mod thumbs;
@@ -21,33 +23,36 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    DeleteObject, DrawTextW, EndPaint, FW_NORMAL, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
-    GetTextFaceW, HBRUSH, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
+    DEFAULT_GUI_FONT, DT_CENTER, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC, DeleteObject, EndPaint,
+    FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT, ReleaseDC, SRCCOPY,
+    SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    EM_SETMARGINS, HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS, ICC_LISTVIEW_CLASSES,
-    ILC_COLOR32, INITCOMMONCONTROLSEX, ImageList_Add, ImageList_Create, ImageList_Destroy,
-    ImageList_Remove, ImageList_ReplaceIcon, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH,
-    LVCOLUMNW, LVIF_IMAGE, LVIF_TEXT, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETNEXTITEM,
-    LVM_INSERTCOLUMNW, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
-    LVM_SETITEMSTATE, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_OWNERDATA, LVS_REPORT, LVS_SHAREIMAGELISTS,
-    LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSIL_SMALL, NM_DBLCLK, NMHDR, NMLVDISPINFOW, SetWindowTheme,
+    DRAWITEMSTRUCT, EM_SETMARGINS, HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS,
+    ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILD_TRANSPARENT, INITCOMMONCONTROLSEX, ImageList_Add,
+    ImageList_Create, ImageList_Destroy, ImageList_Draw, ImageList_Remove, ImageList_ReplaceIcon,
+    InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_TEXT, LVIR_BOUNDS,
+    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETITEMRECT, LVM_GETNEXTITEM,
+    LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETEXTENDEDLISTVIEWSTYLE,
+    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
+    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDATA,
+    LVS_OWNERDRAWFIXED, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
+    LVSIL_SMALL, MEASUREITEMSTRUCT, NM_DBLCLK, NMHDR, NMLVDISPINFOW, ODS_SELECTED, SetWindowTheme,
     WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, RegisterHotKey, SetFocus, UnregisterHotKey, VK_CONTROL, VK_DOWN,
-    VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
+    GetFocus, GetKeyState, RegisterHotKey, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    UnregisterHotKey, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
 };
+
+use draw::scale;
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     RemoveWindowSubclass, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
@@ -57,16 +62,24 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
     ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION, IsWindowVisible, KillTimer,
-    LoadCursorW, LoadIconW, MF_STRING, MSG, MoveWindow, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_HOTKEY,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION,
+    IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MF_STRING, MSG, MoveWindow,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT,
+    WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
+/// Sent when the user changes the Windows accent colour.
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
+const WM_MOUSELEAVE: u32 = 0x02a3;
+/// Static control styles: vertically centred, single-line text cut with an ellipsis.
+const SS_CENTERIMAGE: u32 = 0x0200;
+const SS_ENDELLIPSIS: u32 = 0x4000;
 
 const CLASS: &str = "BetterSearchWindow";
 const EDIT_ID: usize = 101;
@@ -83,6 +96,7 @@ const MENU_RESULT_FOLDER: usize = 211;
 const MENU_RESULT_COPY: usize = 212;
 const ANIMATION_TIMER: usize = 2;
 const RETRY_TIMER: usize = 3;
+const NOTICE_TIMER: usize = 4;
 const SETTINGS_HOTKEY: usize = 301;
 const SETTINGS_HOVER: usize = 302;
 const SETTINGS_SIDE: usize = 303;
@@ -99,35 +113,8 @@ const MAX_IMAGES: usize = 600;
 /// `EM_SETMARGINS` flags for the search box's inner text padding.
 const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
-
-/// Colors are Win32 `COLORREF`s: 0x00BBGGRR.
-fn rgb(r: u32, g: u32, b: u32) -> u32 {
-    r | (g << 8) | (b << 16)
-}
-
-/// A small, flat palette so the window looks the same on light and dark Windows.
-/// The list shares `panel` so the result card's rounded outline has no square corners.
-struct Palette {
-    panel: u32,
-    text: u32,
-    edge: u32,
-}
-
-fn palette(light: bool) -> Palette {
-    if light {
-        Palette {
-            panel: rgb(250, 250, 250),
-            text: rgb(24, 24, 24),
-            edge: rgb(206, 206, 206),
-        }
-    } else {
-        Palette {
-            panel: rgb(26, 26, 26),
-            text: rgb(240, 240, 240),
-            edge: rgb(72, 72, 72),
-        }
-    }
-}
+const EM_SETCUEBANNER: u32 = 0x1501;
+const KEY_HINTS: &str = "Ctrl+Enter  show in folder";
 
 struct Slide {
     from: i32,
@@ -146,9 +133,19 @@ struct App {
     results: Option<Receiver<search::ResultMessage>>,
     serial: u64,
     hits: Vec<Hit>,
+    /// What the list shows, in order: section headings and hits.
+    rows: Vec<rows::Row>,
+    /// The row of each hit.
+    hit_rows: Vec<usize>,
     names: Vec<Vec<u16>>,
-    paths: Vec<Vec<u16>>,
+    /// Which letters of each name matched the search.
+    marks: Vec<Vec<bool>>,
+    /// Second lines: what an app is, or the folder a file is in.
+    details: Vec<String>,
+    hover_row: Option<usize>,
     status: String,
+    /// A short confirmation shown in the footer instead of the status.
+    notice: Option<String>,
     last_text: String,
     /// Type icons by extension, as image list slots.
     icon_cache: HashMap<String, i32>,
@@ -178,11 +175,13 @@ struct App {
     controls: Vec<HWND>,
     light: Option<bool>,
     background: HBRUSH,
-    font: HFONT,
-    panel: u32,
-    text: u32,
-    edge: u32,
-    outlines: Vec<RECT>,
+    surface_brush: HBRUSH,
+    fonts: Option<draw::Fonts>,
+    colors: draw::Palette,
+    /// The search field and the footer, drawn by the window itself.
+    field: RECT,
+    footer: RECT,
+    show_hints: std::cell::Cell<bool>,
     taskbar_message: u32,
 }
 
@@ -196,9 +195,14 @@ impl App {
             results: None,
             serial: 0,
             hits: Vec::new(),
+            rows: Vec::new(),
+            hit_rows: Vec::new(),
             names: Vec::new(),
-            paths: Vec::new(),
-            status: "Type to search".into(),
+            marks: Vec::new(),
+            details: Vec::new(),
+            hover_row: None,
+            status: String::new(),
+            notice: None,
             last_text: String::new(),
             icon_cache: HashMap::new(),
             path_icons: HashMap::new(),
@@ -222,11 +226,12 @@ impl App {
             controls: Vec::new(),
             light: None,
             background: null_mut(),
-            font: null_mut(),
-            panel: rgb(250, 250, 250),
-            text: rgb(24, 24, 24),
-            edge: rgb(206, 206, 206),
-            outlines: Vec::new(),
+            surface_brush: null_mut(),
+            fonts: None,
+            colors: draw::palette(true, settings::accent_color()),
+            field: RECT::default(),
+            footer: RECT::default(),
+            show_hints: std::cell::Cell::new(true),
             taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
         }
     }
@@ -242,7 +247,7 @@ impl App {
         self.apps.refresh_if_stale();
         self.clear_results();
         if query.trim().is_empty() {
-            self.status = "Type a file or folder name".into();
+            self.status = String::new();
         } else if query.len() + 4 > bs_pipe::MAX_REQUEST {
             self.status = "The search is too long".into();
         } else if self.paused {
@@ -262,8 +267,12 @@ impl App {
 
     fn clear_results(&mut self) {
         self.hits.clear();
+        self.rows.clear();
+        self.hit_rows.clear();
         self.names.clear();
-        self.paths.clear();
+        self.marks.clear();
+        self.details.clear();
+        self.hover_row = None;
         if !self.list.is_null() {
             unsafe { SendMessageW(self.list, LVM_SETITEMCOUNT, 0, 0) };
         }
@@ -299,16 +308,7 @@ impl App {
                         self.app_names.insert(hit.path.clone(), name);
                         reply.hits.push(hit);
                     }
-                    self.status = match (shown, hidden) {
-                        (0, 0) => "No matches".into(),
-                        (0, _) => {
-                            format!("No matches. {hidden} in system and app folders (Ctrl+H)")
-                        }
-                        (_, 0) => format!("{shown} matches"),
-                        _ => format!(
-                            "{shown} matches · {hidden} more in system and app folders (Ctrl+H)"
-                        ),
-                    };
+                    self.status = status_text(shown, hidden);
                     if self.include_system {
                         self.status.push_str(" · showing all");
                     }
@@ -324,19 +324,32 @@ impl App {
                         std::cmp::Reverse(hit.score + boost)
                     });
                     reply.hits.truncate(search::LIMIT as usize);
-                    self.names = reply
-                        .hits
+                    let (hits, rows) = rows::group(reply.hits, kind_of);
+                    let names: Vec<String> = hits.iter().map(|hit| self.name_of(hit)).collect();
+                    self.marks = names
                         .iter()
-                        .map(|hit| wide(&self.name_of(hit)))
+                        .map(|name| rows::highlight(name, &self.last_text))
                         .collect();
-                    self.paths = reply.hits.iter().map(|hit| wide(&describe(hit))).collect();
+                    self.names = names
+                        .iter()
+                        .map(|name| name.encode_utf16().collect())
+                        .collect();
+                    self.details = hits.iter().map(describe).collect();
+                    self.hit_rows = vec![0; hits.len()];
+                    for (row, entry) in rows.iter().enumerate() {
+                        if let rows::Row::Hit(index) = *entry {
+                            self.hit_rows[index] = row;
+                        }
+                    }
+                    self.rows = rows;
                     // Pictures still queued for the previous list are not needed now.
                     self.thumb_generation.fetch_add(1, Ordering::Relaxed);
                     self.requested.clear();
-                    self.hits = reply.hits;
+                    self.hits = hits;
                     unsafe {
-                        SendMessageW(self.list, LVM_SETITEMCOUNT, self.hits.len(), 0);
+                        SendMessageW(self.list, LVM_SETITEMCOUNT, self.rows.len(), 0);
                     }
+                    self.fit_column();
                     if !self.hits.is_empty() {
                         self.select(0);
                     }
@@ -371,40 +384,48 @@ impl App {
     }
 
     fn update_title(&self, hwnd: HWND) {
-        let title = wide(&format!("better_search  ·  {}", self.status));
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, title.as_ptr())
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                hwnd,
+                wide("better_search").as_ptr(),
+            )
         };
-        if !self.status_label.is_null() {
-            unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-                    self.status_label,
-                    wide(&self.status).as_ptr(),
-                )
-            };
-        }
+        self.refresh_status();
     }
 
-    fn selected(&self) -> Option<usize> {
-        let index =
+    /// The selected list row, a heading or a hit.
+    fn selected_row(&self) -> Option<usize> {
+        let row =
             unsafe { SendMessageW(self.list, LVM_GETNEXTITEM, usize::MAX, LVNI_SELECTED as _) };
-        (index >= 0 && (index as usize) < self.hits.len()).then_some(index as usize)
+        (row >= 0 && (row as usize) < self.rows.len()).then_some(row as usize)
+    }
+
+    /// The selected hit.
+    fn selected(&self) -> Option<usize> {
+        match self.rows.get(self.selected_row()?) {
+            Some(&rows::Row::Hit(index)) => Some(index),
+            _ => None,
+        }
     }
 
     fn select(&self, index: usize) {
-        if index >= self.hits.len() {
+        let Some(&row) = self.hit_rows.get(index) else {
             return;
-        }
+        };
         let clear = LVITEMW {
             state: 0,
-            stateMask: LVIS_SELECTED,
+            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
             ..Default::default()
         };
         let select = LVITEMW {
-            state: LVIS_SELECTED,
-            stateMask: LVIS_SELECTED,
+            state: LVIS_SELECTED | LVIS_FOCUSED,
+            stateMask: LVIS_SELECTED | LVIS_FOCUSED,
             ..Default::default()
         };
+        // The first hit of a section scrolls its heading into view too.
+        if row > 0 && matches!(self.rows[row - 1], rows::Row::Section(_)) {
+            unsafe { SendMessageW(self.list, LVM_ENSUREVISIBLE, row - 1, 0) };
+        }
         unsafe {
             SendMessageW(
                 self.list,
@@ -415,10 +436,287 @@ impl App {
             SendMessageW(
                 self.list,
                 LVM_SETITEMSTATE,
-                index,
+                row,
                 (&select as *const LVITEMW) as _,
             );
-            SendMessageW(self.list, LVM_ENSUREVISIBLE, index, 0);
+            SendMessageW(self.list, LVM_ENSUREVISIBLE, row, 0);
+        }
+    }
+
+    /// Moves the selection `step` hits up or down, skipping headings.
+    fn step_selection(&self, down: bool) {
+        let current = self.selected().unwrap_or(0);
+        let next = if down {
+            (current + 1).min(self.hits.len().saturating_sub(1))
+        } else {
+            current.saturating_sub(1)
+        };
+        self.select(next);
+    }
+
+    /// The single column spans the list, whether or not it has a scroll bar.
+    fn fit_column(&self) {
+        // The client width excludes a vertical scroll bar, so no horizontal one appears.
+        let mut client = RECT::default();
+        unsafe {
+            GetClientRect(self.list, &mut client);
+            SendMessageW(
+                self.list,
+                windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
+                0,
+                client.right as isize,
+            )
+        };
+    }
+
+    fn row_rect(&self, row: usize) -> RECT {
+        let mut rect = RECT {
+            left: LVIR_BOUNDS as i32,
+            ..Default::default()
+        };
+        unsafe { SendMessageW(self.list, LVM_GETITEMRECT, row, (&raw mut rect) as isize) };
+        rect
+    }
+
+    fn redraw_row(&self, row: Option<usize>) {
+        if let Some(row) = row {
+            unsafe { SendMessageW(self.list, LVM_REDRAWITEMS, row, row as isize) };
+        }
+    }
+
+    /// The row under a list-client point.
+    fn row_at(&self, x: i32, y: i32) -> Option<usize> {
+        let mut info = LVHITTESTINFO {
+            pt: POINT { x, y },
+            ..Default::default()
+        };
+        let row = unsafe { SendMessageW(self.list, LVM_HITTEST, 0, (&raw mut info) as isize) };
+        (row >= 0 && (row as usize) < self.rows.len()).then_some(row as usize)
+    }
+
+    /// "Show in folder" and "Copy path" buttons at the right end of a hit row.
+    fn row_buttons(&self, row: &RECT) -> [RECT; 2] {
+        let size = scale(self.list, 30);
+        let gap = scale(self.list, draw::SPACE_S);
+        let right = row.right - scale(self.list, draw::SPACE_M);
+        let top = row.top + (row.bottom - row.top - size) / 2;
+        let copy = RECT {
+            left: right - size,
+            top,
+            right,
+            bottom: top + size,
+        };
+        let folder = RECT {
+            left: copy.left - gap - size,
+            right: copy.left - gap,
+            ..copy
+        };
+        [folder, copy]
+    }
+
+    fn set_hover(&mut self, row: Option<usize>) {
+        if self.hover_row != row {
+            let old = self.hover_row;
+            self.hover_row = row;
+            self.redraw_row(old);
+            self.redraw_row(row);
+        }
+    }
+
+    fn show_notice(&mut self, hwnd: HWND, text: &str) {
+        self.notice = Some(text.into());
+        self.refresh_status();
+        unsafe { SetTimer(hwnd, NOTICE_TIMER, 1600, None) };
+    }
+
+    /// Draws one list row: a section heading, or a hit as icon, name and detail line,
+    /// with a rounded highlight when hovered or selected.
+    fn draw_row(&mut self, item: &DRAWITEMSTRUCT) {
+        let row = item.itemID as usize;
+        let Some(&entry) = self.rows.get(row) else {
+            return;
+        };
+        let Some(fonts) = &self.fonts else { return };
+        let (name_font, bold_font, detail_font, heading_font, glyph_font) = (
+            fonts.name,
+            fonts.name_bold,
+            fonts.detail,
+            fonts.heading,
+            fonts.glyph,
+        );
+        let colors = self.colors;
+        let bounds = item.rcItem;
+        let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let list = self.list;
+        let s = |v: i32| scale(list, v);
+        // Rows are drawn off screen and copied in one step so they never flicker.
+        let screen = item.hDC;
+        let dc = unsafe { CreateCompatibleDC(screen) };
+        let bitmap = unsafe { CreateCompatibleBitmap(screen, width, height) };
+        let old_bitmap = unsafe { SelectObject(dc, bitmap) };
+        let local = RECT {
+            left: 0,
+            top: 0,
+            right: width,
+            bottom: height,
+        };
+        unsafe { FillRect(dc, &local, self.background) };
+        match entry {
+            rows::Row::Section(kind) => {
+                let label = RECT {
+                    left: s(draw::SPACE_L),
+                    top: height / 2,
+                    right: width - s(draw::SPACE_L),
+                    bottom: height - s(draw::SPACE_S),
+                };
+                draw::text(dc, kind.label(), &label, heading_font, colors.secondary, 0);
+            }
+            rows::Row::Hit(index) => {
+                let selected = item.itemState & ODS_SELECTED != 0;
+                let hovered = self.hover_row == Some(row);
+                let card = RECT {
+                    left: s(draw::SPACE_S),
+                    top: s(1),
+                    right: width - s(draw::SPACE_S),
+                    bottom: height - s(1),
+                };
+                if selected || hovered {
+                    let fill = if selected {
+                        colors.selected
+                    } else {
+                        colors.hover
+                    };
+                    draw::fill_round(dc, &card, s(draw::RADIUS), fill);
+                }
+                if selected {
+                    // Windows 11's selection mark: a short accent pill at the left.
+                    let pill = draw::centered(
+                        &RECT {
+                            left: card.left,
+                            right: card.left + s(3),
+                            ..card
+                        },
+                        s(18),
+                    );
+                    draw::fill_round(dc, &pill, s(2), colors.accent);
+                }
+                let icon = self.icon(index);
+                let icon_size = self.icon_size;
+                let icon_left = s(draw::SPACE_L + draw::SPACE_S);
+                if icon >= 0 {
+                    unsafe {
+                        ImageList_Draw(
+                            self.image_list,
+                            icon,
+                            dc,
+                            icon_left,
+                            (height - icon_size) / 2,
+                            ILD_TRANSPARENT,
+                        )
+                    };
+                }
+                let text_left = icon_left + icon_size + s(draw::SPACE_L);
+                let mut text_right = width - s(draw::SPACE_L);
+                if selected || hovered {
+                    let buttons = self.row_buttons(&local);
+                    for (rect, glyph) in buttons.iter().zip([draw::GLYPH_FOLDER, draw::GLYPH_COPY])
+                    {
+                        draw::text(dc, glyph, rect, glyph_font, colors.secondary, DT_CENTER);
+                    }
+                    text_right = buttons[0].left - s(draw::SPACE_M);
+                }
+                // Name and detail form one block, centred in the row.
+                let name_height = draw::line_height(dc, name_font);
+                let detail_height = draw::line_height(dc, detail_font);
+                // Line heights include internal leading, so the lines overlap a little.
+                let top = (height - name_height - detail_height + s(2)) / 2;
+                let name_rect = RECT {
+                    left: text_left,
+                    top,
+                    right: text_right,
+                    bottom: top + name_height,
+                };
+                draw::marked_text(
+                    dc,
+                    &self.names[index],
+                    &self.marks[index],
+                    &name_rect,
+                    (name_font, bold_font),
+                    colors.text,
+                );
+                let detail_rect = RECT {
+                    left: text_left,
+                    top: name_rect.bottom - s(2),
+                    right: text_right,
+                    bottom: name_rect.bottom - s(2) + detail_height,
+                };
+                draw::text(
+                    dc,
+                    &self.details[index],
+                    &detail_rect,
+                    detail_font,
+                    colors.secondary,
+                    DT_PATH_ELLIPSIS,
+                );
+            }
+        }
+        unsafe {
+            BitBlt(
+                screen,
+                bounds.left,
+                bounds.top,
+                width,
+                height,
+                dc,
+                0,
+                0,
+                SRCCOPY,
+            );
+            SelectObject(dc, old_bitmap);
+            DeleteObject(bitmap);
+            DeleteDC(dc);
+        }
+    }
+
+    /// Mouse presses on a row: its buttons act (if `act`), headings ignore clicks.
+    /// Returns whether the press was handled here.
+    fn click(&mut self, hwnd: HWND, x: i32, y: i32, act: bool) -> bool {
+        let Some(row) = self.row_at(x, y) else {
+            return false;
+        };
+        let rows::Row::Hit(index) = self.rows[row] else {
+            return true;
+        };
+        let rect = self.row_rect(row);
+        let local = RECT {
+            left: 0,
+            top: 0,
+            right: rect.right - rect.left,
+            bottom: rect.bottom - rect.top,
+        };
+        let [folder, copy] = self.row_buttons(&local);
+        let point = (x - rect.left, y - rect.top);
+        let inside = |r: &RECT| {
+            point.0 >= r.left && point.0 < r.right && point.1 >= r.top && point.1 < r.bottom
+        };
+        let on_button = inside(&folder) || inside(&copy);
+        if !on_button || !act {
+            return on_button;
+        }
+        if inside(&folder) {
+            self.select(index);
+            self.open_selected(hwnd, true);
+            true
+        } else if inside(&copy) {
+            self.select(index);
+            self.copy_selected(hwnd);
+            self.show_notice(hwnd, "Path copied");
+            true
+        } else {
+            false
         }
     }
 
@@ -827,10 +1125,11 @@ impl App {
     fn layout(&mut self, hwnd: HWND) {
         let mut rect = RECT::default();
         unsafe { GetClientRect(hwnd, &mut rect) };
-        let pad = scale(hwnd, 14);
+        let pad = scale(hwnd, draw::SPACE_XL);
         let width = (rect.right - 2 * pad).max(0);
-        self.outlines.clear();
         if self.settings_open {
+            self.field = RECT::default();
+            self.footer = RECT::default();
             let line = scale(hwnd, 35);
             let top = scale(hwnd, 20);
             let mut y = top;
@@ -845,111 +1144,156 @@ impl App {
             }
             return;
         }
-        let edit_height = scale(hwnd, 38);
-        let gap = scale(hwnd, 12);
-        let status_height = scale(hwnd, 20);
-        let list_top = pad + edit_height + gap;
-        let list_height = (rect.bottom - pad - status_height - scale(hwnd, 8) - list_top).max(0);
-        let inset = scale(hwnd, 10) as isize;
+        let s = |v: i32| scale(hwnd, v);
+        // Search field, results, footer: three bands on the spacing scale.
+        self.field = RECT {
+            left: pad,
+            top: pad,
+            right: pad + width,
+            bottom: pad + s(40),
+        };
+        let edit_height = s(24);
+        let edit_left = self.field.left + s(40);
+        let footer_height = s(28);
+        self.footer = RECT {
+            left: pad,
+            top: rect.bottom - s(draw::SPACE_S) - footer_height,
+            right: pad + width,
+            bottom: rect.bottom - s(draw::SPACE_S),
+        };
+        // Row highlights are inset by SPACE_S, so the list overhangs the field by that
+        // much and highlights line up with the field's edges.
+        let list_left = pad - s(draw::SPACE_S);
+        let list_top = self.field.bottom + s(draw::SPACE_M);
+        let list_height = (self.footer.top - s(draw::SPACE_S) - list_top).max(0);
         unsafe {
-            MoveWindow(self.edit, pad, pad, width, edit_height, 1);
-            SendMessageW(
-                self.edit,
-                EM_SETMARGINS,
-                EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                (inset | (inset << 16)) as _,
-            );
-            MoveWindow(self.list, pad, list_top, width, list_height, 1);
             MoveWindow(
-                self.status_label,
-                pad,
-                rect.bottom - pad - status_height,
-                width,
-                status_height,
+                self.edit,
+                edit_left,
+                self.field.top + (s(40) - edit_height) / 2,
+                (self.field.right - s(draw::SPACE_L) - edit_left).max(0),
+                edit_height,
                 1,
             );
-            let name_width = (width / 3).max(scale(hwnd, 120));
-            SendMessageW(
+            SendMessageW(self.edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
+            MoveWindow(
                 self.list,
-                windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
-                0,
-                name_width as _,
-            );
-            SendMessageW(
-                self.list,
-                windows_sys::Win32::UI::Controls::LVM_SETCOLUMNWIDTH,
+                list_left,
+                list_top,
+                width + 2 * s(draw::SPACE_S),
+                list_height,
                 1,
-                (width - name_width - scale(hwnd, 24)).max(0) as _,
             );
+            InvalidateRect(hwnd, null(), 1);
         }
-        // Rounded outlines the window's WM_PAINT draws around the field and the list.
-        let radius = scale(hwnd, 5);
-        self.outlines.push(RECT {
-            left: pad - radius,
-            top: pad - radius,
-            right: pad + width + radius,
-            bottom: pad + edit_height + radius,
-        });
-        self.outlines.push(RECT {
-            left: pad - 1,
-            top: list_top - 1,
-            right: pad + width + 1,
-            bottom: list_top + list_height + 1,
-        });
+        self.refresh_status();
+        self.fit_column();
     }
 
-    /// Rebuilds the interface font for the current DPI and hands it to every child.
+    fn hints_width(&self, hwnd: HWND) -> i32 {
+        let Some(fonts) = &self.fonts else { return 0 };
+        let dc = unsafe { GetDC(hwnd) };
+        let hints: Vec<u16> = KEY_HINTS.encode_utf16().collect();
+        let width = draw::text_width(dc, fonts.detail, &hints);
+        unsafe { ReleaseDC(hwnd, dc) };
+        width
+    }
+
+    /// Rebuilds the fonts for the current DPI and hands them to every child.
     fn apply_font(&mut self, hwnd: HWND) {
-        if !self.font.is_null() {
-            unsafe { DeleteObject(self.font) };
+        if let Some(old) = self.fonts.take() {
+            old.delete();
         }
-        self.font = create_ui_font(hwnd);
-        let font = self.font;
-        for control in [self.edit, self.list, self.status_label]
-            .into_iter()
-            .chain(self.controls.iter().copied())
-        {
+        let fonts = draw::Fonts::new(hwnd);
+        let assign = |control: HWND, font: HFONT| {
             if !control.is_null() {
                 unsafe { SendMessageW(control, WM_SETFONT, font as usize, 1) };
             }
+        };
+        assign(self.edit, fonts.search);
+        assign(self.status_label, fonts.detail);
+        assign(self.list, fonts.name);
+        for &control in &self.controls {
+            assign(control, fonts.ui);
         }
-    }
-
-    /// The bottom line shows the highlighted result's full path, or the search state.
-    fn refresh_status(&self) {
-        if self.status_label.is_null() {
-            return;
-        }
-        let text = match self.selected().and_then(|index| self.hits.get(index)) {
-            Some(hit) if hit.path.starts_with(apps::PREFIX) => {
-                format!("Enter opens {}", self.name_of(hit))
-            }
-            Some(hit) if is_app(hit) => format!("Enter opens {} · {}", self.name_of(hit), hit.path),
-            Some(hit) => hit.path.clone(),
-            None => self.status.clone(),
+        self.fonts = Some(fonts);
+        // An owner-drawn list asks for its row height only when it is placed, so a
+        // made-up position change makes it ask again after a DPI change.
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.list, &mut rect) };
+        let position = WINDOWPOS {
+            hwnd: self.list,
+            cx: rect.right - rect.left,
+            cy: rect.bottom - rect.top,
+            flags: SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            ..Default::default()
         };
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-                self.status_label,
-                wide(&text).as_ptr(),
+            SendMessageW(
+                self.list,
+                WM_WINDOWPOSCHANGED,
+                0,
+                (&raw const position) as isize,
             )
         };
     }
 
+    /// The footer's left side: a brief notice, or the search state.
+    /// The key hint on the right gives way when the status needs the room.
+    fn refresh_status(&self) {
+        if self.status_label.is_null() {
+            return;
+        }
+        let text = self.notice.as_deref().unwrap_or(&self.status);
+        let main =
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetParent(self.status_label) };
+        let footer = self.footer;
+        let width = footer.right - footer.left;
+        let gap = scale(main, draw::SPACE_L);
+        let hints = self.hints_width(main);
+        let needed = self.fonts.as_ref().map_or(0, |fonts| {
+            let dc = unsafe { GetDC(main) };
+            let value: Vec<u16> = text.encode_utf16().collect();
+            let width = draw::text_width(dc, fonts.detail, &value);
+            unsafe { ReleaseDC(main, dc) };
+            width
+        });
+        let show = needed + gap + hints <= width;
+        self.show_hints.set(show);
+        let label_width = if show { width - hints - gap } else { width };
+        unsafe {
+            MoveWindow(
+                self.status_label,
+                footer.left,
+                footer.top,
+                label_width.max(0),
+                footer.bottom - footer.top,
+                1,
+            );
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                self.status_label,
+                wide(text).as_ptr(),
+            );
+            InvalidateRect(main, &footer, 1);
+        }
+    }
+
     fn theme(&mut self, hwnd: HWND) {
         let light = settings::light_theme();
-        if self.light == Some(light) {
+        let colors = draw::palette(light, settings::accent_color());
+        if self.light == Some(light) && self.colors.accent == colors.accent {
             return;
         }
         self.light = Some(light);
-        let colors = palette(light);
-        self.panel = colors.panel;
-        self.text = colors.text;
-        self.edge = colors.edge;
+        self.colors = colors;
         if !self.background.is_null() {
             unsafe { DeleteObject(self.background) };
         }
+        if !self.surface_brush.is_null() {
+            unsafe { DeleteObject(self.surface_brush) };
+        }
         self.background = unsafe { CreateSolidBrush(colors.panel) };
+        self.surface_brush = unsafe { CreateSolidBrush(colors.surface) };
         let dark: i32 = (!light).into();
         let corner: i32 = DWMWCP_ROUND;
         unsafe {
@@ -1091,71 +1435,72 @@ unsafe extern "system" fn child_proc(
     if msg == WM_NCDESTROY {
         unsafe { RemoveWindowSubclass(hwnd, Some(child_proc), id) };
     }
+    let main = parent as HWND;
     if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) && id == EDIT_ID {
-        // Repaint so the placeholder appears when the box loses focus and clears on focus.
-        unsafe { InvalidateRect(hwnd, null(), 1) };
+        // The field's accent underline follows the focus.
+        unsafe { InvalidateRect(main, null(), 0) };
     }
-    if msg == WM_PAINT && id == EDIT_ID {
-        // Let the edit paint itself, then add a placeholder when it is empty and idle.
-        let result = unsafe { DefSubclassProc(hwnd, msg, w, l) };
-        let idle = unsafe { GetFocus() } != hwnd && unsafe { GetWindowTextLengthW(hwnd) } == 0;
-        if idle {
-            let mut paint = PAINTSTRUCT::default();
-            let device = unsafe { BeginPaint(hwnd, &mut paint) };
-            let mut rect = RECT::default();
-            unsafe { GetClientRect(hwnd, &mut rect) };
-            rect.left += scale(hwnd, 12);
-            let placeholder = wide("Search files and folders");
-            unsafe {
-                SetBkMode(device, TRANSPARENT as i32);
-                SetTextColor(device, 0x00808080);
-                DrawTextW(
-                    device,
-                    placeholder.as_ptr(),
-                    -1,
-                    &mut rect,
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-                );
-                EndPaint(hwnd, &paint);
+    let ptr = unsafe { GetWindowLongPtrW(main, GWLP_USERDATA) as *mut App };
+    if id == LIST_ID && !ptr.is_null() {
+        let app = unsafe { &mut *ptr };
+        let (x, y) = (
+            (l & 0xffff) as i16 as i32,
+            ((l >> 16) & 0xffff) as i16 as i32,
+        );
+        match msg {
+            WM_MOUSEMOVE => {
+                let mut track = TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                unsafe { TrackMouseEvent(&mut track) };
+                let row = app
+                    .row_at(x, y)
+                    .filter(|&row| matches!(app.rows[row], rows::Row::Hit(_)));
+                app.set_hover(row);
             }
+            WM_MOUSELEAVE => app.set_hover(None),
+            WM_LBUTTONDOWN if app.click(main, x, y, true) => return 0,
+            // The second press of a double-click on a button must not act twice, and
+            // must not open the row.
+            WM_LBUTTONDBLCLK if app.click(main, x, y, false) => return 0,
+            WM_RBUTTONDOWN
+                if app
+                    .row_at(x, y)
+                    .is_some_and(|row| matches!(app.rows[row], rows::Row::Section(_))) =>
+            {
+                return 0;
+            }
+            _ => {}
         }
-        return result;
     }
-    if msg == WM_KEYDOWN {
-        let main = parent as HWND;
-        let ptr = unsafe { GetWindowLongPtrW(main, GWLP_USERDATA) as *mut App };
-        if !ptr.is_null() {
-            let app = unsafe { &mut *ptr };
-            match w as u16 {
-                VK_ESCAPE => {
-                    app.hide_panel(main);
-                    return 0;
-                }
-                VK_RETURN => {
-                    app.open_selected(main, unsafe { GetKeyState(VK_CONTROL as i32) } < 0);
-                    return 0;
-                }
-                VK_TAB => {
-                    unsafe { SetFocus(if id == EDIT_ID { app.list } else { app.edit }) };
-                    return 0;
-                }
-                0x48 if unsafe { GetKeyState(VK_CONTROL as i32) } < 0 => {
-                    app.include_system = !app.include_system;
-                    app.query(main);
-                    return 0;
-                }
-                VK_DOWN | VK_UP if id == EDIT_ID => {
-                    let current = app.selected().unwrap_or(0);
-                    let next = if w as u16 == VK_DOWN {
-                        (current + 1).min(app.hits.len().saturating_sub(1))
-                    } else {
-                        current.saturating_sub(1)
-                    };
-                    app.select(next);
-                    return 0;
-                }
-                _ => {}
+    if msg == WM_KEYDOWN && !ptr.is_null() {
+        let app = unsafe { &mut *ptr };
+        match w as u16 {
+            VK_ESCAPE => {
+                app.hide_panel(main);
+                return 0;
             }
+            VK_RETURN => {
+                app.open_selected(main, unsafe { GetKeyState(VK_CONTROL as i32) } < 0);
+                return 0;
+            }
+            VK_TAB => {
+                unsafe { SetFocus(if id == EDIT_ID { app.list } else { app.edit }) };
+                return 0;
+            }
+            0x48 if unsafe { GetKeyState(VK_CONTROL as i32) } < 0 => {
+                app.include_system = !app.include_system;
+                app.query(main);
+                return 0;
+            }
+            VK_DOWN | VK_UP => {
+                app.step_selection(w as u16 == VK_DOWN);
+                return 0;
+            }
+            _ => {}
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, w, l) }
@@ -1207,23 +1552,30 @@ fn is_app(hit: &Hit) -> bool {
 }
 
 fn display_name(hit: &Hit) -> String {
-    let name = hit.path.rsplit('\\').next().unwrap_or(&hit.path);
+    let path = hit.path.trim_end_matches('\\');
+    let name = path.rsplit('\\').next().unwrap_or(path);
     match (extension(hit), name.rsplit_once('.')) {
         (Some(ext), Some((stem, _))) if SHORTCUT_EXTENSIONS.contains(&ext.as_str()) => stem.into(),
         _ => name.into(),
     }
 }
 
-/// The second column: what an app or link is, in words, or the full path otherwise.
+/// The folder holding `path`, or the path itself for a drive root.
+fn parent_folder(path: &str) -> &str {
+    let path = path.trim_end_matches('\\');
+    path.rsplit_once('\\').map_or(path, |(parent, _)| parent)
+}
+
+/// The second line: what an app or link is, in words, or the folder a file is in.
 fn describe(hit: &Hit) -> String {
     if hit.path.starts_with(apps::PREFIX) {
         return "App".into();
     }
+    let folder = parent_folder(&hit.path);
     let Some(ext) = extension(hit) else {
-        return hit.path.clone();
+        return folder.into();
     };
     let lower = hit.path.to_lowercase();
-    let folder = hit.path.rsplit_once('\\').map_or("", |(parent, _)| parent);
     let place = if lower
         .rsplit_once('\\')
         .is_some_and(|(parent, _)| parent.ends_with("\\desktop"))
@@ -1242,65 +1594,54 @@ fn describe(hit: &Hit) -> String {
         "url" => format!("Web link {place}"),
         _ if program && in_windows => "Windows tool".into(),
         _ if program => format!("App in {folder}"),
-        _ => hit.path.clone(),
+        _ => folder.into(),
     }
 }
 
-fn scale(hwnd: HWND, value: i32) -> i32 {
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
-    value * dpi as i32 / 96
+const DOCUMENT_EXTENSIONS: &[&str] = &[
+    "pdf", "doc", "docx", "docm", "odt", "rtf", "txt", "md", "xls", "xlsx", "xlsm", "ods", "csv",
+    "ppt", "pptx", "odp", "one", "vsdx", "pub", "msg", "eml", "epub", "mobi",
+];
+const MEDIA_EXTENSIONS: &[&str] = &[
+    "jpg", "jpeg", "png", "gif", "bmp", "webp", "heic", "avif", "tif", "tiff", "svg", "psd", "dng",
+    "cr2", "cr3", "nef", "arw", "mp4", "m4v", "mkv", "mov", "avi", "webm", "wmv", "mp3", "wav",
+    "flac", "m4a", "aac", "ogg", "wma", "opus",
+];
+
+/// The section a hit is listed under.
+fn kind_of(hit: &Hit) -> rows::Kind {
+    if is_app(hit) {
+        return rows::Kind::Apps;
+    }
+    if hit.is_dir {
+        return rows::Kind::Folders;
+    }
+    match extension(hit) {
+        Some(ext) if DOCUMENT_EXTENSIONS.contains(&ext.as_str()) => rows::Kind::Documents,
+        Some(ext) if MEDIA_EXTENSIONS.contains(&ext.as_str()) => rows::Kind::Media,
+        _ => rows::Kind::Files,
+    }
 }
 
-/// Creates the interface font. Windows 11's Segoe UI Variable looks best; older
-/// systems fall back to Segoe UI, which every supported Windows has.
-fn create_ui_font(hwnd: HWND) -> HFONT {
-    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96) as i32;
-    // 10 pt, negative height for character height (not cell height).
-    let height = -(10 * dpi / 72);
-    let font = make_font(height, "Segoe UI Variable Text");
-    if font_face_matches(hwnd, font, "Segoe UI Variable") {
-        font
+fn plural(count: u32, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("1 {one}")
     } else {
-        unsafe { DeleteObject(font) };
-        make_font(height, "Segoe UI")
+        format!("{count} {many}")
     }
 }
 
-fn make_font(height: i32, face: &str) -> HFONT {
-    unsafe {
-        CreateFontW(
-            height,
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
-            0,
-            wide(face).as_ptr(),
-        )
+/// The footer's summary of a search: results shown, and how many Ctrl+H would add.
+fn status_text(shown: u32, hidden: u32) -> String {
+    match (shown, hidden) {
+        (0, 0) => "No results".into(),
+        (0, _) => format!("No results · {hidden} more with Ctrl+H"),
+        (_, 0) => plural(shown, "result", "results"),
+        _ => format!(
+            "{} · {hidden} more with Ctrl+H",
+            plural(shown, "result", "results")
+        ),
     }
-}
-
-fn font_face_matches(hwnd: HWND, font: HFONT, needle: &str) -> bool {
-    let device = unsafe { GetDC(hwnd) };
-    if device.is_null() {
-        return false;
-    }
-    let previous = unsafe { SelectObject(device, font) };
-    let mut buffer = [0u16; 64];
-    let length = unsafe { GetTextFaceW(device, buffer.len() as i32, buffer.as_mut_ptr()) };
-    unsafe {
-        SelectObject(device, previous);
-        ReleaseDC(hwnd, device);
-    }
-    let end = (length.max(1) as usize - 1).min(buffer.len());
-    String::from_utf16_lossy(&buffer[..end]).contains(needle)
 }
 
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -1317,8 +1658,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             let app = Box::from_raw(ptr);
-            if !app.background.is_null() {
-                DeleteObject(app.background);
+            for brush in [app.background, app.surface_brush] {
+                if !brush.is_null() {
+                    DeleteObject(brush);
+                }
+            }
+            if let Some(fonts) = &app.fonts {
+                fonts.delete();
             }
             drop(app);
         }
@@ -1359,6 +1705,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         | WS_TABSTOP
                         | LVS_REPORT
                         | LVS_OWNERDATA
+                        | LVS_OWNERDRAWFIXED
+                        | LVS_NOCOLUMNHEADER
                         | LVS_SINGLESEL
                         | LVS_SHOWSELALWAYS
                         | LVS_SHAREIMAGELISTS,
@@ -1372,7 +1720,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     null(),
                 )
             };
-            app.status_label = control(hwnd, &wide("STATIC"), "", STATUS_ID, WS_VISIBLE);
+            app.status_label = control(
+                hwnd,
+                &wide("STATIC"),
+                "",
+                STATUS_ID,
+                WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+            );
+            let cue = wide("Search apps, files and folders");
+            // wParam 1: keep the placeholder while the empty box has focus.
+            unsafe { SendMessageW(app.edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize) };
             unsafe {
                 SetWindowSubclass(app.edit, Some(child_proc), EDIT_ID, hwnd as usize);
                 SetWindowSubclass(app.list, Some(child_proc), LIST_ID, hwnd as usize);
@@ -1443,13 +1800,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     app.list,
                     LVM_SETEXTENDEDLISTVIEWSTYLE,
                     0,
-                    (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP) as _,
+                    (LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER) as _,
                 );
             }
-            let label = wide("Name");
+            let label = wide("Result");
             let col = LVCOLUMNW {
                 mask: LVCF_TEXT | LVCF_WIDTH,
-                cx: scale(hwnd, 160),
+                cx: scale(hwnd, 400),
                 pszText: label.as_ptr() as _,
                 ..Default::default()
             };
@@ -1459,21 +1816,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     LVM_INSERTCOLUMNW,
                     0,
                     (&col as *const LVCOLUMNW) as _,
-                )
-            };
-            let path_label = wide("Path");
-            let path_col = LVCOLUMNW {
-                mask: LVCF_TEXT | LVCF_WIDTH,
-                cx: scale(hwnd, 280),
-                pszText: path_label.as_ptr() as _,
-                ..Default::default()
-            };
-            unsafe {
-                SendMessageW(
-                    app.list,
-                    LVM_INSERTCOLUMNW,
-                    1,
-                    (&path_col as *const LVCOLUMNW) as _,
                 )
             };
             let (sender, results) = search::start(hwnd);
@@ -1493,7 +1835,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             app.layout(hwnd);
             0
         }
-        WM_SETTINGCHANGE | WM_THEMECHANGED => {
+        WM_SETTINGCHANGE | WM_THEMECHANGED | WM_DWMCOLORIZATIONCOLORCHANGED => {
             app.theme(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
@@ -1503,26 +1845,67 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let mut rect = RECT::default();
             unsafe { GetClientRect(hwnd, &mut rect) };
             unsafe { FillRect(device, &rect, app.background) };
-            if !app.outlines.is_empty() {
-                let diameter = scale(hwnd, 14);
-                let pen = unsafe { CreatePen(PS_SOLID, 1, app.edge) };
-                unsafe {
-                    let previous_pen = SelectObject(device, pen);
-                    let previous_brush = SelectObject(device, GetStockObject(NULL_BRUSH));
-                    for outline in &app.outlines {
-                        RoundRect(
-                            device,
-                            outline.left,
-                            outline.top,
-                            outline.right,
-                            outline.bottom,
-                            diameter,
-                            diameter,
-                        );
+            if let Some(fonts) = &app.fonts
+                && app.field.right > app.field.left
+            {
+                let s = |v: i32| scale(hwnd, v);
+                let colors = app.colors;
+                let field = app.field;
+                let radius = s(draw::RADIUS);
+                draw::fill_round(device, &field, radius, colors.edge);
+                let inner = RECT {
+                    left: field.left + 1,
+                    top: field.top + 1,
+                    right: field.right - 1,
+                    bottom: field.bottom - 1,
+                };
+                draw::fill_round(device, &inner, radius, colors.surface);
+                if unsafe { GetFocus() } == app.edit {
+                    // Windows 11 text boxes mark focus with an accent underline.
+                    let line = RECT {
+                        left: field.left + radius / 2,
+                        top: field.bottom - s(2),
+                        right: field.right - radius / 2,
+                        bottom: field.bottom,
+                    };
+                    let brush = unsafe { CreateSolidBrush(colors.accent) };
+                    unsafe {
+                        FillRect(device, &line, brush);
+                        DeleteObject(brush);
                     }
-                    SelectObject(device, previous_brush);
-                    SelectObject(device, previous_pen);
-                    DeleteObject(pen);
+                }
+                let glyph = RECT {
+                    right: field.left + s(40),
+                    ..field
+                };
+                draw::text(
+                    device,
+                    draw::GLYPH_SEARCH,
+                    &glyph,
+                    fonts.glyph,
+                    colors.secondary,
+                    DT_CENTER,
+                );
+                let footer = app.footer;
+                let divider = RECT {
+                    top: footer.top - s(draw::SPACE_S),
+                    bottom: footer.top - s(draw::SPACE_S) + 1,
+                    ..footer
+                };
+                let brush = unsafe { CreateSolidBrush(colors.edge) };
+                unsafe {
+                    FillRect(device, &divider, brush);
+                    DeleteObject(brush);
+                }
+                if app.show_hints.get() {
+                    draw::text(
+                        device,
+                        KEY_HINTS,
+                        &footer,
+                        fonts.detail,
+                        colors.secondary,
+                        DT_RIGHT,
+                    );
                 }
             }
             unsafe { EndPaint(hwnd, &paint) };
@@ -1536,12 +1919,46 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             };
             1
         }
-        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+        WM_CTLCOLOREDIT if l as HWND == app.edit => {
             unsafe {
-                SetBkColor(w as _, app.panel);
-                SetTextColor(w as _, app.text);
+                SetBkColor(w as _, app.colors.surface);
+                SetTextColor(w as _, app.colors.text);
+            }
+            app.surface_brush as _
+        }
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+            let text = if l as HWND == app.status_label {
+                app.colors.secondary
+            } else {
+                app.colors.text
+            };
+            unsafe {
+                SetBkColor(w as _, app.colors.panel);
+                SetTextColor(w as _, text);
             }
             app.background as _
+        }
+        WM_MEASUREITEM => {
+            let item = unsafe { &mut *(l as *mut MEASUREITEMSTRUCT) };
+            if item.CtlID as usize == LIST_ID {
+                item.itemHeight = scale(hwnd, draw::ROW_HEIGHT) as u32;
+                return 1;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+        WM_DRAWITEM => {
+            let item = unsafe { &*(l as *const DRAWITEMSTRUCT) };
+            if item.CtlID as usize == LIST_ID {
+                app.draw_row(item);
+                return 1;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
+        WM_TIMER if w == NOTICE_TIMER => {
+            unsafe { KillTimer(hwnd, NOTICE_TIMER) };
+            app.notice = None;
+            app.refresh_status();
+            0
         }
         WM_COMMAND if w & 0xffff == EDIT_ID && (w >> 16) as u32 == EN_CHANGE => {
             app.query(hwnd);
@@ -1560,7 +1977,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 }
                 MENU_RESULT_OPEN => app.open_selected(hwnd, false),
                 MENU_RESULT_FOLDER => app.open_selected(hwnd, true),
-                MENU_RESULT_COPY => app.copy_selected(hwnd),
+                MENU_RESULT_COPY => {
+                    app.copy_selected(hwnd);
+                    app.show_notice(hwnd, "Path copied");
+                }
                 SETTINGS_SAVE => app.save_settings(hwnd),
                 SETTINGS_BACK => app.show_search(hwnd),
                 SETTINGS_CLEAR => match app.history.clear() {
@@ -1655,36 +2075,39 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let hdr = unsafe { &*(l as *const NMHDR) };
             if hdr.hwndFrom == app.list {
                 if hdr.code == LVN_GETDISPINFOW {
+                    // Rows are drawn by `draw_row`; the text here is what screen
+                    // readers announce.
                     let disp = unsafe { &mut *(l as *mut NMLVDISPINFOW) };
-                    let index = disp.item.iItem as usize;
-                    if index < app.hits.len() {
-                        if disp.item.mask & LVIF_TEXT != 0
-                            && !disp.item.pszText.is_null()
-                            && disp.item.cchTextMax > 0
-                        {
-                            let text = if disp.item.iSubItem == 0 {
-                                &app.names[index]
-                            } else {
-                                &app.paths[index]
-                            };
-                            let count = text.len().min(disp.item.cchTextMax as usize);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    text.as_ptr(),
-                                    disp.item.pszText,
-                                    count,
-                                );
-                                *disp.item.pszText.add(count - 1) = 0;
-                            }
-                        }
-                        if disp.item.mask & LVIF_IMAGE != 0 && disp.item.iSubItem == 0 {
-                            disp.item.iImage = app.icon(index);
+                    let text = match app.rows.get(disp.item.iItem as usize) {
+                        Some(rows::Row::Section(kind)) => kind.label().to_string(),
+                        Some(&rows::Row::Hit(index)) => format!(
+                            "{}, {}",
+                            String::from_utf16_lossy(&app.names[index]),
+                            app.details[index]
+                        ),
+                        None => String::new(),
+                    };
+                    if disp.item.mask & LVIF_TEXT != 0
+                        && !disp.item.pszText.is_null()
+                        && disp.item.cchTextMax > 0
+                    {
+                        let text = wide(&text);
+                        let count = text.len().min(disp.item.cchTextMax as usize);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(text.as_ptr(), disp.item.pszText, count);
+                            *disp.item.pszText.add(count - 1) = 0;
                         }
                     }
                     return 0;
                 }
                 if hdr.code == LVN_ITEMCHANGED {
-                    app.refresh_status();
+                    // Headings cannot be selected (Home, Page Up and clicks land on them).
+                    if let Some(row) = app.selected_row()
+                        && matches!(app.rows[row], rows::Row::Section(_))
+                        && let Some(&rows::Row::Hit(index)) = app.rows.get(row + 1)
+                    {
+                        app.select(index);
+                    }
                     return 0;
                 }
                 if hdr.code == NM_DBLCLK {
@@ -1697,7 +2120,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                             hwnd,
                             &[
                                 (MENU_RESULT_OPEN, "Open"),
-                                (MENU_RESULT_FOLDER, "Open folder"),
+                                (MENU_RESULT_FOLDER, "Show in folder"),
                                 (MENU_RESULT_COPY, "Copy path"),
                             ],
                         );
@@ -1711,15 +2134,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             match w as u16 {
                 VK_ESCAPE => app.hide_panel(hwnd),
                 VK_RETURN => app.open_selected(hwnd, unsafe { GetKeyState(VK_CONTROL as i32) } < 0),
-                VK_DOWN | VK_UP => {
-                    let current = app.selected().unwrap_or(0);
-                    let next = if w as u16 == VK_DOWN {
-                        (current + 1).min(app.hits.len().saturating_sub(1))
-                    } else {
-                        current.saturating_sub(1)
-                    };
-                    app.select(next);
-                }
+                VK_DOWN | VK_UP => app.step_selection(w as u16 == VK_DOWN),
                 _ => return unsafe { DefWindowProcW(hwnd, msg, w, l) },
             }
             0
@@ -1731,11 +2146,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_DESTROY => {
             unsafe {
                 KillTimer(hwnd, RETRY_TIMER);
-                KillTimer(hwnd, ANIMATION_TIMER)
+                KillTimer(hwnd, ANIMATION_TIMER);
+                KillTimer(hwnd, NOTICE_TIMER)
             };
-            if !app.font.is_null() {
-                unsafe { DeleteObject(app.font) };
-            }
             app.hover.rebuild(hwnd, false, false);
             if app.hotkey_registered {
                 unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
@@ -1862,7 +2275,19 @@ mod tests {
         assert_eq!(describe(&hit(r"D:\Tools\x.exe")), r"App in D:\Tools");
         let doc = hit(r"C:\Users\bob\Documents\a.pdf");
         assert_eq!(display_name(&doc), "a.pdf");
-        assert_eq!(describe(&doc), r"C:\Users\bob\Documents\a.pdf");
+        assert_eq!(describe(&doc), r"C:\Users\bob\Documents");
+        let folder = Hit {
+            is_dir: true,
+            ..hit(r"C:\Users\bob\Projects\")
+        };
+        assert_eq!(display_name(&folder), "Projects");
+        assert_eq!(describe(&folder), r"C:\Users\bob");
+        assert_eq!(kind_of(&folder), rows::Kind::Folders);
+        assert_eq!(kind_of(&doc), rows::Kind::Documents);
+        assert_eq!(kind_of(&menu), rows::Kind::Apps);
+        assert_eq!(kind_of(&link), rows::Kind::Files);
+        assert_eq!(status_text(1, 0), "1 result");
+        assert_eq!(status_text(4, 2), "4 results · 2 more with Ctrl+H");
         let store = hit(r"shell:AppsFolder\Microsoft.Paint_8wekyb3d8bbwe!App");
         assert_eq!(describe(&store), "App");
         assert!(is_app(&store));
