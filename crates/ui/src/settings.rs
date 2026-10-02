@@ -23,6 +23,8 @@ pub struct Settings {
     pub hover: bool,
     pub left: bool,
     pub start_with_windows: bool,
+    /// Rank results the user opened before higher (see `frecency`).
+    pub history: bool,
 }
 
 impl Default for Settings {
@@ -33,6 +35,7 @@ impl Default for Settings {
             hover: true,
             left: false,
             start_with_windows: false,
+            history: true,
         }
     }
 }
@@ -71,6 +74,7 @@ impl Settings {
                     "hover" => settings.hover = value == "true",
                     "left" => settings.left = value == "true",
                     "start_with_windows" => settings.start_with_windows = value == "true",
+                    "history" => settings.history = value != "false",
                     _ => {}
                 }
             }
@@ -94,8 +98,13 @@ impl Settings {
         fs::write(
             &tmp,
             format!(
-                "modifiers={}\nkey={}\nhover={}\nleft={}\nstart_with_windows={}\n",
-                self.modifiers, self.key, self.hover, self.left, self.start_with_windows
+                "modifiers={}\nkey={}\nhover={}\nleft={}\nstart_with_windows={}\nhistory={}\n",
+                self.modifiers,
+                self.key,
+                self.hover,
+                self.left,
+                self.start_with_windows,
+                self.history
             ),
         )?;
         fs::rename(tmp, path)
@@ -206,5 +215,8 @@ mod tests {
         assert!(settings.left);
         assert!(settings.start_with_windows);
         assert_eq!(Settings::parse("key=9999").key, u32::from(b' '));
+        assert!(settings.history);
+        assert!(Settings::parse("").history);
+        assert!(!Settings::parse("history=false\n").history);
     }
 }

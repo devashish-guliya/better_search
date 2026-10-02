@@ -76,6 +76,12 @@ launchable file (`.exe`, `.lnk`, `.bat`, ...) above folders and installers that 
 the name, certificate and runtime files (`.pem`, `.pid`, `.dll`, ...) are pushed down,
 and developer toolchains (`msys64`, `cygwin`, package caches) rank as low-value.
 
+The window remembers what you open (on by default) and ranks those files higher the next
+time they match, with a bonus that grows with how often and how recently you opened
+them and is capped, so name matches still lead. The list is kept only on this PC in
+`%LOCALAPPDATA%\better_search\history.tsv` (at most 2,000 paths) and never reaches the
+service. Settings can turn it off or clear it.
+
 Settings let you change the hotkey and edge side, disable edge hover, and explicitly
 enable per-user start at sign-in (HKCU only). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;

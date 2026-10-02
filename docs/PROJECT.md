@@ -650,6 +650,15 @@ and reports a clear message when the service is not running.
   A transparent non-activating four-pixel edge zone on each monitor waits 280 ms before
   sliding the panel in; it can be disabled or moved to the left edge. Window positioning
   and child layout scale with the monitor DPI.
+- **Open history (frecency).** The window records the path of each file it opens (not
+  "open folder") in `%LOCALAPPDATA%\better_search\history.tsv` as `weight`, `last-open
+  seconds`, lowercased path. A weight is the number of opens, halving every 14 days.
+  After a reply arrives, the window adds `min(30, 8·ln(1 + weight))` to each hit's score
+  and re-sorts the (up to 200) hits with a stable sort. Nothing changes in the pipe
+  protocol, the index or the service, and history only reorders hits the service already
+  returned. The file keeps at most 2,000 paths (the weakest 500 go when it overflows),
+  forgets weights under 0.05, and is written by temp file and rename. Settings has a
+  checkbox (`history=` in `window.cfg`, default on) and a "Clear open history" button.
 - Per-user settings live in `%LOCALAPPDATA%\better_search\window.cfg`. The theme follows
   Windows' app light/dark preference on settings changes (title bar, list and controls).
   Start with Windows is off until explicitly enabled in Settings; it only changes the
@@ -1008,8 +1017,8 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  91 workspace tests pass (index crate 36, query crate 21, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 3).
+  96 workspace tests pass (index crate 36, query crate 21, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 8).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
   first, then `cargo fmt`, `cargo test`, and

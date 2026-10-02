@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 //! Unelevated search UI. All index access goes through bs_pipe::Client in `search`.
 
+mod frecency;
 mod hover;
 mod search;
 mod settings;
@@ -82,6 +83,8 @@ const SETTINGS_SIDE: usize = 303;
 const SETTINGS_STARTUP: usize = 304;
 const SETTINGS_SAVE: usize = 305;
 const SETTINGS_BACK: usize = 306;
+const SETTINGS_HISTORY: usize = 307;
+const SETTINGS_CLEAR: usize = 308;
 const CHECKED: isize = 1;
 /// `EM_SETMARGINS` flags for the search box's inner text padding.
 const EC_LEFTMARGIN: usize = 0x0001;
@@ -140,6 +143,7 @@ struct App {
     icon_cache: HashMap<String, i32>,
     image_list: isize,
     settings: settings::Settings,
+    history: frecency::History,
     paused: bool,
     hotkey_registered: bool,
     hover: hover::Hover,
@@ -173,6 +177,7 @@ impl App {
             icon_cache: HashMap::new(),
             image_list: 0,
             settings: settings::Settings::load(),
+            history: frecency::History::load(),
             paused: false,
             hotkey_registered: false,
             hover: hover::Hover::new(),
@@ -240,6 +245,14 @@ impl App {
                     } else {
                         format!("{} matches", reply.total_matches)
                     };
+                    let mut reply = reply;
+                    if self.settings.history && !self.history.is_empty() {
+                        let now = frecency::now();
+                        // Stable, so equal scores keep the service's order.
+                        reply.hits.sort_by_cached_key(|hit| {
+                            std::cmp::Reverse(hit.score + self.history.boost(&hit.path, now))
+                        });
+                    }
                     self.names = reply
                         .hits
                         .iter()
@@ -383,8 +396,12 @@ impl App {
         info.iIcon
     }
 
-    fn open_selected(&self, hwnd: HWND, folder: bool) {
+    fn open_selected(&mut self, hwnd: HWND, folder: bool) {
         let Some(index) = self.selected() else { return };
+        if self.settings.history && !folder {
+            self.history.record(&self.hits[index].path, frecency::now());
+            let _ = self.history.save();
+        }
         let hit = &self.hits[index];
         let (file, args) = if folder {
             // File names cannot contain quotes, so this is safe for explorer's arguments.
@@ -542,6 +559,12 @@ impl App {
                 self.settings.start_with_windows as usize,
                 0,
             );
+            SendMessageW(
+                self.controls[5],
+                BM_SETCHECK,
+                self.settings.history as usize,
+                0,
+            );
             SetForegroundWindow(hwnd);
             SetFocus(self.controls[1]);
         }
@@ -607,6 +630,7 @@ impl App {
             left: unsafe { SendMessageW(self.controls[3], BM_GETCHECK, 0, 0) } == CHECKED,
             start_with_windows: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) }
                 == CHECKED,
+            history: unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED,
         };
         if next.key != self.settings.key || next.modifiers != self.settings.modifiers {
             if self.hotkey_registered {
@@ -648,7 +672,7 @@ impl App {
             let top = scale(hwnd, 20);
             let mut y = top;
             for (i, &control) in self.controls.iter().enumerate() {
-                let height = if i == 6 {
+                let height = if i == 8 {
                     line * 2
                 } else {
                     line - scale(hwnd, 3)
@@ -1148,6 +1172,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 ),
                 control(
                     hwnd,
+                    &button_class,
+                    "Rank what I open higher (kept on this PC)",
+                    SETTINGS_HISTORY,
+                    BS_AUTOCHECKBOX as u32,
+                ),
+                control(hwnd, &button_class, "Clear open history", SETTINGS_CLEAR, 0),
+                control(
+                    hwnd,
                     &static_class,
                     &format!(
                         "Service drives: {} (all fixed NTFS; selection deferred)",
@@ -1288,6 +1320,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 MENU_RESULT_COPY => app.copy_selected(hwnd),
                 SETTINGS_SAVE => app.save_settings(hwnd),
                 SETTINGS_BACK => app.show_search(hwnd),
+                SETTINGS_CLEAR => match app.history.clear() {
+                    Ok(()) => message(hwnd, "Open history cleared."),
+                    Err(err) => message(hwnd, &format!("Could not clear the history: {err}")),
+                },
                 _ => {}
             }
             0
