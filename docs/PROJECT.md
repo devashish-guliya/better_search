@@ -660,6 +660,15 @@ and reports a clear message when the service is not running.
   Shortcuts are shown without `.lnk`/`.url`/`.appref-ms`, and the path column
   describes apps in words (`App`, `App shortcut on the Desktop`, `Windows tool`,
   `Web link`, `App in <folder>`).
+- Microsoft Store and other packaged (MSIX) apps have no shortcut file, so the index
+  cannot see them. `apps.rs` reads the shell's Applications folder (`shell:AppsFolder`)
+  on a background thread at start and again when a search runs more than two minutes
+  after the last read, keeping entries whose app ID contains `!`. The window matches
+  their names itself (exact 180, prefix 144, word start 127, substring 100, close to a
+  Start Menu shortcut's scores), merges up to 20 into the service's hits, and opens
+  them through `shell:AppsFolder\<app ID>`. An app that also has a Start Menu shortcut
+  is shown once. `Program Files\WindowsApps` (package files) is now app files
+  (`SKIP_RULES_VERSION` 8).
   Enter opens, Ctrl+Enter selects the item in Explorer, arrows navigate, Esc hides,
   and a result menu offers Open, Open folder and Copy path.
 - A tray icon provides Open, Settings, Pause and Quit. Pause suspends **window queries
@@ -1045,8 +1054,8 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  113 workspace tests pass (index crate 37, query crate 34, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 10).
+  114 workspace tests pass (index crate 37, query crate 34, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 11).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
   first, then `cargo fmt`, `cargo test`, and

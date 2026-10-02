@@ -41,7 +41,7 @@ pub mod flags {
 
 /// Version of the clutter rules in [`Index::skip_clutter`] and of the location rules.
 /// Bump it when either changes so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 7;
+pub const SKIP_RULES_VERSION: u32 = 8;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1880,6 +1880,8 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
     // files below `Program Files\<app>\<folder>` are.
     if inherited == Location::Normal {
         match program_files_depth(index, parent) {
+            // Packaged apps' own files; the window lists the apps themselves.
+            Some(0) if name == b"windowsapps" => return Location::AppFiles,
             Some(2) => return Location::AppFiles,
             // An app folder's own readme and license files are not the user's
             // documents; only its programs stay in view.
@@ -2144,11 +2146,24 @@ mod tests {
         b.push(19, 18, "Tool", true, false);
         b.push(20, 19, "bin", true, false);
         b.push(21, 20, "tool.exe", false, false);
+        b.push(22, 1, "WindowsApps", true, false);
+        b.push(
+            23,
+            22,
+            "Microsoft.Paint_11.0_x64__8wekyb3d8bbwe",
+            true,
+            false,
+        );
         b.end_volume();
         let index = b.finish();
         let location = |path: &str| index.location(find(&index, path));
         let app = Location::AppFiles;
         assert_eq!(location("C:\\Program Files\\Foo"), Location::Normal);
+        assert_eq!(location("C:\\Program Files\\WindowsApps"), app);
+        assert_eq!(
+            location("C:\\Program Files\\WindowsApps\\Microsoft.Paint_11.0_x64__8wekyb3d8bbwe"),
+            app
+        );
         assert_eq!(
             location("C:\\Program Files\\Foo\\foo.exe"),
             Location::Normal

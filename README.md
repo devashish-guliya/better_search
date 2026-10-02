@@ -77,7 +77,9 @@ words). `ext:pdf` keeps only that type, `ext:xlsx,docx` several, and `ext:pdf` a
 lists every PDF.
 
 Apps appear by name with their own icon (`Excel`, described as `App`, rather than
-`Excel.lnk`), and photos, videos and documents show a thumbnail.
+`Excel.lnk`), and photos, videos and documents show a thumbnail. Microsoft Store apps
+(Calculator, Camera, Paint, Netflix, ...) are found too, even though they have no
+shortcut file.
 
 Results are ranked so the likely target comes first: typing an app's name puts the
 launchable file (`.exe`, `.lnk`, `.bat`, ...) above folders and installers that share

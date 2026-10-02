@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 //! Unelevated search UI. All index access goes through bs_pipe::Client in `search`.
 
+mod apps;
 mod frecency;
 mod hover;
 mod search;
@@ -161,6 +162,9 @@ struct App {
     thumb_sender: Option<Sender<thumbs::Request>>,
     thumb_results: Option<Receiver<thumbs::Done>>,
     thumb_generation: Arc<AtomicU64>,
+    apps: apps::Apps,
+    /// Names of the packaged apps in the current results, by path.
+    app_names: HashMap<String, String>,
     settings: settings::Settings,
     history: frecency::History,
     paused: bool,
@@ -205,6 +209,8 @@ impl App {
             thumb_sender: None,
             thumb_results: None,
             thumb_generation: Arc::new(AtomicU64::new(0)),
+            apps: apps::Apps::default(),
+            app_names: HashMap::new(),
             settings: settings::Settings::load(),
             history: frecency::History::load(),
             paused: false,
@@ -233,6 +239,7 @@ impl App {
         self.last_text = query.clone();
         self.serial = self.serial.wrapping_add(1);
         unsafe { KillTimer(hwnd, RETRY_TIMER) };
+        self.apps.refresh_if_stale();
         self.clear_results();
         if query.trim().is_empty() {
             self.status = "Type a file or folder name".into();
@@ -271,8 +278,27 @@ impl App {
         match result.outcome {
             search::Outcome::Reply(reply) => match reply.status {
                 Status::Ok => {
-                    let shown = reply.total_matches;
+                    let mut reply = reply;
+                    let shortcut_names: HashSet<String> = reply
+                        .hits
+                        .iter()
+                        .filter(|hit| is_app(hit))
+                        .map(|hit| display_name(hit).to_lowercase())
+                        .collect();
+                    // A packaged app that also has a Start Menu shortcut is shown once.
+                    let store: Vec<(Hit, String)> = self
+                        .apps
+                        .matches(&self.last_text)
+                        .into_iter()
+                        .filter(|(_, name)| !shortcut_names.contains(&name.to_lowercase()))
+                        .collect();
+                    let shown = reply.total_matches + store.len() as u32;
                     let hidden = reply.hidden_matches;
+                    self.app_names.clear();
+                    for (hit, name) in store {
+                        self.app_names.insert(hit.path.clone(), name);
+                        reply.hits.push(hit);
+                    }
                     self.status = match (shown, hidden) {
                         (0, 0) => "No matches".into(),
                         (0, _) => {
@@ -286,18 +312,22 @@ impl App {
                     if self.include_system {
                         self.status.push_str(" · showing all");
                     }
-                    let mut reply = reply;
-                    if self.settings.history && !self.history.is_empty() {
-                        let now = frecency::now();
-                        // Stable, so equal scores keep the service's order.
-                        reply.hits.sort_by_cached_key(|hit| {
-                            std::cmp::Reverse(hit.score + self.history.boost(&hit.path, now))
-                        });
-                    }
+                    let now = frecency::now();
+                    let use_history = self.settings.history && !self.history.is_empty();
+                    // Stable, so equal scores keep the service's order.
+                    reply.hits.sort_by_cached_key(|hit| {
+                        let boost = if use_history {
+                            self.history.boost(&hit.path, now)
+                        } else {
+                            0
+                        };
+                        std::cmp::Reverse(hit.score + boost)
+                    });
+                    reply.hits.truncate(search::LIMIT as usize);
                     self.names = reply
                         .hits
                         .iter()
-                        .map(|hit| wide(&display_name(hit)))
+                        .map(|hit| wide(&self.name_of(hit)))
                         .collect();
                     self.paths = reply.hits.iter().map(|hit| wide(&describe(hit))).collect();
                     // Pictures still queued for the previous list are not needed now.
@@ -331,6 +361,13 @@ impl App {
             unsafe { SetTimer(hwnd, RETRY_TIMER, 1200, None) };
         }
         self.update_title(hwnd);
+    }
+
+    fn name_of(&self, hit: &Hit) -> String {
+        self.app_names
+            .get(&hit.path)
+            .cloned()
+            .unwrap_or_else(|| display_name(hit))
     }
 
     fn update_title(&self, hwnd: HWND) {
@@ -411,9 +448,13 @@ impl App {
     fn type_icon(&mut self, index: usize) -> i32 {
         let hit = &self.hits[index];
         let name = hit.path.rsplit('\\').next().unwrap_or(&hit.path);
-        let extension = (!hit.is_dir)
-            .then(|| name.rsplit_once('.').map(|(_, ext)| ext))
-            .flatten();
+        let extension = if hit.path.starts_with(apps::PREFIX) {
+            Some("exe")
+        } else {
+            (!hit.is_dir)
+                .then(|| name.rsplit_once('.').map(|(_, ext)| ext))
+                .flatten()
+        };
         let key = if hit.is_dir {
             "<folder>".into()
         } else {
@@ -522,7 +563,10 @@ impl App {
             let _ = self.history.save();
         }
         let hit = &self.hits[index];
-        let (file, args) = if folder {
+        let (file, args) = if folder && hit.path.starts_with(apps::PREFIX) {
+            // A packaged app has no folder of its own; show it among all apps.
+            (wide("explorer.exe"), wide("shell:AppsFolder"))
+        } else if folder {
             // File names cannot contain quotes, so this is safe for explorer's arguments.
             (
                 wide("explorer.exe"),
@@ -877,7 +921,10 @@ impl App {
             return;
         }
         let text = match self.selected().and_then(|index| self.hits.get(index)) {
-            Some(hit) if is_app(hit) => format!("Enter opens {} · {}", display_name(hit), hit.path),
+            Some(hit) if hit.path.starts_with(apps::PREFIX) => {
+                format!("Enter opens {}", self.name_of(hit))
+            }
+            Some(hit) if is_app(hit) => format!("Enter opens {} · {}", self.name_of(hit), hit.path),
             Some(hit) => hit.path.clone(),
             None => self.status.clone(),
         };
@@ -1137,6 +1184,9 @@ const SHORTCUT_EXTENSIONS: &[&str] = &["lnk", "url", "appref-ms"];
 const PROGRAM_EXTENSIONS: &[&str] = &["exe", "msc", "cpl", "bat", "cmd", "com"];
 
 fn extension(hit: &Hit) -> Option<String> {
+    if hit.path.starts_with(apps::PREFIX) {
+        return None;
+    }
     let name = hit.path.rsplit('\\').next()?;
     (!hit.is_dir)
         .then(|| {
@@ -1148,11 +1198,12 @@ fn extension(hit: &Hit) -> Option<String> {
 
 /// Shortcuts and programs; web links are not apps.
 fn is_app(hit: &Hit) -> bool {
-    extension(hit).is_some_and(|ext| {
-        ext != "url"
-            && (SHORTCUT_EXTENSIONS.contains(&ext.as_str())
-                || PROGRAM_EXTENSIONS.contains(&ext.as_str()))
-    })
+    hit.path.starts_with(apps::PREFIX)
+        || extension(hit).is_some_and(|ext| {
+            ext != "url"
+                && (SHORTCUT_EXTENSIONS.contains(&ext.as_str())
+                    || PROGRAM_EXTENSIONS.contains(&ext.as_str()))
+        })
 }
 
 fn display_name(hit: &Hit) -> String {
@@ -1165,6 +1216,9 @@ fn display_name(hit: &Hit) -> String {
 
 /// The second column: what an app or link is, in words, or the full path otherwise.
 fn describe(hit: &Hit) -> String {
+    if hit.path.starts_with(apps::PREFIX) {
+        return "App".into();
+    }
     let Some(ext) = extension(hit) else {
         return hit.path.clone();
     };
@@ -1428,6 +1482,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let (sender, results) = thumbs::start(hwnd, Arc::clone(&app.thumb_generation));
             app.thumb_sender = Some(sender);
             app.thumb_results = Some(results);
+            app.apps.refresh_if_stale();
             app.theme(hwnd);
             app.register_hotkey(hwnd);
             unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
@@ -1808,6 +1863,10 @@ mod tests {
         let doc = hit(r"C:\Users\bob\Documents\a.pdf");
         assert_eq!(display_name(&doc), "a.pdf");
         assert_eq!(describe(&doc), r"C:\Users\bob\Documents\a.pdf");
+        let store = hit(r"shell:AppsFolder\Microsoft.Paint_8wekyb3d8bbwe!App");
+        assert_eq!(describe(&store), "App");
+        assert!(is_app(&store));
+        assert_eq!(extension(&store), None);
     }
 
     #[test]
