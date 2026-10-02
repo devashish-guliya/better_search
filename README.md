@@ -68,29 +68,37 @@ search box and the result list, and a Segoe UI Variable font.
 
 Results include matching file and folder **names**, with their full location in the
 Path column. Enter opens the selected item, including an app's `.exe` or a shortcut
-when that file is indexed. This is not a general app catalog or a search of text
-inside full folder paths. Contents of skipped clutter folders are absent by design.
+when that file is indexed. This is not a general app catalog, and Store apps without a
+shortcut are not found. Contents of skipped clutter folders are absent by design.
+
+With several words, a word the name lacks may match a folder above it instead:
+`acme contract` finds `Clients\Acme\Contract.pdf` (below files whose own name holds both
+words). `ext:pdf` keeps only that type, `ext:xlsx,docx` several, and `ext:pdf` alone
+lists every PDF.
 
 Results are ranked so the likely target comes first: typing an app's name puts the
 launchable file (`.exe`, `.lnk`, `.bat`, ...) above folders and installers that share
 the name, certificate and runtime files (`.pem`, `.pid`, `.dll`, ...) are pushed down,
 and developer toolchains (`msys64`, `cygwin`, package caches) rank as low-value. A
 program's own files (below `Program Files\<app>`, `app-1.2.3` folders, tool dot-folders
-in your profile) rank lower, and Start Menu shortcuts rank higher. When a short search
+in your profile, readme and license files directly in an app's folder) rank lower, and
+Start Menu shortcuts rank higher, except vendor extras such as `Readme`, `Help` or
+`<App> Website`. Common Windows tools (`cmd`, `regedit`, `taskmgr`, `services.msc`, ...)
+rank as apps although the Windows folder is hidden. When a short search
 has few matches, word initials count too: `vsc` finds `Visual Studio Code`, `mrv` finds
 `MyReportViewer`.
 
-Kinds rank in this order: apps (Start Menu, Desktop and program shortcuts), documents (PDF, Office, text, notes, archives), photos/video/music, folders, then everything else, with source and config files last. A name that equals the query always wins, and history ranks above all of it. The same app's all-users and per-user Start Menu shortcuts are listed once.
+Kinds rank in this order: apps (Start Menu, Desktop and program shortcuts), documents (PDF, Office, text, notes, archives), photos/video/music, folders, then everything else, with source and config files last. A name that equals the query wins over kind preferences, except for runtime files such as `notes.log`. Your profile's Desktop, Documents, Downloads, Pictures, Videos, Music, OneDrive (including `OneDrive - <organization>`), Dropbox, `source`, `repos` and `projects` folders rank higher. Of equal matches, the one in fewer folders comes first. The same app's all-users and per-user Start Menu shortcuts are listed once.
 
 Matches inside system, app-data and program folders are hidden by default; the status
 line says how many were hidden, and Ctrl+H shows them for the current session.
 `bs report <index.bin>` prints how an index divides between these classes, and
 `bs query --system` includes them from the command line.
 
-The window remembers what you open (on by default; the first run starts from your
-Windows Recent files) and ranks those files higher the next
-time they match, with a bonus that grows with how often and how recently you opened
-them and is capped, so name matches still lead. The list is kept only on this PC in
+The window remembers what you open or show in its folder (on by default) and ranks those
+files higher the next time they match. Each start also adds files opened elsewhere since
+then, taken from your Windows Recent files. The bonus grows with how often and how
+recently you opened a file and is capped, so only heavy use overtakes an exact name. The list is kept only on this PC in
 `%LOCALAPPDATA%\better_search\history.tsv` (at most 2,000 paths) and never reaches the
 service. Settings can turn it off or clear it.
 

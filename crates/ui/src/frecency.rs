@@ -13,7 +13,8 @@ const MAX_ENTRIES: usize = 2000;
 const KEEP_ENTRIES: usize = 1500;
 /// An open counts half as much after this many days.
 const HALF_LIFE_DAYS: f64 = 14.0;
-/// The largest score bonus history can give. Name matches stay more important.
+/// The largest score bonus history can give. A file opened very often can overtake
+/// an exact name match, but only that heavy use gets near the cap.
 const MAX_BOOST: i32 = 60;
 /// Weights below this are forgotten.
 const FORGET_BELOW: f64 = 0.05;
@@ -42,6 +43,10 @@ pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
+}
+
+fn unix_secs(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
 fn path() -> Option<PathBuf> {
@@ -120,24 +125,35 @@ fn lnk_target(data: &[u8]) -> Option<String> {
 }
 
 impl History {
-    /// Without a history file yet, the user's Windows "Recent" shortcuts give the
-    /// first ranking hints (one open each, dated by the shortcut).
+    /// The user's Windows "Recent" shortcuts add what was opened outside this window
+    /// (Explorer, Office): everything on the first run, then what is newer than the
+    /// history file, one open each, dated by the shortcut.
     pub fn load() -> Self {
-        match path().and_then(|p| fs::read_to_string(p).ok()) {
-            Some(text) => Self::parse(&text, now()),
-            None => Self::from_recent(),
-        }
+        let file = path();
+        let saved = file.as_ref().and_then(|p| {
+            let text = fs::read_to_string(p).ok()?;
+            let modified = fs::metadata(p).ok()?.modified().ok()?;
+            Some((text, unix_secs(modified)))
+        });
+        let (mut history, since) = match saved {
+            Some((text, modified)) => (Self::parse(&text, now()), modified),
+            None => (Self::default(), 0),
+        };
+        history.import_recent(since);
+        history
     }
 
-    fn from_recent() -> Self {
-        let mut history = Self::default();
+    /// Records the targets of Recent shortcuts changed after `since` (Unix seconds).
+    /// An open recorded here within a minute of the shortcut is the same open, so
+    /// loading twice without saving never counts one twice.
+    fn import_recent(&mut self, since: u64) {
         let Some(dir) =
             std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(r"Microsoft\Windows\Recent"))
         else {
-            return history;
+            return;
         };
         let Ok(read) = fs::read_dir(dir) else {
-            return history;
+            return;
         };
         let mut links: Vec<(u64, PathBuf)> = read
             .flatten()
@@ -147,21 +163,22 @@ impl History {
                     .is_some_and(|x| x.eq_ignore_ascii_case("lnk"))
             })
             .filter_map(|e| {
-                let modified = e.metadata().ok()?.modified().ok()?;
-                let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
-                Some((secs, e.path()))
+                let secs = unix_secs(e.metadata().ok()?.modified().ok()?);
+                (secs > since).then(|| (secs, e.path()))
             })
             .collect();
         links.sort_by_key(|link| std::cmp::Reverse(link.0));
         for (secs, link) in links.into_iter().take(300) {
             let Ok(data) = fs::read(&link) else { continue };
             if let Some(target) = lnk_target(&data)
-                && !history.entries.contains_key(&key(&target))
+                && self
+                    .entries
+                    .get(&key(&target))
+                    .is_none_or(|e| e.last + 60 < secs)
             {
-                history.record(&target, secs);
+                self.record(&target, secs);
             }
         }
-        history
     }
 
     fn parse(text: &str, now: u64) -> Self {

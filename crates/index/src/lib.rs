@@ -39,9 +39,9 @@ pub mod flags {
     pub const SKIPPED: u8 = 1 << 5;
 }
 
-/// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
-/// change so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 6;
+/// Version of the clutter rules in [`Index::skip_clutter`] and of the location rules.
+/// Bump it when either changes so saved indexes built with the old rules are rebuilt.
+pub const SKIP_RULES_VERSION: u32 = 7;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1464,11 +1464,60 @@ const NOISY_ANYWHERE: &[&[u8]] = &[
     b".gradle",
     b".m2",
     b".nuget",
-    // Package stores and certificate folders: tool output, not user files.
-    b"bun",
     b".bun",
-    b"vcpkg",
-    b"certs",
+];
+
+// Package stores and certificate folders: tool output, except inside the user's own
+// folders, where `Documents\Certs` holds diplomas.
+const NOISY_OUTSIDE_USER_CONTENT: &[&[u8]] = &[b"bun", b"vcpkg", b"certs"];
+
+// Command-line and admin tools people start by name, the only files in the Windows
+// folder that rank as apps (`cmd` finds `cmd.exe`).
+const WINDOWS_TOOLS: &[&[u8]] = &[b"regedit.exe"];
+const SYSTEM32_TOOLS: &[&[u8]] = &[
+    b"cmd.exe",
+    b"notepad.exe",
+    b"taskmgr.exe",
+    b"control.exe",
+    b"mspaint.exe",
+    b"calc.exe",
+    b"mstsc.exe",
+    b"msconfig.exe",
+    b"msinfo32.exe",
+    b"dxdiag.exe",
+    b"cleanmgr.exe",
+    b"charmap.exe",
+    b"resmon.exe",
+    b"perfmon.exe",
+    b"snippingtool.exe",
+    b"winver.exe",
+    b"osk.exe",
+    b"magnify.exe",
+    b"services.msc",
+    b"devmgmt.msc",
+    b"diskmgmt.msc",
+    b"eventvwr.msc",
+    b"compmgmt.msc",
+    b"taskschd.msc",
+    b"gpedit.msc",
+    b"certmgr.msc",
+    b"appwiz.cpl",
+    b"ncpa.cpl",
+    b"sysdm.cpl",
+];
+
+/// Extensions of files that start a program, kept in sync with the query crate's list.
+const LAUNCHABLE: &[&[u8]] = &[
+    b"exe",
+    b"com",
+    b"bat",
+    b"cmd",
+    b"msi",
+    b"lnk",
+    b"url",
+    b"appref-ms",
+    b"msc",
+    b"cpl",
 ];
 
 const NOISY_AT_ROOT: &[&[u8]] = &[
@@ -1500,7 +1549,22 @@ const USER_CONTENT: &[&[u8]] = &[
     b"videos",
     b"music",
     b"onedrive",
+    b"dropbox",
+    b"my drive",
+    b"google drive",
+    b"iclouddrive",
+    b"icloud drive",
+    // Where developers keep their own code (Visual Studio uses `source\repos`).
+    b"source",
+    b"repos",
+    b"projects",
 ];
+
+/// A profile folder holding the user's own files. Business OneDrive folders are named
+/// `OneDrive - <organization>`.
+fn is_user_content_name(name: &[u8]) -> bool {
+    USER_CONTENT.contains(&name) || name.starts_with(b"onedrive - ")
+}
 
 // Folders whose contents are never indexed when clutter is skipped. Only names that
 // tools use and people do not.
@@ -1781,6 +1845,9 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
         return Location::StartMenu;
     }
     if inherited == Location::Noisy {
+        if !index.is_dir(entry) && is_windows_tool(index, parent, name) {
+            return Location::StartMenu;
+        }
         return Location::Noisy;
     }
     let at_root = index.parent(parent).is_none();
@@ -1789,11 +1856,14 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
         return Location::Noisy;
     }
     if index.is_dir(entry) {
-        if NOISY_ANYWHERE.contains(&name) || (at_root && NOISY_AT_ROOT.contains(&name)) {
+        if NOISY_ANYWHERE.contains(&name)
+            || (at_root && NOISY_AT_ROOT.contains(&name))
+            || (inherited != Location::UserContent && NOISY_OUTSIDE_USER_CONTENT.contains(&name))
+        {
             return Location::Noisy;
         }
         // <root>\Users\<profile>\<content folder>
-        if inherited == Location::Normal && USER_CONTENT.contains(&name) {
+        if inherited == Location::Normal && is_user_content_name(name) {
             let users_at_root = index.parent(parent).is_some_and(|u| {
                 index.name_folded(u) == b"users"
                     && index.parent(u).is_some_and(|r| index.parent(r).is_none())
@@ -1808,10 +1878,40 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
     }
     // Files directly inside an app's folder are not internals, but the folders and
     // files below `Program Files\<app>\<folder>` are.
-    if inherited == Location::Normal && program_files_depth(index, parent) == Some(2) {
-        return Location::AppFiles;
+    if inherited == Location::Normal {
+        match program_files_depth(index, parent) {
+            Some(2) => return Location::AppFiles,
+            // An app folder's own readme and license files are not the user's
+            // documents; only its programs stay in view.
+            Some(1) if !index.is_dir(entry) && !is_launchable(name) => {
+                return Location::AppFiles;
+            }
+            _ => {}
+        }
     }
     inherited
+}
+
+fn is_launchable(name: &[u8]) -> bool {
+    name.iter()
+        .rposition(|&b| b == b'.')
+        .is_some_and(|dot| LAUNCHABLE.contains(&&name[dot + 1..]))
+}
+
+/// `<root>\Windows\<tool>` or `<root>\Windows\System32\<tool>` for the listed tools.
+fn is_windows_tool(index: &Index, parent: u32, name: &[u8]) -> bool {
+    let is_windows = |folder: u32| {
+        index.name_folded(folder) == b"windows"
+            && index
+                .parent(folder)
+                .is_some_and(|root| index.parent(root).is_none())
+    };
+    if WINDOWS_TOOLS.contains(&name) && is_windows(parent) {
+        return true;
+    }
+    SYSTEM32_TOOLS.contains(&name)
+        && index.name_folded(parent) == b"system32"
+        && index.parent(parent).is_some_and(is_windows)
 }
 
 /// Whether `entry` is below a `ServiceProfiles` folder (a few levels up at most).
@@ -2072,6 +2172,61 @@ mod tests {
         assert_eq!(
             location("C:\\Games\\Doom\\data\\readme.md"),
             Location::Normal
+        );
+    }
+
+    #[test]
+    fn user_folders_system_tools_and_app_folder_files() {
+        let mut b = IndexBuilder::new();
+        b.begin_volume("C:", 0);
+        b.push(1, 0, "Users", true, false);
+        b.push(2, 1, "bob", true, false);
+        b.push(3, 2, "OneDrive - Contoso", true, false);
+        b.push(4, 3, "budget.xlsx", false, false);
+        b.push(5, 2, "Documents", true, false);
+        b.push(6, 5, "Certs", true, false);
+        b.push(7, 6, "diploma.pdf", false, false);
+        b.push(8, 0, "certs", true, false);
+        b.push(9, 0, "Windows", true, false);
+        b.push(10, 9, "System32", true, false);
+        b.push(11, 10, "cmd.exe", false, false);
+        b.push(12, 10, "kernel32.dll", false, false);
+        b.push(13, 9, "regedit.exe", false, false);
+        b.push(14, 0, "Program Files", true, false);
+        b.push(15, 14, "Acme", true, false);
+        b.push(16, 15, "acme.exe", false, false);
+        b.push(17, 15, "readme.txt", false, false);
+        b.push(18, 2, "source", true, false);
+        b.end_volume();
+        let index = b.finish();
+        let location = |path: &str| index.location(find(&index, path));
+        let mine = Location::UserContent;
+        assert_eq!(
+            location("C:\\Users\\bob\\OneDrive - Contoso\\budget.xlsx"),
+            mine
+        );
+        assert_eq!(
+            location("C:\\Users\\bob\\Documents\\Certs\\diploma.pdf"),
+            mine
+        );
+        assert_eq!(location("C:\\Users\\bob\\source"), mine);
+        assert_eq!(location("C:\\certs"), Location::Noisy);
+        assert_eq!(
+            location("C:\\Windows\\System32\\cmd.exe"),
+            Location::StartMenu
+        );
+        assert_eq!(location("C:\\Windows\\regedit.exe"), Location::StartMenu);
+        assert_eq!(
+            location("C:\\Windows\\System32\\kernel32.dll"),
+            Location::Noisy
+        );
+        assert_eq!(
+            location("C:\\Program Files\\Acme\\acme.exe"),
+            Location::Normal
+        );
+        assert_eq!(
+            location("C:\\Program Files\\Acme\\readme.txt"),
+            Location::AppFiles
         );
     }
 

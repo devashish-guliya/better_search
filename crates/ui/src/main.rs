@@ -413,7 +413,8 @@ impl App {
 
     fn open_selected(&mut self, hwnd: HWND, folder: bool) {
         let Some(index) = self.selected() else { return };
-        if self.settings.history && !folder {
+        // Showing a file in its folder is also the user picking that file.
+        if self.settings.history {
             self.history.record(&self.hits[index].path, frecency::now());
             let _ = self.history.save();
         }

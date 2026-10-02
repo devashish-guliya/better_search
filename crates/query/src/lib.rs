@@ -18,10 +18,11 @@ use bs_index::{Index, Location, NameTable, flags};
 use memchr::memmem::{self, Finder};
 use rayon::prelude::*;
 
-/// A parsed query: whitespace-separated terms that must all appear in the name.
+/// A parsed query: whitespace-separated terms that must all appear in the name, or in
+/// the names of the folders above it (see [`Query::partial`]), plus an optional
+/// `ext:pdf,docx` filter.
 pub struct Query {
     terms: Vec<Finder<'static>>,
-    needle_len: usize,
     /// All terms are ASCII, so names can be compared in their stored lowercased form.
     ascii: bool,
     /// Term used to scan the name buffer: the longest, as it produces the fewest hits.
@@ -29,7 +30,15 @@ pub struct Query {
     /// Leave entries in system, app-data and program folders out of the hits and the
     /// match count, and count them in `hidden_matches` instead.
     hide_system: bool,
+    /// Lowercased extensions without the dot; empty means any.
+    extensions: Vec<Vec<u8>>,
+    /// Several terms, so a term the name lacks may be found in a parent folder's name
+    /// instead (`acme contract` finds `Clients\Acme\Contract.pdf`). Term masks are a
+    /// `u8`, which caps this at [`MAX_PARTIAL_TERMS`].
+    partial: bool,
 }
+
+const MAX_PARTIAL_TERMS: usize = 8;
 
 impl Query {
     /// Whether to hide entries in system, app-data and program folders (the `Noisy` and
@@ -40,39 +49,92 @@ impl Query {
     }
 
     pub fn parse(input: &str) -> Option<Self> {
-        let terms: Vec<Finder<'static>> = input
-            .split_whitespace()
-            .map(|t| Finder::new(t.to_lowercase().as_bytes()).into_owned())
-            .collect();
-        if terms.is_empty() {
-            return None;
+        let mut extensions: Vec<Vec<u8>> = Vec::new();
+        let mut words: Vec<String> = Vec::new();
+        for word in input.split_whitespace() {
+            let lower = word.to_lowercase();
+            match lower.strip_prefix("ext:") {
+                Some(list) => extensions.extend(
+                    list.split(',')
+                        .map(|e| e.trim_start_matches('.'))
+                        .filter(|e| !e.is_empty())
+                        .map(|e| e.as_bytes().to_vec()),
+                ),
+                None => words.push(lower),
+            }
         }
-        let needle_len = terms.iter().map(|f| f.needle().len()).sum();
+        if words.is_empty() {
+            // An extension filter alone lists every file of that type.
+            match extensions.as_slice() {
+                [] => return None,
+                [only] => words.push(format!(".{}", String::from_utf8_lossy(only))),
+                _ => words.push(".".into()),
+            }
+        }
+        let terms: Vec<Finder<'static>> = words
+            .iter()
+            .map(|t| Finder::new(t.as_bytes()).into_owned())
+            .collect();
         let ascii = terms.iter().all(|t| t.needle().is_ascii());
         let scan_term = (0..terms.len())
             .max_by_key(|&i| terms[i].needle().len())
             .unwrap_or(0);
+        let partial = (2..=MAX_PARTIAL_TERMS).contains(&terms.len());
         Some(Self {
             terms,
-            needle_len,
             ascii,
             scan_term,
             hide_system: false,
+            extensions,
+            partial,
         })
     }
 
-    /// True when every name matching `self` also matches a query made of `previous`
-    /// terms: each previous term is contained in one of ours.
-    fn narrows(&self, previous: &[Vec<u8>]) -> bool {
-        previous.iter().all(|old| {
-            self.terms
-                .iter()
-                .any(|new| memmem::find(new.needle(), old).is_some())
-        })
+    /// Mask with one bit per term.
+    fn full_mask(&self) -> u8 {
+        if self.partial {
+            ((1u16 << self.terms.len()) - 1) as u8
+        } else {
+            1
+        }
+    }
+
+    /// True when every name `self` can match was among the names the `previous` query
+    /// matched (see [`Session`]).
+    fn narrows(&self, previous: &LastSearch) -> bool {
+        if previous.extensions != self.extensions {
+            return false;
+        }
+        let old_terms = &previous.terms;
+        if self.partial {
+            // A name may match just one of our terms, so each of our terms must imply
+            // one of the old ones, and the old query must have kept partial matches
+            // too (or had a single term).
+            old_terms.len() <= MAX_PARTIAL_TERMS
+                && self.terms.iter().all(|new| {
+                    old_terms
+                        .iter()
+                        .any(|old| memmem::find(new.needle(), old).is_some())
+                })
+        } else {
+            // A name matches all our terms, so it contains every old term.
+            old_terms.iter().all(|old| {
+                self.terms
+                    .iter()
+                    .any(|new| memmem::find(new.needle(), old).is_some())
+            })
+        }
     }
 
     fn term_bytes(&self) -> Vec<Vec<u8>> {
         self.terms.iter().map(|t| t.needle().to_vec()).collect()
+    }
+
+    /// Whether the lowercased name passes the `ext:` filter.
+    fn extension_ok(&self, lower: &[u8]) -> bool {
+        self.extensions.is_empty()
+            || memchr::memrchr(b'.', lower)
+                .is_some_and(|dot| self.extensions.iter().any(|e| e[..] == lower[dot + 1..]))
     }
 }
 
@@ -80,6 +142,17 @@ impl Query {
 pub struct Hit {
     pub entry: u32,
     pub score: i32,
+    /// Folder depth, the first tie-breaker: of equal matches, the less buried one wins.
+    pub depth: u16,
+}
+
+/// Per-name results of pass 1.
+struct NameScores {
+    /// 0 when the name matches no term.
+    scores: Vec<u8>,
+    /// Which terms each name matched, for queries with [`Query::partial`]; empty
+    /// otherwise, where a non-zero score means every term matched.
+    masks: Vec<u8>,
 }
 
 pub struct SearchResult {
@@ -118,10 +191,10 @@ pub fn search_filtered(
     filter: Option<Filter<'_>>,
 ) -> SearchResult {
     let scores = score_names(index.names(), query, None);
-    let result = if collect_matches(&scores, None, false).0 == 0 {
+    let result = if collect_matches(&scores.scores, None, false).0 == 0 {
         SearchResult::empty()
     } else {
-        rank(index, &scores, limit, filter, query.hide_system)
+        rank(index, &scores, query, limit, filter)
     };
     add_acronyms(index, query, limit, filter, result)
 }
@@ -164,12 +237,16 @@ fn add_acronyms(
     let scores: Vec<u8> = (0..names.len() as u32)
         .into_par_iter()
         .with_min_len(1 << 14)
-        .map(|id| acronym_score(names, id, word))
+        .map(|id| acronym_score(names, id, word, query))
         .collect();
     if !scores.iter().any(|&s| s != 0) {
         return found;
     }
-    let extra = rank(index, &scores, limit, filter, query.hide_system);
+    let scores = NameScores {
+        scores,
+        masks: Vec::new(),
+    };
+    let extra = rank(index, &scores, query, limit, filter);
     if extra.total_matches == 0 && extra.hidden_matches == 0 {
         return found;
     }
@@ -185,7 +262,12 @@ fn add_acronyms(
             hits.push(hit);
         }
     }
-    hits.sort_unstable_by(|a, b| b.score.cmp(&a.score).then(a.entry.cmp(&b.entry)));
+    hits.sort_unstable_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then(a.depth.cmp(&b.depth))
+            .then(a.entry.cmp(&b.entry))
+    });
     hits.truncate(limit);
     SearchResult {
         hits,
@@ -196,9 +278,9 @@ fn add_acronyms(
 
 /// [`ACRONYM`] (adjusted for the file type) when the word initials of the name, without
 /// its extension, are exactly `word`; 0 otherwise.
-fn acronym_score(names: &NameTable, id: u32, word: &[u8]) -> u8 {
+fn acronym_score(names: &NameTable, id: u32, word: &[u8], query: &Query) -> u8 {
     let folded = names.folded(id);
-    if folded.first() != word.first() {
+    if folded.first() != word.first() || !query.extension_ok(folded) {
         return 0;
     }
     let start = names.range(id).start;
@@ -280,6 +362,7 @@ pub struct Session {
 struct LastSearch {
     generation: u64,
     terms: Vec<Vec<u8>>,
+    extensions: Vec<Vec<u8>>,
     /// `None` when the last query matched too many names for narrowing to pay off.
     matched_names: Option<Vec<u32>>,
 }
@@ -309,18 +392,19 @@ impl Session {
         let candidates = self
             .last
             .as_ref()
-            .filter(|last| last.generation == index.generation() && query.narrows(&last.terms))
+            .filter(|last| last.generation == index.generation() && query.narrows(last))
             .and_then(|last| last.matched_names.as_deref());
         let scores = score_names(index.names(), query, candidates);
-        let (matched, stored) = collect_matches(&scores, candidates, true);
+        let (matched, stored) = collect_matches(&scores.scores, candidates, true);
         let result = if matched == 0 {
             SearchResult::empty()
         } else {
-            rank(index, &scores, limit, filter, query.hide_system)
+            rank(index, &scores, query, limit, filter)
         };
         self.last = Some(LastSearch {
             generation: index.generation(),
             terms: query.term_bytes(),
+            extensions: query.extensions.clone(),
             matched_names: stored,
         });
         add_acronyms(index, query, limit, filter, result)
@@ -333,10 +417,17 @@ const EXACT: i32 = 100;
 const APP_STEM: i32 = 120;
 const EXACT_STEM: i32 = 90;
 const PREFIX: i32 = 70;
-const WORD_START: i32 = 50;
+/// Close to a prefix: document names often lead with a date or "Copy of".
+const WORD_START: i32 = 56;
 const SUBSTRING: i32 = 30;
+/// What a term found only in a parent folder's name counts for: less than any match
+/// in the name itself.
+const FOLDER_TERM: i32 = 20;
+/// Name score ceiling of Start Menu filler such as `Readme.lnk` or `Acme Website.url`,
+/// so the Start Menu boost does not lift them above the user's own files.
+const GENERIC_SHORTCUT: i32 = 20;
 
-/// Extensions the user launches: programs and shortcuts.
+/// Extensions the user launches: programs, shortcuts and system tools.
 const LAUNCHABLE: &[&[u8]] = &[
     b"exe",
     b"com",
@@ -346,19 +437,59 @@ const LAUNCHABLE: &[&[u8]] = &[
     b"lnk",
     b"url",
     b"appref-ms",
+    b"msc",
+    b"cpl",
 ];
 
-/// Documents a consumer user opens: office files, PDFs, notes, e-books and archives.
+/// Documents a consumer user opens: office files, PDFs, notes, e-mail, e-books and
+/// archives.
 const DOCUMENTS: &[&[u8]] = &[
-    b"pdf", b"doc", b"docx", b"odt", b"rtf", b"txt", b"md", b"xls", b"xlsx", b"ods", b"csv",
-    b"ppt", b"pptx", b"odp", b"key", b"pages", b"numbers", b"epub", b"mobi", b"zip", b"rar", b"7z",
+    b"pdf", b"doc", b"docx", b"docm", b"odt", b"rtf", b"txt", b"md", b"xls", b"xlsx", b"xlsm",
+    b"ods", b"csv", b"ppt", b"pptx", b"odp", b"one", b"vsdx", b"pub", b"msg", b"eml", b"epub",
+    b"mobi", b"zip", b"rar", b"7z",
 ];
 
 /// Photos, video and audio: just under documents.
 const MEDIA: &[&[u8]] = &[
-    b"jpg", b"jpeg", b"png", b"gif", b"bmp", b"webp", b"heic", b"tif", b"tiff", b"svg", b"mp4",
-    b"mkv", b"mov", b"avi", b"webm", b"wmv", b"mp3", b"wav", b"flac", b"m4a", b"aac", b"ogg",
+    b"jpg", b"jpeg", b"png", b"gif", b"bmp", b"webp", b"heic", b"avif", b"tif", b"tiff", b"svg",
+    b"psd", b"dng", b"cr2", b"cr3", b"nef", b"arw", b"mp4", b"m4v", b"mkv", b"mov", b"avi",
+    b"webm", b"wmv", b"mp3", b"wav", b"flac", b"m4a", b"aac", b"ogg", b"wma", b"opus",
 ];
+
+/// Shortcut names (without extension) that vendors put next to the app's own
+/// shortcut, alone or after the app name (`Acme Help`).
+const GENERIC_SHORTCUTS: &[&[u8]] = &[
+    b"readme",
+    b"read me",
+    b"help",
+    b"online help",
+    b"manual",
+    b"user manual",
+    b"user guide",
+    b"documentation",
+    b"license",
+    b"license agreement",
+    b"eula",
+    b"website",
+    b"web site",
+    b"home page",
+    b"homepage",
+    b"on the web",
+    b"release notes",
+    b"changelog",
+    b"what's new",
+    b"faq",
+    b"support",
+];
+
+fn is_generic_shortcut(stem: &[u8]) -> bool {
+    GENERIC_SHORTCUTS.iter().any(|g| {
+        stem == *g
+            || (stem.len() > g.len() + 1
+                && stem.ends_with(g)
+                && stem[stem.len() - g.len() - 1] == b' ')
+    })
+}
 
 /// Source and configuration files a developer wrote: shown, but after everything a
 /// regular user is likelier to want.
@@ -418,42 +549,108 @@ const DEMOTED: &[&[u8]] = &[
 /// Pass 2: turns per-name scores into the best entries.
 fn rank(
     index: &Index,
-    name_scores: &[u8],
+    names: &NameScores,
+    query: &Query,
     limit: usize,
     filter: Option<Filter<'_>>,
-    hide_system: bool,
 ) -> SearchResult {
     const CHUNK: usize = 1 << 14;
     let name_ids = index.name_ids();
     let entry_flags = index.flags();
+    let full = query.full_mask();
+    let masks = &names.masks;
     let top = name_ids
         .par_chunks(CHUNK)
         .zip(entry_flags.par_chunks(CHUNK))
         .enumerate()
         .fold(
-            || TopK::new(limit),
-            |mut top, (chunk, (ids, fl))| {
+            || (TopK::new(limit), FolderCache::new()),
+            |(mut top, mut folders), (chunk, (ids, fl))| {
                 let base = (chunk * CHUNK) as u32;
                 for (k, (&name_id, &f)) in ids.iter().zip(fl).enumerate() {
-                    let name_score = name_scores[name_id as usize];
-                    if name_score != 0 && f & flags::DELETED == 0 {
-                        let entry = base + k as u32;
-                        // Volume roots ("C:") are not useful results.
-                        if index.parent(entry).is_some() && filter.is_none_or(|f| f(entry)) {
-                            if hide_system && is_system(f) {
-                                top.hidden += 1;
-                            } else {
-                                top.push(final_score(name_score, f), entry);
-                            }
+                    let name_score = names.scores[name_id as usize];
+                    if name_score == 0 || f & flags::DELETED != 0 {
+                        continue;
+                    }
+                    let entry = base + k as u32;
+                    // Volume roots ("C:") are not useful results.
+                    let Some(parent) = index.parent(entry) else {
+                        continue;
+                    };
+                    // Terms missing from the name must appear in the folders above it.
+                    if !masks.is_empty() {
+                        let mask = masks[name_id as usize];
+                        if mask != full && mask | folders.get(index, masks, parent).mask != full {
+                            continue;
+                        }
+                    }
+                    if filter.is_none_or(|f| f(entry)) {
+                        if query.hide_system && is_system(f) {
+                            top.hidden += 1;
+                        } else {
+                            top.push(final_score(name_score, f), entry, || {
+                                folders.get(index, masks, parent).depth.saturating_add(1)
+                            });
                         }
                     }
                 }
-                top
+                (top, folders)
             },
         )
+        .map(|(top, _)| top)
         .reduce(|| TopK::new(limit), TopK::merge);
     dedupe_shortcuts(index, top.into_result())
 }
+
+#[derive(Clone, Copy)]
+struct FolderInfo {
+    /// Terms matched by the folder or any folder above it, the volume root excepted
+    /// (or "c" would match every folder on drive C:).
+    mask: u8,
+    /// Number of folders above it.
+    depth: u16,
+}
+
+/// Remembers [`FolderInfo`] of recently seen folders. Entries of one folder are mostly
+/// stored next to each other, so most lookups skip the walk up to the root.
+struct FolderCache {
+    slots: Vec<(u32, FolderInfo)>,
+}
+
+impl FolderCache {
+    const SLOTS: usize = 4096;
+
+    fn new() -> Self {
+        Self {
+            slots: vec![(NO_FOLDER, FolderInfo { mask: 0, depth: 0 }); Self::SLOTS],
+        }
+    }
+
+    fn get(&mut self, index: &Index, masks: &[u8], folder: u32) -> FolderInfo {
+        let slot = (folder.wrapping_mul(0x9E37_79B1) >> 20) as usize % Self::SLOTS;
+        if self.slots[slot].0 == folder {
+            return self.slots[slot].1;
+        }
+        let name_ids = index.name_ids();
+        let mut info = FolderInfo { mask: 0, depth: 0 };
+        let mut current = folder;
+        while let Some(up) = index.parent(current)
+            && info.depth < MAX_FOLDER_DEPTH
+        {
+            if !masks.is_empty() {
+                info.mask |= masks[name_ids[current as usize] as usize];
+            }
+            info.depth += 1;
+            current = up;
+        }
+        self.slots[slot] = (folder, info);
+        info
+    }
+}
+
+const NO_FOLDER: u32 = u32::MAX;
+/// Same bound the index uses for parent chains.
+const MAX_FOLDER_DEPTH: u16 = 512;
 
 /// The same app often has a Start Menu shortcut for all users and another for the
 /// current user. Only the better-ranked one is listed.
@@ -479,44 +676,85 @@ fn dedupe_shortcuts(index: &Index, mut result: SearchResult) -> SearchResult {
 
 /// Pass 1: one score per unique name; 0 means no match. With `candidates`, only those
 /// names are checked and all others score 0.
-fn score_names(names: &NameTable, query: &Query, candidates: Option<&[u32]>) -> Vec<u8> {
+fn score_names(names: &NameTable, query: &Query, candidates: Option<&[u32]>) -> NameScores {
     let mut scores = vec![0u8; names.len()];
+    let mut masks = if query.partial {
+        vec![0u8; names.len()]
+    } else {
+        Vec::new()
+    };
     if let Some(candidates) = candidates {
-        let scored: Vec<(u32, u8)> = candidates
+        let scored: Vec<(u32, (u8, u8))> = candidates
             .par_iter()
             .with_min_len(4096)
             .map_init(Vec::new, |buf, &id| (id, score_name(names, id, buf, query)))
             .collect();
-        for (id, score) in scored {
+        for (id, (score, mask)) in scored {
             scores[id as usize] = score;
+            if let Some(m) = masks.get_mut(id as usize) {
+                *m = mask;
+            }
         }
-        return scores;
+        return NameScores { scores, masks };
     }
 
     const NAMES_PER_CHUNK: usize = 1 << 14;
-    scores
-        .par_chunks_mut(NAMES_PER_CHUNK)
-        .enumerate()
-        .for_each_init(Vec::new, |buf, (chunk, out)| {
-            let first = chunk * NAMES_PER_CHUNK;
-            if query.ascii {
-                scan_chunk(names, first, out, query, buf);
+    let score_chunk = |buf: &mut Vec<u8>, chunk: usize, out: &mut [u8], mask_out: &mut [u8]| {
+        let first = chunk * NAMES_PER_CHUNK;
+        if query.ascii {
+            if query.partial {
+                // A name may hold any one of the terms, so each one is scanned for.
+                for finder in &query.terms {
+                    scan_chunk(names, first, out, mask_out, query, finder, buf);
+                }
             } else {
-                for (k, score) in out.iter_mut().enumerate() {
-                    *score = score_name(names, (first + k) as u32, buf, query);
+                let finder = &query.terms[query.scan_term];
+                scan_chunk(names, first, out, mask_out, query, finder, buf);
+            }
+        } else {
+            for (k, score) in out.iter_mut().enumerate() {
+                let (s, m) = score_name(names, (first + k) as u32, buf, query);
+                *score = s;
+                if let Some(slot) = mask_out.get_mut(k) {
+                    *slot = m;
                 }
             }
-        });
-    scores
+        }
+    };
+    if query.partial {
+        scores
+            .par_chunks_mut(NAMES_PER_CHUNK)
+            .zip(masks.par_chunks_mut(NAMES_PER_CHUNK))
+            .enumerate()
+            .for_each_init(Vec::new, |buf, (chunk, (out, mask_out))| {
+                score_chunk(buf, chunk, out, mask_out)
+            });
+    } else {
+        scores
+            .par_chunks_mut(NAMES_PER_CHUNK)
+            .enumerate()
+            .for_each_init(Vec::new, |buf, (chunk, out)| {
+                score_chunk(buf, chunk, out, &mut [])
+            });
+    }
+    NameScores { scores, masks }
 }
 
 /// Scans `out.len()` consecutive names starting at `first` as one block of bytes and
-/// scores only the names that contain the scan term.
-fn scan_chunk(names: &NameTable, first: usize, out: &mut [u8], query: &Query, buf: &mut Vec<u8>) {
+/// scores the names that contain `finder` and are not scored yet. `masks` is empty
+/// unless the query keeps partial matches.
+fn scan_chunk(
+    names: &NameTable,
+    first: usize,
+    out: &mut [u8],
+    masks: &mut [u8],
+    query: &Query,
+    finder: &Finder<'_>,
+    buf: &mut Vec<u8>,
+) {
     let offsets = &names.offsets()[first..=first + out.len()];
     let base = offsets[0] as usize;
     let hay = &names.folded_buffer()[base..offsets[out.len()] as usize];
-    let finder = &query.terms[query.scan_term];
     let needle_len = finder.needle().len();
     let mut local = 0usize;
     let mut pos = 0usize;
@@ -530,7 +768,14 @@ fn scan_chunk(names: &NameTable, first: usize, out: &mut [u8], query: &Query, bu
         }
         let name_end = offsets[local + 1] as usize - base;
         if p + needle_len <= name_end {
-            out[local] = score_name(names, (first + local) as u32, buf, query);
+            // Every scored name has a non-zero score, so 0 means "not yet".
+            if out[local] == 0 {
+                let (score, mask) = score_name(names, (first + local) as u32, buf, query);
+                out[local] = score;
+                if let Some(slot) = masks.get_mut(local) {
+                    *slot = mask;
+                }
+            }
             pos = name_end;
         } else {
             // The hit runs into the next name.
@@ -574,52 +819,56 @@ fn final_score(name_score: u8, entry_flags: u8) -> i32 {
     score
 }
 
-/// Scores one name against the query. Returns 0 when it does not match.
-fn score_name(names: &NameTable, id: u32, buf: &mut Vec<u8>, query: &Query) -> u8 {
+/// Scores one name against the query: the score (0 when it does not match) and which
+/// terms it matched. Without [`Query::partial`], a match needs every term.
+fn score_name(names: &NameTable, id: u32, buf: &mut Vec<u8>, query: &Query) -> (u8, u8) {
+    let ascii = query.ascii;
+    let lower: &[u8] = if ascii {
+        names.folded(id)
+    } else {
+        // Non-ASCII query: full Unicode lowercasing, which can change byte lengths, so
+        // the lowercased copy is used for matching and word starts (camelCase is not
+        // detected).
+        buf.clear();
+        buf.extend_from_slice(names.get(id).to_lowercase().as_bytes());
+        buf
+    };
+    if !query.extension_ok(lower) {
+        return (0, 0);
+    }
+    let start = names.range(id).start;
+    let upper = |i: usize| ascii && names.is_upper(start + i);
     let mut total = 0;
-    if query.ascii {
-        let folded = names.folded(id);
-        let start = names.range(id).start;
-        let upper = |i: usize| names.is_upper(start + i);
-        for term in &query.terms {
-            let needle = term.needle();
-            let mut best = 0;
-            if needle.len() <= folded.len() {
-                for pos in memchr::memchr_iter(needle[0], &folded[..=folded.len() - needle.len()]) {
-                    if &folded[pos..pos + needle.len()] == needle {
-                        best = best.max(classify(folded, pos, needle.len(), upper));
-                        if best >= PREFIX {
-                            break;
-                        }
+    let mut mask = 0u8;
+    let mut matched_len = 0;
+    for (i, term) in query.terms.iter().enumerate() {
+        let needle = term.needle();
+        let mut best = 0;
+        if needle.len() <= lower.len() {
+            for pos in memchr::memchr_iter(needle[0], &lower[..=lower.len() - needle.len()]) {
+                if &lower[pos..pos + needle.len()] == needle {
+                    best = best.max(classify(lower, pos, needle.len(), upper));
+                    if best >= PREFIX {
+                        break;
                     }
                 }
             }
-            if best == 0 {
-                return 0;
-            }
-            total += best;
-        }
-        return finish_score(total, folded, query);
-    }
-
-    // Non-ASCII query: full Unicode lowercasing, which can change byte lengths, so the
-    // lowercased copy is used for matching and word starts (camelCase is not detected).
-    buf.clear();
-    buf.extend_from_slice(names.get(id).to_lowercase().as_bytes());
-    for term in &query.terms {
-        let mut best = 0;
-        for pos in term.find_iter(buf) {
-            best = best.max(classify(buf, pos, term.needle().len(), |_| false));
-            if best >= PREFIX {
-                break;
-            }
         }
         if best == 0 {
-            return 0;
+            if !query.partial {
+                return (0, 0);
+            }
+            total += FOLDER_TERM;
+        } else {
+            total += best;
+            mask |= 1 << i;
+            matched_len += needle.len();
         }
-        total += best;
     }
-    finish_score(total, buf, query)
+    if mask == 0 {
+        return (0, 0);
+    }
+    (finish_score(total, lower, query, matched_len), mask)
 }
 
 /// `lower` is the lowercased name; `upper(i)` tells whether byte `i` was uppercase.
@@ -640,8 +889,9 @@ fn classify(lower: &[u8], pos: usize, needle_len: usize, upper: impl Fn(usize) -
     if word_start { WORD_START } else { SUBSTRING }
 }
 
-/// Turns summed term scores into the final name score. `lower` is the lowercased name.
-fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
+/// Turns summed term scores into the final name score. `lower` is the lowercased name
+/// and `matched_len` the length of the terms found in it.
+fn finish_score(total: i32, lower: &[u8], query: &Query, matched_len: usize) -> u8 {
     let mut score = total / query.terms.len() as i32;
 
     // The name is exactly the query plus a single extension (`factory.exe`, `notes.txt`).
@@ -656,14 +906,18 @@ fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
         }
         _ => None,
     };
+    let dot = memchr::memrchr(b'.', lower);
+    let extension = dot.map(|d| &lower[d + 1..]);
 
     match stem_extension {
         // A launchable file named exactly after the query is the app the user meant.
         Some(extension) if LAUNCHABLE.contains(&extension) => score = APP_STEM,
+        // `notes.log` is not what someone typing "notes" wants, so it gets no exact
+        // bonus (that starts at EXACT_STEM) and stays below documents.
+        Some(extension) if DEMOTED.contains(&extension) => score = PREFIX - 10,
         Some(extension) => score = EXACT_STEM + kind_bonus(extension).max(0),
         None => {
-            if let Some(dot) = memchr::memrchr(b'.', lower) {
-                let extension = &lower[dot + 1..];
+            if let Some(extension) = extension {
                 if LAUNCHABLE.contains(&extension) {
                     // An installer is run once, so it should not outrank the program.
                     if extension == b"msi" || looks_like_installer(lower) {
@@ -680,10 +934,23 @@ fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
         }
     }
 
-    // The extension of an exact stem match is not extra text.
+    // The extension of an exact stem match is not extra text. Document and media
+    // names are often long and descriptive, so their length costs less.
     if stem_extension.is_none() {
-        let extra = lower.len().saturating_sub(query.needle_len);
-        score -= (extra / 4).min(15) as i32;
+        let extra = lower.len().saturating_sub(matched_len);
+        let gentle = extension.is_some_and(|e| DOCUMENTS.contains(&e) || MEDIA.contains(&e));
+        score -= if gentle {
+            (extra / 8).min(8)
+        } else {
+            (extra / 4).min(15)
+        } as i32;
+    }
+
+    if let (Some(d), Some(extension)) = (dot, extension)
+        && (extension == b"lnk" || extension == b"url")
+        && is_generic_shortcut(&lower[..d])
+    {
+        score = score.min(GENERIC_SHORTCUT);
     }
     score.clamp(1, 255) as u8
 }
@@ -694,11 +961,14 @@ fn looks_like_installer(lower: &[u8]) -> bool {
         .any(|word| memmem::find(lower, word.as_bytes()).is_some())
 }
 
-/// Keeps the `limit` best hits. Ties go to the lower entry index so results are
-/// deterministic regardless of how work is split across threads.
+/// (score, shallower first, lower entry first): higher is better.
+type Ranked = (i32, Reverse<u16>, Reverse<u32>);
+
+/// Keeps the `limit` best hits. Ties go to the shallower entry, then the lower entry
+/// index, so results are deterministic regardless of how work is split across threads.
 struct TopK {
     limit: usize,
-    heap: BinaryHeap<Reverse<(i32, Reverse<u32>)>>,
+    heap: BinaryHeap<Reverse<Ranked>>,
     total: usize,
     hidden: usize,
 }
@@ -713,12 +983,21 @@ impl TopK {
         }
     }
 
-    fn push(&mut self, score: i32, entry: u32) {
+    /// `depth` walks the parents, so it is only called for hits that can still place.
+    fn push(&mut self, score: i32, entry: u32, depth: impl FnOnce() -> u16) {
         self.total += 1;
-        self.offer((score, Reverse(entry)));
+        if self.heap.len() >= self.limit
+            && self
+                .heap
+                .peek()
+                .is_none_or(|Reverse(worst)| score < worst.0)
+        {
+            return;
+        }
+        self.offer((score, Reverse(depth()), Reverse(entry)));
     }
 
-    fn offer(&mut self, item: (i32, Reverse<u32>)) {
+    fn offer(&mut self, item: Ranked) {
         if self.heap.len() < self.limit {
             self.heap.push(Reverse(item));
         } else if let Some(Reverse(worst)) = self.heap.peek()
@@ -744,7 +1023,11 @@ impl TopK {
         SearchResult {
             hits: items
                 .into_iter()
-                .map(|(score, Reverse(entry))| Hit { entry, score })
+                .map(|(score, Reverse(depth), Reverse(entry))| Hit {
+                    entry,
+                    score,
+                    depth,
+                })
                 .collect(),
             total_matches: self.total,
             hidden_matches: self.hidden,
@@ -793,11 +1076,12 @@ mod tests {
             .collect()
     }
 
-    fn naive_scores(names: &NameTable, query: &Query) -> Vec<u8> {
+    fn naive_scores(names: &NameTable, query: &Query) -> (Vec<u8>, Vec<u8>) {
         let mut buf = Vec::new();
-        (0..names.len() as u32)
+        let (scores, masks): (Vec<u8>, Vec<u8>) = (0..names.len() as u32)
             .map(|id| score_name(names, id, &mut buf, query))
-            .collect()
+            .unzip();
+        (scores, if query.partial { masks } else { Vec::new() })
     }
 
     #[test]
@@ -1165,11 +1449,24 @@ mod tests {
     fn buffer_scan_agrees_with_scoring_every_name() {
         let index = mixed_index();
         for text in [
-            "e", "rep", "PHOTO", "x data", "qz", ".txt", "tx", "otes2", "zzz", "ée",
+            "e",
+            "rep",
+            "PHOTO",
+            "x data",
+            "qz",
+            ".txt",
+            "tx",
+            "otes2",
+            "zzz",
+            "ée",
+            "f1 ée",
+            "ext:txt",
+            "note ext:txt,md",
         ] {
             let q = Query::parse(text).unwrap();
+            let scanned = score_names(index.names(), &q, None);
             assert_eq!(
-                score_names(index.names(), &q, None),
+                (scanned.scores, scanned.masks),
                 naive_scores(index.names(), &q),
                 "query {text:?}"
             );
@@ -1251,11 +1548,132 @@ mod tests {
 
     #[test]
     fn narrowing_rule() {
+        let last = |terms: &[&str], extensions: &[&str]| LastSearch {
+            generation: 0,
+            terms: terms.iter().map(|t| t.as_bytes().to_vec()).collect(),
+            extensions: extensions.iter().map(|e| e.as_bytes().to_vec()).collect(),
+            matched_names: None,
+        };
+        let q = Query::parse("report").unwrap();
+        assert!(q.narrows(&last(&["rep"], &[])));
+        assert!(!q.narrows(&last(&["reports"], &[])));
+        assert!(!q.narrows(&last(&["rep"], &["pdf"])));
+        // Several terms keep names that match only some of them, so each new term
+        // must imply an old one.
         let q = Query::parse("report 2024").unwrap();
-        assert!(q.narrows(&[b"rep".to_vec()]));
-        assert!(q.narrows(&[b"202".to_vec(), b"port".to_vec()]));
-        assert!(!q.narrows(&[b"reports".to_vec()]));
-        assert!(!q.narrows(&[b"x".to_vec()]));
+        assert!(q.narrows(&last(&["rep", "202"], &[])));
+        assert!(q.narrows(&last(&["202", "port"], &[])));
+        assert!(!q.narrows(&last(&["rep"], &[])));
+        assert!(!q.narrows(&last(&["x"], &[])));
+        let q = Query::parse("report ext:pdf").unwrap();
+        assert!(q.narrows(&last(&["rep"], &["pdf"])));
+        assert!(!q.narrows(&last(&["rep"], &[])));
+    }
+
+    #[test]
+    fn missing_terms_may_match_parent_folders() {
+        let index = index_of(&[
+            "Users\\bob\\Documents\\Clients\\Acme\\Contract.pdf",
+            "Users\\bob\\Documents\\Clients\\Other\\Contract.pdf",
+            "Users\\bob\\Documents\\Acme Contract.pdf",
+        ]);
+        let found = paths(&index, "acme contract", 10);
+        assert_eq!(
+            found,
+            vec![
+                "T:\\Users\\bob\\Documents\\Acme Contract.pdf",
+                "T:\\Users\\bob\\Documents\\Clients\\Acme\\Contract.pdf",
+            ]
+        );
+        // Every term must still be found, and the volume root does not count.
+        assert!(paths(&index, "zebra contract", 10).is_empty());
+        assert!(paths(&index, "t: contract", 10).is_empty());
+        // A term matching only folders does not list the folder's whole contents.
+        assert!(
+            paths(&index, "acme clients", 10)
+                .iter()
+                .all(|p| p.ends_with("Acme"))
+        );
+        // Typing narrows the same way as a fresh search.
+        let mut session = Session::new();
+        for text in [
+            "a",
+            "ac",
+            "acme",
+            "acme c",
+            "acme co",
+            "acme contract",
+            "acme",
+        ] {
+            let q = Query::parse(text).unwrap();
+            let narrowed = session.search(&index, &q, 10);
+            let fresh = search(&index, &q, 10);
+            assert_eq!(narrowed.hits, fresh.hits, "query {text:?}");
+            assert_eq!(
+                narrowed.total_matches, fresh.total_matches,
+                "query {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extension_filter() {
+        let index = index_of(&[
+            "d\\budget.xlsx",
+            "d\\budget.pdf",
+            "d\\budget.docx",
+            "d\\report.pdf",
+        ]);
+        assert_eq!(
+            paths(&index, "budget ext:pdf", 10),
+            vec!["T:\\d\\budget.pdf"]
+        );
+        let mut found = paths(&index, "EXT:.pdf", 10);
+        found.sort();
+        assert_eq!(found, vec!["T:\\d\\budget.pdf", "T:\\d\\report.pdf"]);
+        assert_eq!(paths(&index, "budget ext:xlsx,docx", 10).len(), 2);
+        assert!(Query::parse("ext:").is_none());
+    }
+
+    #[test]
+    fn runtime_files_named_like_the_query_stay_below_documents() {
+        let index = index_of(&[
+            "Users\\bob\\Documents\\notes.log",
+            "Users\\bob\\Documents\\server.pem",
+            "Users\\bob\\Documents\\Notes 2024 meeting.docx",
+            "Users\\bob\\Documents\\server notes.docx",
+        ]);
+        assert!(paths(&index, "notes", 10)[0].ends_with("Notes 2024 meeting.docx"));
+        assert!(paths(&index, "server", 10)[0].ends_with("server notes.docx"));
+    }
+
+    #[test]
+    fn generic_start_menu_shortcuts_stay_below_user_files() {
+        let menu = "Users\\bob\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs";
+        let index = index_of(&[
+            &format!("{menu}\\Acme\\Readme.lnk"),
+            &format!("{menu}\\Acme\\Acme Website.url"),
+            &format!("{menu}\\Acme\\Acme.lnk"),
+            "Users\\bob\\Documents\\readme for taxes.txt",
+            "Users\\bob\\Documents\\acme website notes.txt",
+        ]);
+        assert!(paths(&index, "readme", 10)[0].ends_with("readme for taxes.txt"));
+        let found = paths(&index, "acme", 10);
+        assert!(found[0].ends_with("Acme.lnk"), "{found:?}");
+        assert!(paths(&index, "acme website", 10)[0].ends_with("notes.txt"));
+    }
+
+    #[test]
+    fn equal_matches_prefer_shallower_paths() {
+        let index = index_of(&["a\\b\\c\\d\\lib.rs", "x\\lib.rs", "a\\b\\lib.rs"]);
+        assert_eq!(
+            paths(&index, "lib.rs", 10),
+            vec![
+                "T:\\x\\lib.rs",
+                "T:\\a\\b\\lib.rs",
+                "T:\\a\\b\\c\\d\\lib.rs"
+            ]
+        );
     }
 
     #[test]
