@@ -336,6 +336,7 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
     let Some(query) = Query::parse(&req.query) else {
         return Reply::status(Status::Ok);
     };
+    let query = query.hiding_system(!req.include_system);
     engine.touch();
     let t = Instant::now();
     state.refresh_profile_folders(engine);
@@ -356,6 +357,7 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
         .collect();
     drop(index);
     let mut total = result.total_matches;
+    let mut hidden = result.hidden_matches;
     if let Some(removable) = state.removable.get() {
         let volumes = removable.indexes();
         if !volumes.is_empty() {
@@ -364,7 +366,7 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
                 &query,
                 viewer,
                 usize::from(req.limit),
-                &mut total,
+                (&mut total, &mut hidden),
                 &mut hits,
             );
             // Stable ties keep the NTFS order before entries from removable drives.
@@ -375,6 +377,7 @@ fn answer(state: &State, session: &mut Session, viewer: &Viewer, req: &Request) 
     Reply {
         status: Status::Ok,
         total_matches: u32::try_from(total).unwrap_or(u32::MAX),
+        hidden_matches: u32::try_from(hidden).unwrap_or(u32::MAX),
         search_micros: u32::try_from(t.elapsed().as_micros()).unwrap_or(u32::MAX),
         hits,
     }
@@ -385,7 +388,7 @@ fn merge_removable(
     query: &Query,
     viewer: &Viewer,
     limit: usize,
-    total: &mut usize,
+    (total, hidden): (&mut usize, &mut usize),
     hits: &mut Vec<Hit>,
 ) {
     for data in volumes {
@@ -395,6 +398,7 @@ fn merge_removable(
         let filter = |entry: u32| profiles.allows(&visibility, &index, entry);
         let found = bs_query::search_filtered(&index, query, limit, Some(&filter));
         *total = total.saturating_add(found.total_matches);
+        *hidden = hidden.saturating_add(found.hidden_matches);
         hits.extend(found.hits.iter().map(|hit| Hit {
             path: index.full_path(hit.entry),
             is_dir: index.is_dir(hit.entry),
@@ -428,6 +432,7 @@ mod tests {
         ));
         let query = Query::parse("needle").unwrap();
         let mut total = 0;
+        let mut hidden = 0;
         let mut hits = Vec::new();
         let alice = Viewer {
             profile: Some(r"C:\Users\alice".into()),
@@ -437,7 +442,7 @@ mod tests {
             &query,
             &alice,
             10,
-            &mut total,
+            (&mut total, &mut hidden),
             &mut hits,
         );
         assert_eq!(total, 2);
@@ -447,7 +452,15 @@ mod tests {
         data.set_profile_folders(&[]);
         total = 0;
         hits.clear();
-        merge_removable([data], &query, &alice, 10, &mut total, &mut hits);
+        merge_removable(
+            [data],
+            &query,
+            &alice,
+            10,
+            (&mut total, &mut hidden),
+            &mut hits,
+        );
         assert_eq!(total, 3);
+        assert_eq!(hidden, 0);
     }
 }

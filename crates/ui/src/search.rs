@@ -15,6 +15,7 @@ pub const LIMIT: u16 = 200;
 pub struct Request {
     pub serial: u64,
     pub text: String,
+    pub include_system: bool,
 }
 
 pub enum Outcome {
@@ -60,11 +61,11 @@ fn worker(target: isize, rx: Receiver<Request>, results: Sender<ResultMessage>) 
                 }
             }
         }
-        let outcome = match client
-            .as_mut()
-            .expect("connected above")
-            .search(&request.text, LIMIT)
-        {
+        let outcome = match client.as_mut().expect("connected above").search(
+            &request.text,
+            LIMIT,
+            request.include_system,
+        ) {
             Ok(reply) if reply.status == Status::Denied => Outcome::Denied,
             Ok(reply) => Outcome::Reply(reply),
             Err(err) => {

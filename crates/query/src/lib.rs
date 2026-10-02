@@ -26,9 +26,19 @@ pub struct Query {
     ascii: bool,
     /// Term used to scan the name buffer: the longest, as it produces the fewest hits.
     scan_term: usize,
+    /// Leave entries in system, app-data and program folders out of the hits and the
+    /// match count, and count them in `hidden_matches` instead.
+    hide_system: bool,
 }
 
 impl Query {
+    /// Whether to hide entries in system, app-data and program folders (the `Noisy` and
+    /// `AppFiles` locations). Off by default.
+    pub fn hiding_system(mut self, hide: bool) -> Self {
+        self.hide_system = hide;
+        self
+    }
+
     pub fn parse(input: &str) -> Option<Self> {
         let terms: Vec<Finder<'static>> = input
             .split_whitespace()
@@ -47,6 +57,7 @@ impl Query {
             needle_len,
             ascii,
             scan_term,
+            hide_system: false,
         })
     }
 
@@ -76,6 +87,19 @@ pub struct SearchResult {
     pub hits: Vec<Hit>,
     /// Number of entries that matched, including those not in `hits`.
     pub total_matches: usize,
+    /// Matches left out because the query hides system folders (see
+    /// [`Query::hiding_system`]). They are not part of `total_matches`.
+    pub hidden_matches: usize,
+}
+
+impl SearchResult {
+    fn empty() -> Self {
+        Self {
+            hits: Vec::new(),
+            total_matches: 0,
+            hidden_matches: 0,
+        }
+    }
 }
 
 /// Decides per entry whether it may appear in results; `false` hides it from both the
@@ -95,12 +119,9 @@ pub fn search_filtered(
 ) -> SearchResult {
     let scores = score_names(index.names(), query, None);
     let result = if collect_matches(&scores, None, false).0 == 0 {
-        SearchResult {
-            hits: Vec::new(),
-            total_matches: 0,
-        }
+        SearchResult::empty()
     } else {
-        rank(index, &scores, limit, filter)
+        rank(index, &scores, limit, filter, query.hide_system)
     };
     add_acronyms(index, query, limit, filter, result)
 }
@@ -148,8 +169,8 @@ fn add_acronyms(
     if !scores.iter().any(|&s| s != 0) {
         return found;
     }
-    let extra = rank(index, &scores, limit, filter);
-    if extra.total_matches == 0 {
+    let extra = rank(index, &scores, limit, filter, query.hide_system);
+    if extra.total_matches == 0 && extra.hidden_matches == 0 {
         return found;
     }
     let mut hits = found.hits;
@@ -169,6 +190,7 @@ fn add_acronyms(
     SearchResult {
         hits,
         total_matches: found.total_matches + extra.total_matches - duplicates,
+        hidden_matches: found.hidden_matches + extra.hidden_matches,
     }
 }
 
@@ -292,12 +314,9 @@ impl Session {
         let scores = score_names(index.names(), query, candidates);
         let (matched, stored) = collect_matches(&scores, candidates, true);
         let result = if matched == 0 {
-            SearchResult {
-                hits: Vec::new(),
-                total_matches: 0,
-            }
+            SearchResult::empty()
         } else {
-            rank(index, &scores, limit, filter)
+            rank(index, &scores, limit, filter, query.hide_system)
         };
         self.last = Some(LastSearch {
             generation: index.generation(),
@@ -357,6 +376,7 @@ fn rank(
     name_scores: &[u8],
     limit: usize,
     filter: Option<Filter<'_>>,
+    hide_system: bool,
 ) -> SearchResult {
     const CHUNK: usize = 1 << 14;
     let name_ids = index.name_ids();
@@ -375,7 +395,11 @@ fn rank(
                         let entry = base + k as u32;
                         // Volume roots ("C:") are not useful results.
                         if index.parent(entry).is_some() && filter.is_none_or(|f| f(entry)) {
-                            top.push(final_score(name_score, f), entry);
+                            if hide_system && is_system(f) {
+                                top.hidden += 1;
+                            } else {
+                                top.push(final_score(name_score, f), entry);
+                            }
                         }
                     }
                 }
@@ -446,6 +470,14 @@ fn scan_chunk(names: &NameTable, first: usize, out: &mut [u8], query: &Query, bu
             pos = p + 1;
         }
     }
+}
+
+/// Entries in system, app-data and program folders: places people rarely look in.
+fn is_system(entry_flags: u8) -> bool {
+    matches!(
+        Location::from_flags(entry_flags),
+        Location::Noisy | Location::AppFiles
+    )
 }
 
 fn final_score(name_score: u8, entry_flags: u8) -> i32 {
@@ -590,6 +622,7 @@ struct TopK {
     limit: usize,
     heap: BinaryHeap<Reverse<(i32, Reverse<u32>)>>,
     total: usize,
+    hidden: usize,
 }
 
 impl TopK {
@@ -598,6 +631,7 @@ impl TopK {
             limit,
             heap: BinaryHeap::with_capacity(limit.min(1024) + 1),
             total: 0,
+            hidden: 0,
         }
     }
 
@@ -619,6 +653,7 @@ impl TopK {
 
     fn merge(mut self, other: Self) -> Self {
         self.total += other.total;
+        self.hidden += other.hidden;
         for Reverse(item) in other.heap {
             self.offer(item);
         }
@@ -634,6 +669,7 @@ impl TopK {
                 .map(|(score, Reverse(entry))| Hit { entry, score })
                 .collect(),
             total_matches: self.total,
+            hidden_matches: self.hidden,
         }
     }
 }
@@ -826,6 +862,52 @@ mod tests {
             paths(&index, "acme setup", 10)[0],
             "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Acme Setup.lnk"
         );
+    }
+
+    #[test]
+    fn hiding_system_folders_counts_them_apart() {
+        let index = index_of(&[
+            "Users\\bob\\Documents\\notes.txt",
+            "Users\\bob\\AppData\\Local\\App\\notes.cache",
+            "Program Files\\Acme\\plugins\\data\\notes.md",
+            "work\\notes.md",
+            "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Notes.lnk",
+        ]);
+        let q = Query::parse("notes").unwrap();
+        let all = search(&index, &q, 10);
+        assert_eq!((all.total_matches, all.hidden_matches), (5, 0));
+        let q = Query::parse("notes").unwrap().hiding_system(true);
+        let shown = search(&index, &q, 10);
+        assert_eq!((shown.total_matches, shown.hidden_matches), (3, 2));
+        let found: Vec<String> = shown
+            .hits
+            .iter()
+            .map(|h| index.full_path(h.entry))
+            .collect();
+        assert!(
+            found
+                .iter()
+                .all(|p| !p.contains("AppData") && !p.contains("Acme"))
+        );
+        assert!(found.iter().any(|p| p.contains("Start Menu")));
+        // Session and fresh searches agree, including after narrowing.
+        let mut session = Session::new();
+        let q = Query::parse("note").unwrap().hiding_system(true);
+        session.search(&index, &q, 10);
+        let q = Query::parse("notes").unwrap().hiding_system(true);
+        let narrowed = session.search(&index, &q, 10);
+        assert_eq!((narrowed.total_matches, narrowed.hidden_matches), (3, 2));
+    }
+
+    #[test]
+    fn hidden_acronym_matches_are_counted_too() {
+        let index = index_of(&[
+            "Program Files\\Acme\\lib\\data\\very_serious_charts.txt",
+            "docs\\Visual Studio Code.txt",
+        ]);
+        let q = Query::parse("vsc").unwrap().hiding_system(true);
+        let result = search(&index, &q, 10);
+        assert_eq!((result.total_matches, result.hidden_matches), (1, 1));
     }
 
     #[test]

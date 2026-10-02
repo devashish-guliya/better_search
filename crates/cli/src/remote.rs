@@ -10,14 +10,18 @@ use crate::BENCH_QUERIES;
 
 pub const USAGE: &str = "\
 Usage:
-  bs query [-n COUNT] TEXT...   Search through the running better_search service.
+  bs query [-n COUNT] [--system] TEXT...
+                                Search through the running better_search service.
                                 No admin needed. Other users' profile folders are hidden.
+                                System, app-data and program folders are left out and
+                                only counted; --system includes them.
   bs query --bench              Time searches through the pipe: round trip, time spent
                                 searching in the service, and the difference (overhead).";
 
 pub fn run(args: &[String]) -> Result<(), String> {
     let mut limit: u16 = 20;
     let mut bench = false;
+    let mut include_system = false;
     let mut words = Vec::new();
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -27,6 +31,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 return Ok(());
             }
             "--bench" => bench = true,
+            "--system" => include_system = true,
             "-n" => {
                 let value = it.next().ok_or("-n needs a number")?;
                 limit = value
@@ -48,15 +53,25 @@ pub fn run(args: &[String]) -> Result<(), String> {
     let mut client = connect()?;
     let connect_time = t.elapsed();
     let t = Instant::now();
-    let reply = client.search(&text, limit).map_err(|e| e.to_string())?;
+    let reply = client
+        .search(&text, limit, include_system)
+        .map_err(|e| e.to_string())?;
     let round_trip = t.elapsed();
     check(reply.status)?;
     for (i, hit) in reply.hits.iter().enumerate() {
         let slash = if hit.is_dir { "\\" } else { "" };
         println!("{:>3}. [{:>4}] {}{slash}", i + 1, hit.score, hit.path);
     }
+    let hidden = if reply.hidden_matches > 0 {
+        format!(
+            " (+{} in system and program folders, use --system)",
+            fmt_count(reply.hidden_matches as usize)
+        )
+    } else {
+        String::new()
+    };
     println!(
-        "     {} matches · round trip {} (service {}) · connect {}",
+        "     {} matches{hidden} · round trip {} (service {}) · connect {}",
         fmt_count(reply.total_matches as usize),
         fmt_duration(round_trip),
         fmt_duration(Duration::from_micros(u64::from(reply.search_micros))),
@@ -100,7 +115,7 @@ fn run_bench() -> Result<(), String> {
     let t = Instant::now();
     check(
         client
-            .search("warm up", 20)
+            .search("warm up", 20, false)
             .map_err(|e| e.to_string())?
             .status,
     )?;
@@ -121,7 +136,7 @@ fn run_bench() -> Result<(), String> {
         let mut matches = 0;
         for _ in 0..RUNS {
             let t = Instant::now();
-            let reply = client.search(text, 20).map_err(|e| e.to_string())?;
+            let reply = client.search(text, 20, false).map_err(|e| e.to_string())?;
             let elapsed = t.elapsed();
             check(reply.status)?;
             let svc = Duration::from_micros(u64::from(reply.search_micros));
@@ -144,7 +159,7 @@ fn run_bench() -> Result<(), String> {
     }
 
     let t = Instant::now();
-    let reply = client.search("e", 1000).map_err(|e| e.to_string())?;
+    let reply = client.search("e", 1000, false).map_err(|e| e.to_string())?;
     let elapsed = t.elapsed();
     check(reply.status)?;
     let svc = Duration::from_micros(u64::from(reply.search_micros));

@@ -145,6 +145,9 @@ struct App {
     settings: settings::Settings,
     history: frecency::History,
     paused: bool,
+    /// Ctrl+H: also show matches inside system, app-data, and program folders.
+    /// Per session, so the window always starts with the tidy view.
+    include_system: bool,
     hotkey_registered: bool,
     hover: hover::Hover,
     slide: Option<Slide>,
@@ -179,6 +182,7 @@ impl App {
             settings: settings::Settings::load(),
             history: frecency::History::load(),
             paused: false,
+            include_system: false,
             hotkey_registered: false,
             hover: hover::Hover::new(),
             slide: None,
@@ -216,6 +220,7 @@ impl App {
                 let _ = sender.send(search::Request {
                     serial: self.serial,
                     text: query,
+                    include_system: self.include_system,
                 });
             }
         }
@@ -240,11 +245,21 @@ impl App {
         match result.outcome {
             search::Outcome::Reply(reply) => match reply.status {
                 Status::Ok => {
-                    self.status = if reply.total_matches == 0 {
-                        "No matches".into()
-                    } else {
-                        format!("{} matches", reply.total_matches)
+                    let shown = reply.total_matches;
+                    let hidden = reply.hidden_matches;
+                    self.status = match (shown, hidden) {
+                        (0, 0) => "No matches".into(),
+                        (0, _) => {
+                            format!("No matches. {hidden} in system and app folders (Ctrl+H)")
+                        }
+                        (_, 0) => format!("{shown} matches"),
+                        _ => format!(
+                            "{shown} matches · {hidden} more in system and app folders (Ctrl+H)"
+                        ),
                     };
+                    if self.include_system {
+                        self.status.push_str(" · showing all");
+                    }
                     let mut reply = reply;
                     if self.settings.history && !self.history.is_empty() {
                         let now = frecency::now();
@@ -972,6 +987,11 @@ unsafe extern "system" fn child_proc(
                     unsafe { SetFocus(if id == EDIT_ID { app.list } else { app.edit }) };
                     return 0;
                 }
+                0x48 if unsafe { GetKeyState(VK_CONTROL as i32) } < 0 => {
+                    app.include_system = !app.include_system;
+                    app.query(main);
+                    return 0;
+                }
                 VK_DOWN | VK_UP if id == EDIT_ID => {
                     let current = app.selected().unwrap_or(0);
                     let next = if w as u16 == VK_DOWN {
@@ -1367,6 +1387,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let _ = sender.send(search::Request {
                         serial: app.serial,
                         text: app.last_text.clone(),
+                        include_system: app.include_system,
                     });
                 }
             }

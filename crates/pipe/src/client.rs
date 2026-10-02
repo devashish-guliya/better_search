@@ -96,10 +96,13 @@ impl Client {
         }
     }
 
-    pub fn search(&mut self, query: &str, limit: u16) -> io::Result<Reply> {
+    /// With `include_system` false, matches in system, app-data and program folders are
+    /// left out and only counted (see [`Reply::hidden_matches`]).
+    pub fn search(&mut self, query: &str, limit: u16, include_system: bool) -> io::Result<Reply> {
         Request {
             query: query.to_owned(),
             limit,
+            include_system,
         }
         .encode(&mut self.request);
         let len = self.transact()?;

@@ -80,7 +80,13 @@ in your profile) rank lower, and Start Menu shortcuts rank higher. When a short 
 has few matches, word initials count too: `vsc` finds `Visual Studio Code`, `mrv` finds
 `MyReportViewer`.
 
-The window remembers what you open (on by default) and ranks those files higher the next
+Matches inside system, app-data and program folders are hidden by default; the status
+line says how many were hidden, and Ctrl+H shows them for the current session.
+`bs report <index.bin>` prints how an index divides between these classes, and
+`bs query --system` includes them from the command line.
+
+The window remembers what you open (on by default; the first run starts from your
+Windows Recent files) and ranks those files higher the next
 time they match, with a bonus that grows with how often and how recently you opened
 them and is capped, so name matches still lead. The list is kept only on this PC in
 `%LOCALAPPDATA%\better_search\history.tsv` (at most 2,000 paths) and never reaches the

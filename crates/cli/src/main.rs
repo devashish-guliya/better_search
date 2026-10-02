@@ -1,6 +1,7 @@
 //! Command-line prototype: build or load the index, keep it live, print stats, search.
 
 mod remote;
+mod report;
 mod synthetic;
 mod walk;
 
@@ -26,6 +27,8 @@ Usage:
   bs --walk <FOLDER>     Index a folder by walking it. No admin needed.
   bs --synthetic <N>     Index N generated fake entries, for benchmarking.
   bs query TEXT...       Search through the running service instead (see bs query --help).
+  bs report INDEX.BIN    Show how many entries of a saved index fall in each location
+                         class, and the biggest system and program folders.
 
 Options:
   --bench                Run a fixed set of timed queries and exit.
@@ -118,6 +121,15 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
 
 fn main() -> ExitCode {
     let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.first().is_some_and(|a| a == "report") {
+        return match report::run(&raw[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if raw.first().is_some_and(|a| a == "query") {
         return match remote::run(&raw[1..]) {
             Ok(()) => ExitCode::SUCCESS,

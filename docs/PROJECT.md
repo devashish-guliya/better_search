@@ -539,10 +539,12 @@ bs-service.exe --console  Same thing in a terminal, for testing
   program that is not the better_search service (the pipe is owned by S-1-5-21-...)";
   a unit test covers the same. An elevated program can still pass the check, which is
   fine: an administrator can read the index anyway.
-- **Request:** `version u8 · kind u8 (1 = search) · limit u16 · query UTF-8` (the query
-  is the rest of the message, at most 4096 bytes in total; the limit is capped at 1000).
-  **Reply:** `version u8 · status u8 · total matches u32 · search time µs u32 · hit
-  count u16`, then per hit `score i32 · flags u8 (1 = folder) · path length u16 · path
+- **Request (version 2):** `version u8 · kind u8 (1 = search) · limit u16 · options u8
+  (bit 0 = include system and app folders) · query UTF-8` (the query is the rest of the
+  message, at most 4096 bytes in total; the limit is capped at 1000). By default the
+  query crate counts matches in `Noisy` and `AppFiles` locations as *hidden* instead of
+  ranking them. **Reply:** `version u8 · status u8 · total matches u32 · hidden matches
+  u32 · search time µs u32 · hit count u16`, then per hit `score i32 · flags u8 (1 = folder) · path length u16 · path
   UTF-8`. Status is `Ok`, `Loading`, `BadRequest` or `Denied` (the caller could not be
   identified). Little endian, size-checked on both sides, with round-trip and
   truncation tests. Every message carries the version and a mismatch is rejected.
@@ -669,6 +671,15 @@ and reports a clear message when the service is not running.
   returned. The file keeps at most 2,000 paths (the weakest 500 go when it overflows),
   forgets weights under 0.05, and is written by temp file and rename. Settings has a
   checkbox (`history=` in `window.cfg`, default on) and a "Clear open history" button.
+- **Hidden system matches.** A measurement of the real index (`bs report <index.bin>`)
+  found 94% of entries in system, app-data or program folders and 3.8% in ordinary
+  locations. The window therefore asks the service to hide those by default and shows
+  "N more in system and app folders (Ctrl+H)". Ctrl+H toggles showing them for the
+  session (not persisted). `bs query --system` does the same in the CLI.
+- **History seeding.** With no `history.tsv` yet, the window reads the Windows Recent
+  shortcuts (`%APPDATA%\Microsoft\Windows\Recent`, newest 300), resolves each `.lnk`
+  target from the LinkInfo block without COM, and records one open dated by the
+  shortcut.
 - Per-user settings live in `%LOCALAPPDATA%\better_search\window.cfg`. The theme follows
   Windows' app light/dark preference on settings changes (title bar, list and controls).
   Start with Windows is off until explicitly enabled in Settings; it only changes the

@@ -1,18 +1,20 @@
 //! How search windows talk to the better_search service: one message per request and
 //! one per reply over the named pipe [`PIPE_NAME`].
 //!
-//! Request: `version u8 · kind u8 (1 = search) · limit u16 · query UTF-8 (rest)`.
+//! Request: `version u8 · kind u8 (1 = search) · limit u16 · options u8 (1 = include
+//! system and program folders) · query UTF-8 (rest)`.
 //!
-//! Reply: `version u8 · status u8 · total matches u32 · search time µs u32 ·
-//! hit count u16`, then per hit `score i32 · flags u8 (1 = folder) · path length u16 ·
-//! path UTF-8`. All numbers are little-endian.
+//! Reply: `version u8 · status u8 · total matches u32 · hidden matches u32 · search
+//! time µs u32 · hit count u16`, then per hit `score i32 · flags u8 (1 = folder) · path
+//! length u16 · path UTF-8`. Hidden matches are those left out because the request did
+//! not include system and program folders. All numbers are little-endian.
 
 mod client;
 
 pub use client::Client;
 
 pub const PIPE_NAME: &str = r"\\.\pipe\better_search";
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 /// Replies never carry more hits than this.
 pub const MAX_LIMIT: u16 = 1000;
 /// Longest request the service accepts.
@@ -20,13 +22,17 @@ pub const MAX_REQUEST: usize = 4096;
 
 const KIND_SEARCH: u8 = 1;
 const FLAG_DIR: u8 = 1;
-const REQUEST_HEADER: usize = 4;
-const REPLY_HEADER: usize = 12;
+const OPTION_INCLUDE_SYSTEM: u8 = 1;
+const REQUEST_HEADER: usize = 5;
+const REPLY_HEADER: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
     pub query: String,
     pub limit: u16,
+    /// Also search system, app-data and program folders. Otherwise their matches are
+    /// only counted, in [`Reply::hidden_matches`].
+    pub include_system: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +77,8 @@ pub struct Hit {
 pub struct Reply {
     pub status: Status,
     pub total_matches: u32,
+    /// Matches in system and program folders that were left out of the reply.
+    pub hidden_matches: u32,
     /// Time the service spent searching and building paths, in microseconds.
     pub search_micros: u32,
     pub hits: Vec<Hit>,
@@ -81,6 +89,7 @@ impl Reply {
         Self {
             status,
             total_matches: 0,
+            hidden_matches: 0,
             search_micros: 0,
             hits: Vec::new(),
         }
@@ -92,6 +101,11 @@ impl Request {
         out.clear();
         out.extend_from_slice(&[VERSION, KIND_SEARCH]);
         out.extend_from_slice(&self.limit.to_le_bytes());
+        out.push(if self.include_system {
+            OPTION_INCLUDE_SYSTEM
+        } else {
+            0
+        });
         out.extend_from_slice(self.query.as_bytes());
     }
 
@@ -103,10 +117,15 @@ impl Request {
             return None;
         }
         let limit = u16::from_le_bytes([data[2], data[3]]).min(MAX_LIMIT);
+        let include_system = data[4] & OPTION_INCLUDE_SYSTEM != 0;
         let query = std::str::from_utf8(&data[REQUEST_HEADER..])
             .ok()?
             .to_owned();
-        Some(Self { query, limit })
+        Some(Self {
+            query,
+            limit,
+            include_system,
+        })
     }
 }
 
@@ -116,6 +135,7 @@ impl Reply {
         let count = self.hits.len().min(usize::from(MAX_LIMIT));
         out.extend_from_slice(&[VERSION, self.status.code()]);
         out.extend_from_slice(&self.total_matches.to_le_bytes());
+        out.extend_from_slice(&self.hidden_matches.to_le_bytes());
         out.extend_from_slice(&self.search_micros.to_le_bytes());
         out.extend_from_slice(&(count as u16).to_le_bytes());
         for hit in &self.hits[..count] {
@@ -133,8 +153,9 @@ impl Reply {
         }
         let status = Status::from_code(data[1])?;
         let total_matches = u32::from_le_bytes(data[2..6].try_into().ok()?);
-        let search_micros = u32::from_le_bytes(data[6..10].try_into().ok()?);
-        let count = u16::from_le_bytes([data[10], data[11]]);
+        let hidden_matches = u32::from_le_bytes(data[6..10].try_into().ok()?);
+        let search_micros = u32::from_le_bytes(data[10..14].try_into().ok()?);
+        let count = u16::from_le_bytes([data[14], data[15]]);
         let mut hits = Vec::with_capacity(usize::from(count.min(MAX_LIMIT)));
         let mut rest = &data[REPLY_HEADER..];
         for _ in 0..count {
@@ -153,6 +174,7 @@ impl Reply {
         rest.is_empty().then_some(Self {
             status,
             total_matches,
+            hidden_matches,
             search_micros,
             hits,
         })
@@ -179,8 +201,16 @@ mod tests {
         let request = Request {
             query: "tax 2024 änd".into(),
             limit: 50,
+            include_system: false,
         };
         let mut buf = Vec::new();
+        request.encode(&mut buf);
+        assert_eq!(Request::decode(&buf), Some(request));
+        let request = Request {
+            query: "x".into(),
+            limit: 1,
+            include_system: true,
+        };
         request.encode(&mut buf);
         assert_eq!(Request::decode(&buf), Some(request));
     }
@@ -191,6 +221,7 @@ mod tests {
         Request {
             query: "x".into(),
             limit: u16::MAX,
+            include_system: false,
         }
         .encode(&mut buf);
         assert_eq!(Request::decode(&buf).unwrap().limit, MAX_LIMIT);
@@ -200,12 +231,15 @@ mod tests {
     fn rejects_bad_requests() {
         assert_eq!(Request::decode(&[]), None);
         assert_eq!(
-            Request::decode(&[VERSION + 1, KIND_SEARCH, 1, 0, b'a']),
+            Request::decode(&[VERSION + 1, KIND_SEARCH, 1, 0, 0, b'a']),
             None
         );
-        assert_eq!(Request::decode(&[VERSION, 9, 1, 0, b'a']), None);
-        assert_eq!(Request::decode(&[VERSION, KIND_SEARCH, 1, 0, 0xff]), None);
-        let mut long = vec![VERSION, KIND_SEARCH, 1, 0];
+        assert_eq!(Request::decode(&[VERSION, 9, 1, 0, 0, b'a']), None);
+        assert_eq!(
+            Request::decode(&[VERSION, KIND_SEARCH, 1, 0, 0, 0xff]),
+            None
+        );
+        let mut long = vec![VERSION, KIND_SEARCH, 1, 0, 0];
         long.resize(MAX_REQUEST + 1, b'a');
         assert_eq!(Request::decode(&long), None);
     }
@@ -215,6 +249,7 @@ mod tests {
         let reply = Reply {
             status: Status::Ok,
             total_matches: 123_456,
+            hidden_matches: 4_000_000,
             search_micros: 789,
             hits: vec![
                 Hit {
@@ -248,6 +283,7 @@ mod tests {
         let reply = Reply {
             status: Status::Ok,
             total_matches: 1,
+            hidden_matches: 0,
             search_micros: 1,
             hits: vec![Hit {
                 path: "C:\\a".into(),

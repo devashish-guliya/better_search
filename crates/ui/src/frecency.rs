@@ -53,12 +53,115 @@ fn key(path: &str) -> String {
     path.to_lowercase()
 }
 
+/// The local target path stored in a Windows shortcut (`.lnk`), read straight from the
+/// documented binary layout so no COM is needed. `None` for anything unusual.
+fn lnk_target(data: &[u8]) -> Option<String> {
+    let u16_at = |at: usize| {
+        data.get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let u32_at = |at: usize| {
+        data.get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    if u32_at(0)? != 0x4c {
+        return None;
+    }
+    let flags = u32_at(0x14)?;
+    let mut at = 0x4c;
+    if flags & 1 != 0 {
+        at += 2 + usize::from(u16_at(at)?);
+    }
+    // HasLinkInfo
+    if flags & 2 == 0 {
+        return None;
+    }
+    let info = at;
+    let header = u32_at(info + 4)?;
+    // VolumeIDAndLocalBasePath
+    if u32_at(info + 8)? & 1 == 0 {
+        return None;
+    }
+    let text = |offset: usize, wide: bool| -> Option<String> {
+        let start = info.checked_add(offset)?;
+        if wide {
+            let units: Vec<u16> = data
+                .get(start..)?
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes(*b))
+                .take_while(|&u| u != 0)
+                .collect();
+            Some(String::from_utf16_lossy(&units))
+        } else {
+            let bytes: Vec<u8> = data
+                .get(start..)?
+                .iter()
+                .copied()
+                .take_while(|&b| b != 0)
+                .collect();
+            Some(bytes.iter().map(|&b| char::from(b)).collect())
+        }
+    };
+    let (base, suffix) = if header >= 0x24 {
+        (
+            text(u32_at(info + 28)?, true)?,
+            text(u32_at(info + 32)?, true)?,
+        )
+    } else {
+        (
+            text(u32_at(info + 16)?, false)?,
+            text(u32_at(info + 24)?, false)?,
+        )
+    };
+    let full = format!("{base}{suffix}");
+    (full.len() > 3 && full.as_bytes()[1] == b':').then_some(full)
+}
+
 impl History {
+    /// Without a history file yet, the user's Windows "Recent" shortcuts give the
+    /// first ranking hints (one open each, dated by the shortcut).
     pub fn load() -> Self {
-        let text = path()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        Self::parse(&text, now())
+        match path().and_then(|p| fs::read_to_string(p).ok()) {
+            Some(text) => Self::parse(&text, now()),
+            None => Self::from_recent(),
+        }
+    }
+
+    fn from_recent() -> Self {
+        let mut history = Self::default();
+        let Some(dir) =
+            std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(r"Microsoft\Windows\Recent"))
+        else {
+            return history;
+        };
+        let Ok(read) = fs::read_dir(dir) else {
+            return history;
+        };
+        let mut links: Vec<(u64, PathBuf)> = read
+            .flatten()
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .is_some_and(|x| x.eq_ignore_ascii_case("lnk"))
+            })
+            .filter_map(|e| {
+                let modified = e.metadata().ok()?.modified().ok()?;
+                let secs = modified.duration_since(UNIX_EPOCH).ok()?.as_secs();
+                Some((secs, e.path()))
+            })
+            .collect();
+        links.sort_by_key(|link| std::cmp::Reverse(link.0));
+        for (secs, link) in links.into_iter().take(300) {
+            let Ok(data) = fs::read(&link) else { continue };
+            if let Some(target) = lnk_target(&data)
+                && !history.entries.contains_key(&key(&target))
+            {
+                history.record(&target, secs);
+            }
+        }
+        history
     }
 
     fn parse(text: &str, now: u64) -> Self {
@@ -168,6 +271,35 @@ mod tests {
             history.record(r"C:\a.txt", 1000);
         }
         assert_eq!(history.boost(r"C:\a.txt", 1000), MAX_BOOST);
+    }
+
+    fn sample_lnk() -> Vec<u8> {
+        let mut data = vec![0u8; 0x4c];
+        data[0] = 0x4c;
+        data[0x14] = 2;
+        let base = b"C:\\Docs\\\0";
+        let suffix = b"a.txt\0";
+        let mut info = Vec::new();
+        info.extend_from_slice(&0u32.to_le_bytes()); // size, unused by the reader
+        info.extend_from_slice(&0x1cu32.to_le_bytes());
+        info.extend_from_slice(&1u32.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&0x1cu32.to_le_bytes());
+        info.extend_from_slice(&0u32.to_le_bytes());
+        info.extend_from_slice(&(0x1c + base.len() as u32).to_le_bytes());
+        info.extend_from_slice(base);
+        info.extend_from_slice(suffix);
+        data.extend(info);
+        data
+    }
+
+    #[test]
+    fn reads_the_target_of_a_shortcut() {
+        assert_eq!(lnk_target(&sample_lnk()).as_deref(), Some(r"C:\Docs\a.txt"));
+        assert_eq!(lnk_target(b"nonsense"), None);
+        let mut truncated = sample_lnk();
+        truncated.truncate(0x50);
+        assert_eq!(lnk_target(&truncated), None);
     }
 
     #[test]
