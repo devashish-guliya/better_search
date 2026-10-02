@@ -114,7 +114,7 @@ const ACRONYM_LENGTHS: std::ops::RangeInclusive<usize> = 2..=6;
 
 /// Acronyms are a fallback for searches with few ordinary matches. With more, the
 /// user is looking at plenty already, and the extra scan would cost every keystroke.
-const ACRONYM_BELOW: usize = 200;
+const ACRONYM_BELOW: usize = 5000;
 
 /// Adds names whose word initials spell the query. Only a single ASCII word of letters
 /// can be an acronym. Ordinary matches keep their score, so an acronym only wins
@@ -455,7 +455,10 @@ fn final_score(name_score: u8, entry_flags: u8) -> i32 {
         Location::Normal => 0,
         Location::Noisy => -45,
         Location::AppFiles => -30,
-        Location::StartMenu => 30,
+        // Shortcuts are the entries that launch installed programs. The folders that
+        // group them are ordinary folders.
+        Location::StartMenu if entry_flags & flags::DIR != 0 => 0,
+        Location::StartMenu => 50,
     };
     if entry_flags & flags::DIR != 0 {
         score += 3;
@@ -557,7 +560,12 @@ fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
             if let Some(dot) = memchr::memrchr(b'.', lower) {
                 let extension = &lower[dot + 1..];
                 if LAUNCHABLE.contains(&extension) {
-                    score += 10;
+                    // An installer is run once, so it should not outrank the program.
+                    if extension == b"msi" || looks_like_installer(lower) {
+                        score -= 20;
+                    } else {
+                        score += 10;
+                    }
                 } else if DEMOTED.contains(&extension) {
                     score -= 10;
                 }
@@ -568,6 +576,12 @@ fn finish_score(total: i32, lower: &[u8], query: &Query) -> u8 {
     let extra = lower.len().saturating_sub(query.needle_len);
     score -= (extra / 4).min(15) as i32;
     score.clamp(1, 255) as u8
+}
+
+fn looks_like_installer(lower: &[u8]) -> bool {
+    ["setup", "install", "unins"]
+        .iter()
+        .any(|word| memmem::find(lower, word.as_bytes()).is_some())
 }
 
 /// Keeps the `limit` best hits. Ties go to the lower entry index so results are
@@ -811,6 +825,35 @@ mod tests {
         assert_eq!(
             paths(&index, "acme setup", 10)[0],
             "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Acme Setup.lnk"
+        );
+    }
+
+    #[test]
+    fn start_menu_shortcut_beats_installer_and_app_folder() {
+        let index = index_of(&[
+            "Users\\bob\\Downloads\\ChromeSetup.exe",
+            "Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk",
+            "Windows\\ServiceProfiles\\Svc\\Start Menu\\Programs\\Google Chrome.lnk",
+        ]);
+        let found = paths(&index, "chrome", 10);
+        assert_eq!(
+            found[0],
+            "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Google Chrome.lnk"
+        );
+        assert_eq!(
+            found.last().unwrap(),
+            "T:\\Windows\\ServiceProfiles\\Svc\\Start Menu\\Programs\\Google Chrome.lnk"
+        );
+        // Start Menu folders get no boost of their own.
+        let index = index_of(&[
+            "ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Git\\Git Bash.lnk",
+            "Users\\bob\\Documents\\Git",
+        ]);
+        let found = paths(&index, "git", 10);
+        assert_eq!(
+            found[0],
+            "T:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Git\\Git Bash.lnk"
         );
     }
 

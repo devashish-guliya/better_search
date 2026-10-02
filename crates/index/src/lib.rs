@@ -1,4 +1,4 @@
-﻿//! Compact in-memory index of file and folder names.
+//! Compact in-memory index of file and folder names.
 //!
 //! Data is stored as parallel arrays (one slot per entry) instead of one struct per file:
 //! each entry costs a name id, a parent index and a flags byte. Names are UTF-8, stored
@@ -41,7 +41,7 @@ pub mod flags {
 
 /// Version of the clutter rules in [`Index::skip_clutter`]. Bump it when the rules
 /// change so saved indexes built with the old rules are rebuilt.
-pub const SKIP_RULES_VERSION: u32 = 4;
+pub const SKIP_RULES_VERSION: u32 = 5;
 
 /// Where an entry lives, used by ranking to boost or demote results.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1766,11 +1766,13 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
     };
     let name = index.name_folded(entry);
     // Start Menu folders sit inside ProgramData and AppData, so this must come before
-    // the check that lets Noisy spread to everything below.
+    // the check that lets Noisy spread to everything below. The menus of service
+    // accounts (`Windows\ServiceProfiles\...`) belong to no person, so they stay noisy.
     if inherited == Location::StartMenu
         || (name == b"programs"
             && index.is_dir(entry)
-            && index.name_folded(parent) == b"start menu")
+            && index.name_folded(parent) == b"start menu"
+            && !inside_service_profiles(index, parent))
     {
         return Location::StartMenu;
     }
@@ -1806,6 +1808,19 @@ fn own_location(index: &Index, entry: u32, inherited: Location) -> Location {
         return Location::AppFiles;
     }
     inherited
+}
+
+/// Whether `entry` is below a `ServiceProfiles` folder (a few levels up at most).
+fn inside_service_profiles(index: &Index, entry: u32) -> bool {
+    let mut current = Some(entry);
+    for _ in 0..12 {
+        let Some(e) = current else { return false };
+        if index.name_folded(e) == b"serviceprofiles" {
+            return true;
+        }
+        current = index.parent(e);
+    }
+    false
 }
 
 /// Folders that belong to a program rather than to the person using it, recognised by
@@ -2070,9 +2085,18 @@ mod tests {
         b.push(8, 7, "Paint.lnk", false, false);
         b.push(9, 3, "Templates", true, false);
         b.push(10, 9, "x.dat", false, false);
+        b.push(11, 0, "Windows", true, false);
+        b.push(12, 11, "ServiceProfiles", true, false);
+        b.push(13, 12, "Start Menu", true, false);
+        b.push(14, 13, "Programs", true, false);
+        b.push(15, 14, "Svc.lnk", false, false);
         b.end_volume();
         let index = b.finish();
         let location = |path: &str| index.location(find(&index, path));
+        assert_eq!(
+            location("C:\\Windows\\ServiceProfiles\\Start Menu\\Programs\\Svc.lnk"),
+            Location::Noisy
+        );
         let base = "C:\\ProgramData\\Microsoft\\Windows\\";
         let menu = Location::StartMenu;
         assert_eq!(location(&format!("{base}Start Menu\\Programs")), menu);

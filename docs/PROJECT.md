@@ -231,12 +231,13 @@ number, so each volume needs "record number → entry":
   `.docker`). The app's own folder and the files directly inside it stay `Normal`.
   Ranked lower (−30) but still found. Programs installed elsewhere are not guessed at.
 - `StartMenu`: a `Start Menu\Programs` folder and everything below it, even though
-  it sits inside `ProgramData` or `AppData`. Ranked higher (+30), because installed
-  programs register their shortcuts there.
+  it sits inside `ProgramData` or `AppData`, except under `Windows\ServiceProfiles`
+  (service accounts). Shortcuts in it rank higher (+50), because installed programs
+  register them there; its folders are neutral.
 - `Normal`: everything else.
 
 The class is stored in three flag bits (two at bits 2–3, one at bit 6) so older saved
-indexes read the same. `SKIP_RULES_VERSION` is 4, which triggers one rescan.
+indexes read the same. `SKIP_RULES_VERSION` is 5, which triggers one rescan.
 
 A child inherits its parent's class unless its own name changes it. The classes are
 recomputed when folders move.
@@ -377,20 +378,20 @@ the `SKIPPED` flag; nothing below it is in the index.
   when that extension is **launchable** (`.exe`, `.com`, `.bat`, `.cmd`, `.msi`, `.lnk`,
   `.url`, `.appref-ms`) it becomes the highest tier, so the app a user means
   (`factory.exe`) outranks folders and installers that only share the prefix.
-  Launchable extensions elsewhere get +10; `.dll`, `.mui`, `.tmp`, `.log`, `.etl`,
+  Launchable extensions elsewhere get +10, except installers (`.msi`, or a name containing `setup`, `install` or `unins`), which get −20; `.dll`, `.mui`, `.tmp`, `.log`, `.etl`,
   `.cat`, `.manifest`, `.pf`, `.pyc` and the certificate/runtime types `.pem`, `.pid`,
   `.crt`, `.key`, `.pdb`, `.lib`, `.obj`, `.ilk` get −10; longer names lose a little.
-- **Pass 2, per entry:** name score plus location (`UserContent` +25, `StartMenu` +30, `AppFiles` −30, `Noisy` −45),
+- **Pass 2, per entry:** name score plus location (`UserContent` +25, `StartMenu` +50 for files and 0 for its folders, `AppFiles` −30, `Noisy` −45),
   folders +3, hidden −20. Each thread keeps only the best `limit` hits in a small heap,
   so the full match list is never built, even for millions of matches. Ties go to the
   lower entry number, so results are deterministic.
-- **Acronym fallback:** a query of one ASCII word, 2–6 letters, with fewer than 200
+- **Acronym fallback:** a query of one ASCII word, 2–6 letters, with fewer than 5,000
   ordinary matches also finds names whose word initials spell it exactly (extension
   ignored; words split at non-alphanumeric characters and camelCase). `vsc` finds
   `Visual Studio Code.lnk`, `mrv` finds `MyReportViewer.cs`. An acronym match scores 60
   (+10 launchable, −10 demoted type), then location applies, so a Start Menu shortcut
-  reaches 100. Results are merged with the ordinary ones. The scan reads every unique
-  name but the first-byte test skips nearly all of them; above the 200-match limit it is
+  reaches 120. Results are merged with the ordinary ones. The scan reads every unique
+  name but the first-byte test skips nearly all of them; above the 5,000-match limit it is
   skipped, so busy queries cost nothing extra (synthetic 2M entries: png, exe and readme
   unchanged at 5–6 ms). Narrowing does not apply to it.
 - **Type-ahead narrowing (`Session`):** when the new query only adds characters to the
@@ -1026,7 +1027,7 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  98 workspace tests pass (index crate 36, query crate 23, engine crate 9,
+  99 workspace tests pass (index crate 36, query crate 24, engine crate 9,
   service crate 10, pipe crate 6, ntfs crate 3, cli crate 3, window crate 8).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
