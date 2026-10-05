@@ -216,7 +216,13 @@ pub fn fill_round(dc: HDC, rect: &RECT, radius: i32, color: u32) {
 /// Single-line text in `rect`, vertically centred. `extra` adds flags such as
 /// `DT_PATH_ELLIPSIS` or `DT_RIGHT`.
 pub fn text(dc: HDC, value: &str, rect: &RECT, font: HFONT, color: u32, extra: DRAW_TEXT_FORMAT) {
-    let value: Vec<u16> = value.encode_utf16().collect();
+    // DrawTextW reads the first character even for a count of 0, and an empty Vec's
+    // pointer is dangling, so empty text (a name run cut to nothing) crashed it.
+    if value.is_empty() {
+        return;
+    }
+    let value: Vec<u16> = value.encode_utf16().chain([0]).collect();
+    let value = &value[..value.len() - 1];
     let mut rect = *rect;
     unsafe {
         let old = SelectObject(dc, font);
@@ -244,6 +250,9 @@ pub fn line_height(dc: HDC, font: HFONT) -> i32 {
 }
 
 pub fn text_width(dc: HDC, font: HFONT, value: &[u16]) -> i32 {
+    if value.is_empty() {
+        return 0;
+    }
     let mut size = SIZE::default();
     unsafe {
         let old = SelectObject(dc, font);
@@ -358,5 +367,27 @@ mod tests {
         assert_eq!(found, [(0, 2, true), (2, 3, false), (3, 4, true)]);
         assert_eq!(runs(&[]).count(), 0);
         assert_eq!(mix(rgb(0, 0, 0), rgb(200, 100, 0), 50), rgb(100, 50, 0));
+    }
+
+    #[test]
+    fn drawing_empty_text_is_safe() {
+        use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, DeleteDC};
+        let dc = unsafe { CreateCompatibleDC(null_mut()) };
+        let rect = RECT {
+            left: 0,
+            top: 0,
+            right: 40,
+            bottom: 20,
+        };
+        for flags in [0, DT_END_ELLIPSIS] {
+            text(dc, "", &rect, null_mut(), 0, flags);
+            text(dc, "abc", &rect, null_mut(), 0, flags);
+        }
+        let name: Vec<u16> = "abcdefgh".encode_utf16().collect();
+        let marks = [true, true, false, false, true, true, true, true];
+        // Too narrow for any run, so every piece is cut to nothing.
+        let narrow = RECT { right: 1, ..rect };
+        marked_text(dc, &name, &marks, &narrow, (null_mut(), null_mut()), 0);
+        unsafe { DeleteDC(dc) };
     }
 }

@@ -1,44 +1,61 @@
 //! Win+S opens this window instead of Windows search. Explorer reserves the
 //! combination, so it cannot be registered as a hotkey; a low-level keyboard hook sees
 //! it first and swallows it. When an Explorer window is in front, the search is
-//! scoped to the folder it shows.
+//! scoped to the folder it shows. Letters typed while Start is open come here too, so
+//! Start works as before with this window as its search.
 
 use std::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Com::{
     CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Threading::{
+    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    QueryFullProcessImageNameW, TerminateProcess,
+};
+use windows_sys::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, KEYEVENTF_KEYUP, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT, keybd_event,
+    GetAsyncKeyState, GetKeyState, KEYEVENTF_KEYUP, VK_CAPITAL, VK_CONTROL, VK_ESCAPE, VK_LWIN,
+    VK_MENU, VK_RWIN, VK_SHIFT, keybd_event,
 };
 use windows_sys::Win32::UI::Shell::SHGetPathFromIDListW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, FindWindowExW, GA_ROOT, GetAncestor, GetClassNameW, GetMessageW, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, PostMessageW, SetWindowsHookExW, WH_KEYBOARD_LL, WM_APP, WM_KEYDOWN,
+    CallNextHookEx, EVENT_SYSTEM_FOREGROUND, FindWindowExW, GA_ROOT, GetAncestor, GetClassNameW,
+    GetForegroundWindow, GetMessageW, GetWindowThreadProcessId, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    PostMessageW, SetWindowsHookExW, WH_KEYBOARD_LL, WINEVENT_OUTOFCONTEXT, WM_APP, WM_KEYDOWN,
     WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 use windows_sys::core::{GUID, HRESULT};
 
 /// Posted to the window when Win+S was pressed.
 pub const WM_WIN_S: u32 = WM_APP + 5;
+/// Posted with a character (wParam) typed while Start was open.
+pub const WM_START_TYPED: u32 = WM_APP + 6;
 
 static TARGET: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// Windows search is turned off, so a SearchHost window that still comes to the
+/// front is closed.
+static SEARCH_OFF: AtomicBool = AtomicBool::new(false);
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 static SWALLOWED_S: AtomicBool = AtomicBool::new(false);
+/// The foreground window last checked by [`start_in_front`], and whether it is Start.
+static LAST_FRONT: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+static LAST_FRONT_IS_START: AtomicBool = AtomicBool::new(false);
 /// A virtual key no keyboard has. Pressing it while Win is down tells the shell the
 /// Win key was part of a combination, so releasing it does not open Start.
 const VK_UNASSIGNED: u8 = 0xE8;
 
-/// Installs the hook on a thread of its own. Windows silently removes a low-level hook
-/// that answers too slowly, so it must not wait behind the window's own work.
-pub fn install(target: HWND, enabled: bool) {
+/// Installs the hooks on a thread of their own. Windows silently removes a low-level
+/// hook that answers too slowly, so it must not wait behind the window's own work.
+pub fn install(target: HWND, enabled: bool, search_off: bool) {
     TARGET.store(target, Ordering::Relaxed);
     ENABLED.store(enabled, Ordering::Relaxed);
+    SEARCH_OFF.store(search_off, Ordering::Relaxed);
     let _ = std::thread::Builder::new()
         .name("window-win-s".into())
         .spawn(|| {
@@ -47,6 +64,17 @@ pub fn install(target: HWND, enabled: bool) {
             if hook.is_null() {
                 return;
             }
+            let _: HWINEVENTHOOK = unsafe {
+                SetWinEventHook(
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    null_mut(),
+                    Some(foreground_changed),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
+                )
+            };
             let mut msg = MSG::default();
             while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {}
         });
@@ -56,38 +84,150 @@ pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+pub fn set_search_off(off: bool) {
+    SEARCH_OFF.store(off, Ordering::Relaxed);
+}
+
+/// The file name of the program that owns `window`, lowercased.
+fn program_of(window: HWND, access: u32) -> Option<(String, isize)> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(window, &mut pid) };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | access, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut buffer = [0u16; 512];
+    let mut len = buffer.len() as u32;
+    let ok = unsafe {
+        QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
+    };
+    let path = String::from_utf16_lossy(&buffer[..len as usize]);
+    let name = path.rsplit('\\').next().unwrap_or_default().to_lowercase();
+    (ok != 0).then_some((name, process as isize)).or_else(|| {
+        unsafe { CloseHandle(process) };
+        None
+    })
+}
+
+unsafe extern "system" fn foreground_changed(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    window: HWND,
+    _object: i32,
+    _child: i32,
+    _thread: u32,
+    _time: u32,
+) {
+    let search_off = SEARCH_OFF.load(Ordering::Relaxed);
+    let access = if search_off { PROCESS_TERMINATE } else { 0 };
+    let Some((name, process)) = program_of(window, access) else {
+        return;
+    };
+    if name == "searchhost.exe" && search_off && ENABLED.load(Ordering::Relaxed) {
+        unsafe {
+            TerminateProcess(process as _, 0);
+            PostMessageW(TARGET.load(Ordering::Relaxed), WM_WIN_S, 0, 0);
+        }
+    }
+    unsafe { CloseHandle(process as _) };
+}
+
+/// Whether Start is the foreground window. Checked at the key press: the foreground
+/// event arrives too late for the first letters typed after opening Start. The
+/// answer is kept per window, so typing elsewhere costs one comparison.
+fn start_in_front() -> bool {
+    let front = unsafe { GetForegroundWindow() };
+    if front != LAST_FRONT.swap(front, Ordering::Relaxed) {
+        LAST_FRONT_IS_START.store(is_start(front), Ordering::Relaxed);
+    }
+    LAST_FRONT_IS_START.load(Ordering::Relaxed)
+}
+
+/// Taps a key no keyboard has. Windows lets the program that sent the last input take
+/// the foreground; it also keeps a released Win key from opening Start.
+pub fn tap_unassigned_key() {
+    unsafe {
+        keybd_event(VK_UNASSIGNED, 0, 0, 0);
+        keybd_event(VK_UNASSIGNED, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+pub fn is_start(window: HWND) -> bool {
+    program_of(window, 0).is_some_and(|(name, process)| {
+        unsafe { CloseHandle(process as _) };
+        name == "startmenuexperiencehost.exe"
+    })
+}
+
+/// Closes Start, which no other program may take the foreground from. Only call this
+/// right after [`is_start`] said Start is in front, or the key reaches another app.
+/// Returns once Start has left the front, so the key cannot reach the caller's window.
+pub fn close_start() {
+    unsafe {
+        keybd_event(VK_ESCAPE as u8, 0, 0, 0);
+        keybd_event(VK_ESCAPE as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+    for _ in 0..50 {
+        if !is_start(unsafe { GetForegroundWindow() }) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The character a letter or digit key types, or `None` for other keys.
+fn typed_char(vk: u16) -> Option<char> {
+    let shift = unsafe { GetAsyncKeyState(i32::from(VK_SHIFT)) } < 0;
+    let caps = unsafe { GetKeyState(i32::from(VK_CAPITAL)) } & 1 != 0;
+    match vk as u8 {
+        letter @ b'A'..=b'Z' if shift != caps => Some(letter as char),
+        letter @ b'A'..=b'Z' => Some(letter.to_ascii_lowercase() as char),
+        digit @ b'0'..=b'9' if !shift => Some(digit as char),
+        _ => None,
+    }
+}
+
 unsafe extern "system" fn hook(code: i32, w: WPARAM, l: LPARAM) -> LRESULT {
     if code >= 0 {
         let key = unsafe { &*(l as *const KBDLLHOOKSTRUCT) };
         let down = matches!(w as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
         let up = matches!(w as u32, WM_KEYUP | WM_SYSKEYUP);
         let vk = key.vkCode as u16;
+        let held = |vk: u16| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
         // Keys sent by other programs count too, so remapping tools can press Win+S.
-        if vk != u16::from(VK_UNASSIGNED) {
-            if vk == VK_LWIN || vk == VK_RWIN {
-                WIN_DOWN.store(down, Ordering::Relaxed);
-            } else if vk == u16::from(b'S') {
-                if up && SWALLOWED_S.swap(false, Ordering::Relaxed) {
-                    return 1;
-                }
-                // Win+Shift+S is the screenshot tool and stays with Windows.
-                let held = |vk: u16| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0;
-                if down
-                    && ENABLED.load(Ordering::Relaxed)
-                    && WIN_DOWN.load(Ordering::Relaxed)
-                    && !held(VK_SHIFT)
-                    && !held(VK_CONTROL)
-                    && !held(VK_MENU)
-                {
-                    SWALLOWED_S.store(true, Ordering::Relaxed);
-                    unsafe {
-                        keybd_event(VK_UNASSIGNED, 0, 0, 0);
-                        keybd_event(VK_UNASSIGNED, 0, KEYEVENTF_KEYUP, 0);
-                        PostMessageW(TARGET.load(Ordering::Relaxed), WM_WIN_S, 0, 0);
-                    }
-                    return 1;
-                }
+        if vk == VK_LWIN || vk == VK_RWIN {
+            WIN_DOWN.store(down, Ordering::Relaxed);
+        } else if vk == u16::from(b'S') && up && SWALLOWED_S.swap(false, Ordering::Relaxed) {
+            return 1;
+        } else if vk == u16::from(b'S') && down && WIN_DOWN.load(Ordering::Relaxed) {
+            // Win+Shift+S is the screenshot tool and stays with Windows.
+            if ENABLED.load(Ordering::Relaxed)
+                && !held(VK_SHIFT)
+                && !held(VK_CONTROL)
+                && !held(VK_MENU)
+            {
+                SWALLOWED_S.store(true, Ordering::Relaxed);
+                tap_unassigned_key();
+                unsafe { PostMessageW(TARGET.load(Ordering::Relaxed), WM_WIN_S, 0, 0) };
+                return 1;
             }
+        } else if down
+            && ENABLED.load(Ordering::Relaxed)
+            && !WIN_DOWN.load(Ordering::Relaxed)
+            && !held(VK_CONTROL)
+            && !held(VK_MENU)
+            && let Some(c) = typed_char(vk)
+            && start_in_front()
+        {
+            unsafe {
+                PostMessageW(
+                    TARGET.load(Ordering::Relaxed),
+                    WM_START_TYPED,
+                    c as usize,
+                    0,
+                )
+            };
+            return 1;
         }
     }
     unsafe { CallNextHookEx(null_mut(), code, w, l) }

@@ -11,6 +11,7 @@ mod search;
 mod settings;
 mod thumbs;
 mod winkey;
+mod winsearch;
 
 use std::collections::{HashMap, HashSet};
 use std::ptr::{null, null_mut};
@@ -83,6 +84,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const WM_MOUSELEAVE: u32 = 0x02a3;
 const EM_GETSEL: u32 = 0x00b0;
+const EM_SETSEL: u32 = 0x00b1;
 /// Static control styles: vertically centred, single-line text cut with an ellipsis.
 const SS_CENTERIMAGE: u32 = 0x0200;
 const SS_ENDELLIPSIS: u32 = 0x4000;
@@ -111,6 +113,7 @@ const SETTINGS_SAVE: usize = 305;
 const SETTINGS_BACK: usize = 306;
 const SETTINGS_HISTORY: usize = 307;
 const SETTINGS_WIN_S: usize = 320;
+const SETTINGS_WINDOWS_SEARCH: usize = 321;
 const SETTINGS_CLEAR: usize = 308;
 const CHECKED: isize = 1;
 /// Result icons and previews, in pixels at 96 DPI.
@@ -194,6 +197,8 @@ struct App {
     /// chip in the field; Backspace at the start of the field removes it.
     scope: Option<String>,
     chip: RECT,
+    /// When a letter typed in Start last arrived.
+    start_typed_at: Option<std::time::Instant>,
 }
 
 impl App {
@@ -246,6 +251,7 @@ impl App {
             taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
             scope: None,
             chip: RECT::default(),
+            start_typed_at: None,
         }
     }
 
@@ -272,11 +278,15 @@ impl App {
         self.query(hwnd);
     }
 
-    fn query(&mut self, hwnd: HWND) {
+    fn edit_text(&self) -> String {
         let len = unsafe { GetWindowTextLengthW(self.edit) };
         let mut text = vec![0u16; len.max(0) as usize + 1];
         unsafe { GetWindowTextW(self.edit, text.as_mut_ptr(), text.len() as i32) };
-        let query = String::from_utf16_lossy(&text[..len.max(0) as usize]);
+        String::from_utf16_lossy(&text[..len.max(0) as usize])
+    }
+
+    fn query(&mut self, hwnd: HWND) {
+        let query = self.edit_text();
         self.last_text = query.clone();
         self.serial = self.serial.wrapping_add(1);
         unsafe { KillTimer(hwnd, RETRY_TIMER) };
@@ -1092,6 +1102,12 @@ impl App {
                 self.settings.win_s as usize,
                 0,
             );
+            SendMessageW(
+                self.controls[7],
+                BM_SETCHECK,
+                winsearch::is_off() as usize,
+                0,
+            );
             SetForegroundWindow(hwnd);
             SetFocus(self.controls[1]);
         }
@@ -1183,6 +1199,14 @@ impl App {
             message(hwnd, &format!("Could not save settings: {err}"));
             return;
         }
+        let search_off = unsafe { SendMessageW(self.controls[7], BM_GETCHECK, 0, 0) } == CHECKED;
+        if search_off != winsearch::is_off() && !winsearch::request(hwnd, search_off) {
+            message(
+                hwnd,
+                "Windows search was not changed. Approve the administrator prompt to change it.",
+            );
+        }
+        winkey::set_search_off(winsearch::is_off());
         self.settings = next;
         winkey::set_enabled(self.settings.win_s);
         self.hover
@@ -1202,7 +1226,7 @@ impl App {
             let top = scale(hwnd, 20);
             let mut y = top;
             for (i, &control) in self.controls.iter().enumerate() {
-                let height = if i == 9 {
+                let height = if i == 10 {
                     line * 2
                 } else {
                     line - scale(hwnd, 3)
@@ -1606,6 +1630,26 @@ unsafe extern "system" fn child_proc(
     unsafe { DefSubclassProc(hwnd, msg, w, l) }
 }
 
+/// Shows the window for a key the hook caught. Unlike a registered hotkey, a hook
+/// does not give the right to take the foreground, so it is borrowed from `front`.
+fn open_from_hook(app: &mut App, hwnd: HWND, front: HWND, over_start: bool) {
+    let mut front = front;
+    // Start keeps the foreground against every other program, so it is closed first.
+    if over_start && winkey::is_start(unsafe { GetForegroundWindow() }) {
+        winkey::close_start();
+        front = unsafe { GetForegroundWindow() };
+    }
+    winkey::tap_unassigned_key();
+    let front_thread = unsafe { GetWindowThreadProcessId(front, null_mut()) };
+    let own_thread = unsafe { GetCurrentThreadId() };
+    let attached = front_thread != own_thread
+        && unsafe { AttachThreadInput(own_thread, front_thread, 1) } != 0;
+    app.open_panel(hwnd);
+    if attached {
+        unsafe { AttachThreadInput(own_thread, front_thread, 0) };
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
@@ -1891,8 +1935,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 control(
                     hwnd,
                     &button_class,
-                    "Win+S opens better_search (in the Explorer folder in front)",
+                    "Win+S and typing in Start open better_search",
                     SETTINGS_WIN_S,
+                    BS_AUTOCHECKBOX as u32,
+                ),
+                control(
+                    hwnd,
+                    &button_class,
+                    "Turn off Windows search and its indexer (asks for admin)",
+                    SETTINGS_WINDOWS_SEARCH,
                     BS_AUTOCHECKBOX as u32,
                 ),
                 control(hwnd, &button_class, "Clear open history", SETTINGS_CLEAR, 0),
@@ -1949,7 +2000,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             app.apps.refresh_if_stale();
             app.theme(hwnd);
             app.register_hotkey(hwnd);
-            winkey::install(hwnd, app.settings.win_s);
+            winkey::install(hwnd, app.settings.win_s, winsearch::is_off());
             unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
             app.update_title(hwnd);
             0
@@ -2166,15 +2217,31 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 unsafe { SetWindowTextW(app.edit, wide("").as_ptr()) };
             }
             app.set_scope(hwnd, scope);
-            // Unlike a registered hotkey, a hook does not give the right to take the
-            // foreground, so borrow it from the window in front.
-            let front_thread = unsafe { GetWindowThreadProcessId(front, null_mut()) };
-            let own_thread = unsafe { GetCurrentThreadId() };
-            let attached = front_thread != own_thread
-                && unsafe { AttachThreadInput(own_thread, front_thread, 1) } != 0;
-            app.open_panel(hwnd);
-            if attached {
-                unsafe { AttachThreadInput(own_thread, front_thread, 0) };
+            open_from_hook(app, hwnd, front, false);
+            0
+        }
+        winkey::WM_START_TYPED => {
+            let front = unsafe { GetForegroundWindow() };
+            let typed = char::from_u32(w as u32).unwrap_or(' ');
+            // Letters typed before this window took over from Start follow the first.
+            let continuing = front == hwnd
+                || app
+                    .start_typed_at
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
+            app.start_typed_at = Some(std::time::Instant::now());
+            let text = if continuing {
+                format!("{}{typed}", app.edit_text())
+            } else {
+                app.set_scope(hwnd, None);
+                typed.to_string()
+            };
+            unsafe {
+                SetWindowTextW(app.edit, wide(&text).as_ptr());
+                let end = text.encode_utf16().count();
+                SendMessageW(app.edit, EM_SETSEL, end, end as isize);
+            }
+            if front != hwnd {
+                open_from_hook(app, hwnd, front, true);
             }
             0
         }
@@ -2398,6 +2465,13 @@ fn run(start_hidden: bool) -> Result<(), String> {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, state] = args.as_slice()
+        && flag == winsearch::ARGUMENT
+    {
+        winsearch::apply(state == "off");
+        return;
+    }
     let hidden = std::env::args_os()
         .skip(1)
         .any(|arg| arg == std::ffi::OsStr::new("--hidden"));

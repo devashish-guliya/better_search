@@ -79,7 +79,14 @@ Win+S opens better_search instead of Windows search (Win+Shift+S still takes a
 screenshot; turn it off in the tray's Settings). Pressed over an Explorer window, it
 searches only the folder that window shows, marked by an "In <folder>" chip in the
 search field; Backspace at the start of the field removes the chip and searches
-everything again.
+everything again. Letters and digits typed while Start is open close Start and go to
+better_search instead.
+
+The Settings checkbox "Turn off Windows search and its indexer" asks for admin once,
+then sets the `DisableSearch` policy, disables the `WSearch` service and closes
+`SearchHost.exe`; if Windows search still comes to the front, better_search closes it
+and opens itself. Unchecking it (or `bs-window --windows-search on`, elevated) turns
+it back on.
 
 Windows Settings pages (Display, Sound, Wi-Fi, Background, Installed apps, ...) are
 found by name and by common words (`wallpaper`, `uninstall`, `volume`), and Shut down,
