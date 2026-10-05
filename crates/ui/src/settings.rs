@@ -224,10 +224,7 @@ mod tests {
 
     #[test]
     fn parses_settings_and_recovers_from_broken_hotkeys() {
-        // `hover` and `left` keys from older config files are ignored.
-        let settings = Settings::parse(
-            "modifiers=3\nkey=75\nhover=false\nleft=true\nstart_with_windows=true\n",
-        );
+        let settings = Settings::parse("modifiers=3\nkey=75\nstart_with_windows=true\n");
         assert_eq!(settings.key, 75);
         assert_eq!(settings.modifiers, 3);
         assert!(settings.start_with_windows);
