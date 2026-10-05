@@ -6,10 +6,11 @@ use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{HWND, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
-    DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DeleteObject, DrawTextW, FW_NORMAL, FW_SEMIBOLD, GetDC, GetTextExtentExPointW,
-    GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, HDC, HFONT, OUT_DEFAULT_PRECIS, PS_SOLID,
-    ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
+    DEFAULT_CHARSET, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteObject, DrawTextW, FW_NORMAL, FW_SEMIBOLD,
+    GetDC, GetTextExtentExPointW, GetTextExtentPoint32W, GetTextFaceW, GetTextMetricsW, HDC, HFONT,
+    OUT_DEFAULT_PRECIS, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    TEXTMETRICW, TRANSPARENT,
 };
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
 
@@ -27,6 +28,8 @@ pub const GLYPH_SEARCH: &str = "\u{E721}";
 pub const GLYPH_SETTINGS: &str = "\u{E713}";
 pub const GLYPH_FOLDER: &str = "\u{E838}";
 pub const GLYPH_COPY: &str = "\u{E8C8}";
+pub const GLYPH_BACK: &str = "\u{E72B}";
+pub const GLYPH_CHEVRON: &str = "\u{E76C}";
 
 pub fn scale(hwnd: HWND, value: i32) -> i32 {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
@@ -261,6 +264,50 @@ pub fn text_width(dc: HDC, font: HFONT, value: &[u16]) -> i32 {
         SelectObject(dc, old);
     }
     size.cx
+}
+
+/// Height of `value` wrapped to `width`, for notes drawn over several lines.
+pub fn wrapped_text_height(dc: HDC, font: HFONT, value: &str, width: i32) -> i32 {
+    if value.is_empty() {
+        return 0;
+    }
+    let value: Vec<u16> = value.encode_utf16().collect();
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: width.max(1),
+        bottom: 0,
+    };
+    unsafe {
+        let old = SelectObject(dc, font);
+        DrawTextW(
+            dc,
+            value.as_ptr(),
+            value.len() as i32,
+            &mut rect,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+        );
+        SelectObject(dc, old);
+    }
+    rect.bottom
+}
+
+/// Multi-line text drawn from the top of `rect`, wrapped to its width.
+pub fn wrapped_text(dc: HDC, value: &str, rect: &RECT, font: HFONT, color: u32) {
+    let value: Vec<u16> = value.encode_utf16().collect();
+    unsafe {
+        let old = SelectObject(dc, font);
+        SetBkMode(dc, TRANSPARENT as i32);
+        SetTextColor(dc, color);
+        DrawTextW(
+            dc,
+            value.as_ptr(),
+            value.len() as i32,
+            &mut { *rect },
+            DT_WORDBREAK | DT_NOPREFIX | DT_LEFT,
+        );
+        SelectObject(dc, old);
+    }
 }
 
 /// A name with its matched letters in semibold, cut with an ellipsis if it does not

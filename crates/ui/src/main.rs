@@ -8,6 +8,7 @@ mod frecency;
 mod rows;
 mod search;
 mod settings;
+mod settings_page;
 mod stats;
 mod thumbs;
 mod update;
@@ -38,24 +39,24 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, EM_SETMARGINS, HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS,
-    ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILD_TRANSPARENT, INITCOMMONCONTROLSEX, ImageList_Add,
-    ImageList_Create, ImageList_Destroy, ImageList_Draw, ImageList_Remove, ImageList_ReplaceIcon,
-    InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVHITTESTINFO, LVIF_TEXT, LVIR_BOUNDS,
-    LVIS_FOCUSED, LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_GETITEMRECT, LVM_GETNEXTITEM,
-    LVM_HITTEST, LVM_INSERTCOLUMNW, LVM_REDRAWITEMS, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETIMAGELIST, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVN_GETDISPINFOW, LVN_ITEMCHANGED,
-    LVNI_SELECTED, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDATA,
-    LVS_OWNERDRAWFIXED, LVS_REPORT, LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVS_SINGLESEL,
-    LVSIL_SMALL, MEASUREITEMSTRUCT, NM_DBLCLK, NMHDR, NMLVDISPINFOW, ODS_SELECTED, SetWindowTheme,
-    WC_LISTVIEWW,
+    DRAWITEMSTRUCT, EM_SETMARGINS, ICC_LISTVIEW_CLASSES, ILC_COLOR32, ILD_TRANSPARENT,
+    INITCOMMONCONTROLSEX, ImageList_Add, ImageList_Create, ImageList_Destroy, ImageList_Draw,
+    ImageList_Remove, ImageList_ReplaceIcon, InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH,
+    LVCOLUMNW, LVHITTESTINFO, LVIF_TEXT, LVIR_BOUNDS, LVIS_FOCUSED, LVIS_SELECTED, LVITEMW,
+    LVM_ENSUREVISIBLE, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_HITTEST, LVM_INSERTCOLUMNW,
+    LVM_REDRAWITEMS, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETIMAGELIST, LVM_SETITEMCOUNT,
+    LVM_SETITEMSTATE, LVN_GETDISPINFOW, LVN_ITEMCHANGED, LVNI_SELECTED, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDATA, LVS_OWNERDRAWFIXED, LVS_REPORT,
+    LVS_SHAREIMAGELISTS, LVS_SHOWSELALWAYS, LVS_SINGLESEL, LVSIL_SMALL, MEASUREITEMSTRUCT,
+    NM_DBLCLK, NMHDR, NMLVDISPINFOW, ODS_SELECTED, SetWindowTheme, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, RegisterHotKey, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    UnregisterHotKey, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
+    UnregisterHotKey, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN,
+    VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 
 use draw::scale;
@@ -67,22 +68,24 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CreatePopupMenu, CreateWindowExW,
-    DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
-    ES_AUTOHSCROLL, FindWindowW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
-    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
-    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2,
-    MB_ICONQUESTION, MB_YESNO, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS,
-    WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED,
-    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, FindWindowW, GWLP_USERDATA,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION,
+    IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO,
+    MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOWPOS,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT,
+    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER,
+    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
+/// `WM_SYSCOMMAND`'s menu-open command, sent for Alt+Space and F10.
+const SC_KEYMENU: usize = 0xf100;
 /// Sent when the user changes the Windows accent colour.
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const WM_MOUSELEAVE: u32 = 0x02a3;
@@ -117,21 +120,6 @@ const MENU_RESULT_FOLDER: usize = 211;
 const MENU_RESULT_COPY: usize = 212;
 const RETRY_TIMER: usize = 3;
 const NOTICE_TIMER: usize = 4;
-const SETTINGS_HOTKEY: usize = 301;
-const SETTINGS_STARTUP: usize = 304;
-const SETTINGS_SAVE: usize = 305;
-const SETTINGS_BACK: usize = 306;
-const SETTINGS_HISTORY: usize = 307;
-const SETTINGS_WIN_S: usize = 320;
-const SETTINGS_WINDOWS_SEARCH: usize = 321;
-/// The "what this costs" line, by position in `App::controls`.
-const SETTINGS_SIZES_ROW: usize = 9;
-/// Settings rows that need two lines: the skipped-folder note and the footprint.
-const SETTINGS_TALL_ROWS: [usize; 2] = [8, SETTINGS_SIZES_ROW];
-/// The "check for updates" button, at the end of the Settings list.
-const SETTINGS_UPDATE: usize = 322;
-const SETTINGS_CLEAR: usize = 308;
-const CHECKED: isize = 1;
 /// Result icons and previews, in pixels at 96 DPI.
 const ICON_SIZE: i32 = 32;
 /// Pictures kept before the image list starts over.
@@ -257,7 +245,17 @@ struct App {
     include_system: bool,
     hotkey_registered: bool,
     settings_open: bool,
-    controls: Vec<HWND>,
+    /// The settings page's lines and rects, rebuilt when its inputs change.
+    settings_page: settings_page::Page,
+    /// The settings row under the mouse, and the keyboard's row.
+    settings_hover: Option<usize>,
+    settings_cursor: Option<usize>,
+    /// How far the settings page is scrolled up (its wheel scrolling).
+    settings_scroll: i32,
+    /// The hotkey band is being edited: the next keys become the hotkey.
+    capturing: bool,
+    /// A hint about the capture, shown in the band until the next key.
+    capture_note: Option<&'static str>,
     light: Option<bool>,
     background: HBRUSH,
     surface_brush: HBRUSH,
@@ -323,7 +321,18 @@ impl App {
             include_system: false,
             hotkey_registered: false,
             settings_open: false,
-            controls: Vec::new(),
+            settings_page: settings_page::Page {
+                lines: Vec::new(),
+                hotkey: RECT::default(),
+                back: RECT::default(),
+                title: RECT::default(),
+                content: 0,
+            },
+            settings_hover: None,
+            settings_cursor: None,
+            settings_scroll: 0,
+            capturing: false,
+            capture_note: None,
             light: None,
             background: null_mut(),
             surface_brush: null_mut(),
@@ -541,10 +550,16 @@ impl App {
     }
 
     fn update_title(&self, hwnd: HWND) {
+        // The settings page keeps its own title; the sizes replies must not reset it.
+        let title = if self.settings_open {
+            "better_search  ·  Settings"
+        } else {
+            "better_search"
+        };
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
                 hwnd,
-                wide("better_search").as_ptr(),
+                wide(title).as_ptr(),
             )
         };
         self.refresh_status();
@@ -1108,42 +1123,20 @@ impl App {
 
     fn show_settings(&mut self, hwnd: HWND) {
         self.settings_open = true;
+        self.settings_cursor = None;
+        self.settings_hover = None;
+        self.capturing = false;
+        self.capture_note = None;
         unsafe {
             ShowWindow(hwnd, SW_SHOW);
             ShowWindow(self.edit, SW_HIDE);
             ShowWindow(self.list, SW_HIDE);
             ShowWindow(self.status_label, SW_HIDE);
-        }
-        for &control in &self.controls {
-            unsafe { ShowWindow(control, SW_SHOW) };
-        }
-        let hotkey = encode_hotkey(self.settings.modifiers, self.settings.key);
-        self.update_search_button();
-        self.update_sizes_label();
-        unsafe {
-            SendMessageW(self.controls[1], HKM_SETHOTKEY, hotkey, 0);
-            SendMessageW(
-                self.controls[3],
-                BM_SETCHECK,
-                self.settings.start_with_windows as usize,
-                0,
-            );
-            SendMessageW(
-                self.controls[4],
-                BM_SETCHECK,
-                self.settings.history as usize,
-                0,
-            );
-            SendMessageW(
-                self.controls[5],
-                BM_SETCHECK,
-                self.settings.win_s as usize,
-                0,
-            );
             SetForegroundWindow(hwnd);
-            SetFocus(self.controls[1]);
+            // The page itself takes the keys: arrows move, Enter activates, Esc goes back.
+            SetFocus(hwnd);
         }
-        self.layout(hwnd);
+        self.rebuild_page(hwnd);
         let title = wide("better_search  ·  Settings");
         unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, title.as_ptr())
@@ -1152,9 +1145,8 @@ impl App {
 
     fn show_search(&mut self, hwnd: HWND) {
         self.settings_open = false;
-        for &control in &self.controls {
-            unsafe { ShowWindow(control, SW_HIDE) };
-        }
+        self.settings_hover = None;
+        self.settings_cursor = None;
         unsafe {
             ShowWindow(self.edit, SW_SHOW);
             ShowWindow(self.list, SW_SHOW);
@@ -1190,36 +1182,50 @@ impl App {
         }
     }
 
-    fn save_settings(&mut self, hwnd: HWND) {
-        let hotkey = unsafe { SendMessageW(self.controls[1], HKM_GETHOTKEY, 0, 0) } as u32;
-        let Some((modifiers, key)) = decode_hotkey(hotkey) else {
-            message(
-                hwnd,
-                "Choose a key with Alt, Ctrl, Shift, or a combination.",
-            );
-            return;
+    /// Rebuilds the settings page for the current settings and service state. Called
+    /// when the page opens, when a row changes something, and when the sizes reading
+    /// or the window's size arrives.
+    fn rebuild_page(&mut self, hwnd: HWND) {
+        let mut rect = RECT::default();
+        unsafe { GetClientRect(hwnd, &mut rect) };
+        let s = |v: i32| scale(hwnd, v);
+        let width = (rect.right - 2 * s(draw::SPACE_XL)).max(0);
+        let fonts = self.fonts.as_ref();
+        let inputs = settings_page::Inputs {
+            start_with_windows: self.settings.start_with_windows,
+            history: self.settings.history,
+            win_s: self.settings.win_s,
+            windows_search: windows_search_row(),
+            sizes: sizes_text(self.sizes.as_ref()),
+            drives: settings::indexed_drives(),
         };
-        let next = settings::Settings {
-            key,
-            modifiers,
-            start_with_windows: unsafe { SendMessageW(self.controls[3], BM_GETCHECK, 0, 0) }
-                == CHECKED,
-            history: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) } == CHECKED,
-            win_s: unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED,
-            windows_search_asked: self.settings.windows_search_asked,
+        // Notes wrap inside their card: page width minus the card's side insets and
+        // the text padding on both ends.
+        let text_width = width - 2 * s(draw::SPACE_S) - 2 * s(draw::SPACE_L);
+        let device = unsafe { GetDC(hwnd) };
+        let note_height = |text: &str| {
+            fonts.map_or(0, |fonts| {
+                draw::wrapped_text_height(device, fonts.detail, text, text_width)
+            })
         };
-        if next.key != self.settings.key || next.modifiers != self.settings.modifiers {
-            if self.hotkey_registered {
-                unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
+        self.settings_page = settings_page::build(width, s, note_height, &inputs);
+        if !device.is_null() {
+            unsafe { ReleaseDC(hwnd, device) };
+        }
+        let max_scroll = (self.settings_page.content - rect.bottom).max(0);
+        self.settings_scroll = self.settings_scroll.min(max_scroll);
+        unsafe { InvalidateRect(hwnd, null(), 1) };
+    }
+
+    /// A switch was flipped: apply it at once, so there is nothing to save later.
+    fn apply_toggle(&mut self, hwnd: HWND, kind: settings_page::Toggle) {
+        let mut next = self.settings.clone();
+        match kind {
+            settings_page::Toggle::StartWithWindows => {
+                next.start_with_windows = !next.start_with_windows
             }
-            if unsafe { RegisterHotKey(hwnd, HOTKEY_ID, next.modifiers, next.key) } == 0 {
-                self.hotkey_registered = unsafe {
-                    RegisterHotKey(hwnd, HOTKEY_ID, self.settings.modifiers, self.settings.key)
-                } != 0;
-                message(hwnd, "That hotkey is already in use. Choose another.");
-                return;
-            }
-            self.hotkey_registered = true;
+            settings_page::Toggle::History => next.history = !next.history,
+            settings_page::Toggle::WinS => next.win_s = !next.win_s,
         }
         if next.start_with_windows != self.settings.start_with_windows
             && let Err(err) = next.apply_startup()
@@ -1231,18 +1237,141 @@ impl App {
             message(hwnd, &format!("Could not save settings: {err}"));
             return;
         }
-        winkey::set_search_off(winsearch::is_off());
         self.settings = next;
-        winkey::set_enabled(self.settings.win_s);
-        self.show_search(hwnd);
+        if kind == settings_page::Toggle::WinS {
+            winkey::set_enabled(self.settings.win_s);
+        }
+        self.rebuild_page(hwnd);
     }
 
-    /// One click switches Windows search; the button label says what the next press does.
+    /// A captured combination replaces the hotkey, or the old one is put back and
+    /// `false` returned with the band showing why.
+    fn apply_captured_hotkey(&mut self, hwnd: HWND, modifiers: u32, key: u32) -> bool {
+        if modifiers == self.settings.modifiers && key == self.settings.key {
+            return true;
+        }
+        if self.hotkey_registered {
+            unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
+        }
+        if unsafe { RegisterHotKey(hwnd, HOTKEY_ID, modifiers, key) } == 0 {
+            self.hotkey_registered = unsafe {
+                RegisterHotKey(hwnd, HOTKEY_ID, self.settings.modifiers, self.settings.key)
+            } != 0;
+            self.capture_note = Some("That hotkey is already in use. Choose another.");
+            return false;
+        }
+        self.hotkey_registered = true;
+        self.settings.modifiers = modifiers;
+        self.settings.key = key;
+        if let Err(err) = self.settings.save() {
+            message(hwnd, &format!("Could not save settings: {err}"));
+        }
+        true
+    }
+
+    /// What the hotkey band shows on its right: the prompt and keys held while
+    /// capturing, otherwise the current combination.
+    fn hotkey_display(&self) -> String {
+        if self.capturing {
+            if let Some(note) = self.capture_note {
+                return note.to_string();
+            }
+            let modifiers = held_modifiers();
+            if modifiers == 0 {
+                "Press the keys…".to_string()
+            } else {
+                settings_page::hotkey_name(modifiers, 0)
+            }
+        } else {
+            settings_page::hotkey_name(self.settings.modifiers, self.settings.key)
+        }
+    }
+
+    /// A key while the band is being edited: modifiers only update the prompt; any
+    /// other key either becomes the hotkey or explains why not.
+    fn capture_key(&mut self, hwnd: HWND, vk: u16) {
+        match vk {
+            VK_ESCAPE => self.capturing = false,
+            VK_CONTROL | VK_MENU | VK_SHIFT | VK_LWIN | VK_RWIN => {}
+            _ => {
+                let modifiers = held_modifiers();
+                let key = vk as u32;
+                if !settings_page::valid_combo(modifiers, key) {
+                    self.capture_note = Some("Use Ctrl, Alt, Shift or Win with another key.");
+                } else if self.apply_captured_hotkey(hwnd, modifiers, key) {
+                    self.capturing = false;
+                }
+            }
+        }
+        unsafe { InvalidateRect(hwnd, null(), 0) };
+    }
+
+    /// The row the keyboard points at, stepped over headings and notes.
+    fn step_cursor(&mut self, hwnd: HWND, down: bool) {
+        if self.settings_page.lines.is_empty() {
+            return;
+        }
+        let page = &self.settings_page;
+        let last = page.lines.len() - 1;
+        let mut index = self.settings_cursor.unwrap_or(0);
+        loop {
+            index = if down {
+                if index >= last {
+                    break;
+                }
+                index + 1
+            } else if index == 0 {
+                break;
+            } else {
+                index - 1
+            };
+            if !page.is_heading(index) {
+                self.settings_cursor = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = self.settings_cursor {
+            // Keep the pointed-at row on screen: scroll just enough to see it.
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(hwnd, &mut rect) };
+            let row = page.lines[index].rect;
+            let view = rect.bottom;
+            if row.top - self.settings_scroll < 0 {
+                self.settings_scroll = row.top;
+            } else if row.bottom - self.settings_scroll > view {
+                self.settings_scroll = (row.bottom - view).min(page.content - view).max(0);
+            }
+        }
+        unsafe { InvalidateRect(hwnd, null(), 1) };
+    }
+
+    /// Runs the row the keyboard or mouse chose.
+    fn activate_row(&mut self, hwnd: HWND, index: usize) {
+        let Some(line) = self.settings_page.lines.get(index) else {
+            return;
+        };
+        match &line.row {
+            settings_page::Row::Toggle { kind, .. } => {
+                let kind = *kind;
+                self.apply_toggle(hwnd, kind);
+            }
+            settings_page::Row::Action { kind, .. } => match kind {
+                settings_page::Action::WindowsSearch => self.toggle_windows_search(hwnd),
+                settings_page::Action::Updates => check_updates(hwnd),
+                settings_page::Action::ClearHistory => match self.history.clear() {
+                    Ok(()) => message(hwnd, "Open history cleared."),
+                    Err(err) => message(hwnd, &format!("Could not clear the history: {err}")),
+                },
+            },
+            _ => {}
+        }
+    }
+
+    /// One click switches Windows search; the row's title says what the next press does.
     fn toggle_windows_search(&mut self, hwnd: HWND) {
         let off = !winsearch::is_off();
         let outcome = winsearch::request(hwnd, off);
         winkey::set_search_off(winsearch::is_off());
-        self.update_search_button();
         if !outcome.changed {
             message(
                 hwnd,
@@ -1268,14 +1397,7 @@ impl App {
         }
         // Its footprint changed either way, so what the panel holds is now out of date.
         self.refresh_sizes(hwnd);
-    }
-
-    fn update_search_button(&self) {
-        let Some(&button) = self.controls.get(2) else {
-            return;
-        };
-        let text = wide(windows_search_label());
-        unsafe { SetWindowTextW(button, text.as_ptr()) };
+        self.rebuild_page(hwnd);
     }
 
     /// The first-run offer: one short explanation, then the user decides. Asked once only,
@@ -1334,25 +1456,17 @@ impl App {
         self.start_sizes(hwnd);
     }
 
-    /// A sizes reading arrived. It fills in the Settings line, and shows an offer that
-    /// was postponed because the panel was busy.
+    /// A sizes reading arrived. It fills in the Settings page's footprint note, and
+    /// shows an offer that was postponed because the panel was busy.
     fn apply_sizes(&mut self, hwnd: HWND, reading: stats::Reading) {
         self.sizes = Some(reading);
         if self.settings_open {
-            self.update_sizes_label();
+            self.rebuild_page(hwnd);
         }
         let idle = self.last_text.trim().is_empty();
         if self.offer_pending && idle && unsafe { IsWindowVisible(hwnd) } != 0 {
             self.show_windows_search_offer(hwnd);
         }
-    }
-
-    /// What better_search costs, and where the disk space goes.
-    fn update_sizes_label(&self) {
-        let Some(&label) = self.controls.get(SETTINGS_SIZES_ROW) else {
-            return;
-        };
-        unsafe { SetWindowTextW(label, wide(&sizes_text(self.sizes.as_ref())).as_ptr()) };
     }
 
     fn remember_windows_search(&mut self, hwnd: HWND) {
@@ -1368,21 +1482,9 @@ impl App {
         let pad = scale(hwnd, draw::SPACE_XL);
         let width = (rect.right - 2 * pad).max(0);
         if self.settings_open {
-            self.field = RECT::default();
-            self.footer = RECT::default();
-            self.gear = RECT::default();
-            let line = scale(hwnd, 35);
-            let top = scale(hwnd, 20);
-            let mut y = top;
-            for (i, &control) in self.controls.iter().enumerate() {
-                let height = if SETTINGS_TALL_ROWS.contains(&i) {
-                    line * 2
-                } else {
-                    line - scale(hwnd, 3)
-                };
-                unsafe { MoveWindow(control, pad, y, width, height, 1) };
-                y += height + scale(hwnd, 3);
-            }
+            // The page draws itself from the client rect; only the native hotkey
+            // control is placed, which `rebuild_page` does.
+            self.rebuild_page(hwnd);
             return;
         }
         let s = |v: i32| scale(hwnd, v);
@@ -1479,9 +1581,6 @@ impl App {
         assign(self.edit, fonts.search);
         assign(self.status_label, fonts.detail);
         assign(self.list, fonts.name);
-        for &control in &self.controls {
-            assign(control, fonts.ui);
-        }
         self.fonts = Some(fonts);
         // An owner-drawn list asks for its row height only when it is placed, so a
         // made-up position change makes it ask again after a DPI change.
@@ -1900,18 +1999,13 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
 }
 
-fn encode_hotkey(modifiers: u32, key: u32) -> usize {
-    (key as usize)
-        | (usize::from(modifiers & 4 != 0) << 8)
-        | (usize::from(modifiers & 2 != 0) << 9)
-        | (usize::from(modifiers & 1 != 0) << 10)
-}
-
-fn decode_hotkey(value: u32) -> Option<(u32, u32)> {
-    let key = value & 0xff;
-    let flags = (value >> 8) & 0xff;
-    let modifiers = ((flags & 1) << 2) | (flags & 2) | ((flags & 4) >> 2);
-    (key != 0 && modifiers != 0).then_some((modifiers, key))
+/// The modifiers held right now, as `RegisterHotKey`'s flags.
+fn held_modifiers() -> u32 {
+    let held = |vk: i32| unsafe { GetKeyState(vk) } < 0;
+    (u32::from(held(VK_CONTROL as i32)) * 0x2)
+        | (u32::from(held(VK_SHIFT as i32)) * 0x4)
+        | u32::from(held(VK_MENU as i32))
+        | (u32::from(held(VK_LWIN as i32) || held(VK_RWIN as i32)) * 0x8)
 }
 
 /// Extensions of shortcuts, shown without it: `Excel` instead of `Excel.lnk`.
@@ -1957,6 +2051,17 @@ fn windows_search_label() -> &'static str {
     } else {
         "Turn Windows search off (asks for admin)"
     }
+}
+
+/// The Windows-search row's title and second line, from the current state.
+fn windows_search_row() -> (String, String) {
+    let title = windows_search_label().to_owned();
+    let detail = if winsearch::is_off() {
+        "Windows search is off; its index files were removed".into()
+    } else {
+        "Windows search is on, and indexes in the background".into()
+    };
+    (title, detail)
 }
 
 /// The scope chip's text: the folder's own name, or the drive for a root.
@@ -2194,74 +2299,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 SetWindowSubclass(app.edit, Some(child_proc), EDIT_ID, hwnd as usize);
                 SetWindowSubclass(app.list, Some(child_proc), LIST_ID, hwnd as usize);
             }
-            let static_class = wide("STATIC");
-            let button_class = wide("BUTTON");
-            app.controls = vec![
-                control(hwnd, &static_class, "Hotkey (Alt+Space by default):", 0, 0),
-                control(
-                    hwnd,
-                    &wide("msctls_hotkey32"),
-                    "",
-                    SETTINGS_HOTKEY,
-                    WS_BORDER,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
-                    windows_search_label(),
-                    SETTINGS_WINDOWS_SEARCH,
-                    0,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
-                    "Start with Windows (current user only)",
-                    SETTINGS_STARTUP,
-                    BS_AUTOCHECKBOX as u32,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
-                    "Rank what I open higher (kept on this PC)",
-                    SETTINGS_HISTORY,
-                    BS_AUTOCHECKBOX as u32,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
-                    "Win+S and typing in Start open better_search",
-                    SETTINGS_WIN_S,
-                    BS_AUTOCHECKBOX as u32,
-                ),
-                control(hwnd, &button_class, "Clear open history", SETTINGS_CLEAR, 0),
-                control(
-                    hwnd,
-                    &static_class,
-                    &format!(
-                        "Service drives: {} (all fixed NTFS; selection deferred)",
-                        settings::indexed_drives()
-                    ),
-                    0,
-                    0,
-                ),
-                control(
-                    hwnd,
-                    &static_class,
-                    "Skipped folder counts and per-folder overrides are deferred; the service does not index their contents.",
-                    0,
-                    0,
-                ),
-                control(hwnd, &static_class, &sizes_text(None), 0, 0),
-                control(
-                    hwnd,
-                    &button_class,
-                    &format!("Check for updates (installed {})", update::current()),
-                    SETTINGS_UPDATE,
-                    0,
-                ),
-                control(hwnd, &button_class, "Save settings", SETTINGS_SAVE, 0),
-                control(hwnd, &button_class, "Back to search", SETTINGS_BACK, 0),
-            ];
             app.apply_font(hwnd);
             unsafe {
                 SendMessageW(
@@ -2311,6 +2348,33 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_LBUTTONDOWN => {
             let x = (l & 0xffff) as i16 as i32;
             let y = ((l >> 16) & 0xffff) as i16 as i32;
+            if app.settings_open {
+                // The page takes the mouse back; a row click acts at once.
+                unsafe { SetFocus(hwnd) };
+                let band = app.settings_page.hotkey;
+                let in_band = x >= band.left
+                    && x < band.right
+                    && y + app.settings_scroll >= band.top
+                    && y + app.settings_scroll < band.bottom;
+                if in_band {
+                    // The band is the field now: the next keys become the hotkey.
+                    app.capturing = true;
+                    app.capture_note = None;
+                    unsafe { InvalidateRect(hwnd, null(), 0) };
+                    return 0;
+                }
+                app.capturing = false;
+                app.capture_note = None;
+                let index = app
+                    .settings_page
+                    .line_at(x, y + app.settings_scroll)
+                    .filter(|&index| !app.settings_page.is_heading(index));
+                app.settings_cursor = index;
+                if let Some(index) = index {
+                    app.activate_row(hwnd, index);
+                }
+                return 0;
+            }
             let gear = app.gear;
             if !app.settings_open
                 && gear.right > gear.left
@@ -2324,6 +2388,46 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
+        WM_MOUSEMOVE if app.settings_open => {
+            let x = (l & 0xffff) as i16 as i32;
+            let y = ((l >> 16) & 0xffff) as i16 as i32;
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            unsafe { TrackMouseEvent(&mut track) };
+            let index = app
+                .settings_page
+                .line_at(x, y + app.settings_scroll)
+                .filter(|&index| !app.settings_page.is_heading(index));
+            if app.settings_hover != index {
+                app.settings_hover = index;
+                unsafe { InvalidateRect(hwnd, null(), 1) };
+            }
+            0
+        }
+        WM_MOUSELEAVE if app.settings_open => {
+            if app.settings_hover.take().is_some() {
+                unsafe { InvalidateRect(hwnd, null(), 1) };
+            }
+            0
+        }
+        WM_MOUSEWHEEL if app.settings_open => {
+            // The page scrolls when it is taller than the window.
+            let lines = ((w >> 16) as i16 as i32 / 120) * 3;
+            let mut rect = RECT::default();
+            unsafe { GetClientRect(hwnd, &mut rect) };
+            let row = scale(hwnd, draw::ROW_HEIGHT);
+            let max = (app.settings_page.content - rect.bottom).max(0);
+            let next = (app.settings_scroll - lines * row).clamp(0, max);
+            if next != app.settings_scroll {
+                app.settings_scroll = next;
+                unsafe { InvalidateRect(hwnd, null(), 1) };
+            }
+            0
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let device = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -2331,6 +2435,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             unsafe { GetClientRect(hwnd, &mut rect) };
             unsafe { FillRect(device, &rect, app.background) };
             if let Some(fonts) = &app.fonts
+                && app.settings_open
+            {
+                let view = settings_page::View {
+                    hover: app.settings_hover,
+                    cursor: app.settings_cursor,
+                    hotkey_text: app.hotkey_display(),
+                    capturing: app.capturing,
+                    offset: app.settings_scroll,
+                };
+                settings_page::paint(
+                    device,
+                    &app.settings_page,
+                    fonts,
+                    &app.colors,
+                    &view,
+                    &|v| scale(hwnd, v),
+                );
+            } else if let Some(fonts) = &app.fonts
                 && app.field.right > app.field.left
             {
                 let s = |v: i32| scale(hwnd, v);
@@ -2495,15 +2617,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     app.copy_selected(hwnd);
                     app.show_notice(hwnd, "Path copied");
                 }
-                SETTINGS_SAVE => app.save_settings(hwnd),
-                SETTINGS_BACK => app.show_search(hwnd),
-                SETTINGS_WINDOWS_SEARCH => app.toggle_windows_search(hwnd),
-                SETTINGS_UPDATE => check_updates(hwnd),
                 MENU_UPDATE => check_updates(hwnd),
-                SETTINGS_CLEAR => match app.history.clear() {
-                    Ok(()) => message(hwnd, "Open history cleared."),
-                    Err(err) => message(hwnd, &format!("Could not clear the history: {err}")),
-                },
                 _ => {}
             }
             0
@@ -2698,7 +2812,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
+        WM_KEYDOWN | WM_SYSKEYDOWN if app.settings_open && app.capturing => {
+            // With Alt held the keys arrive as WM_SYSKEYDOWN; swallow both, or the
+            // system menu would open instead of the capture finishing.
+            app.capture_key(hwnd, w as u16);
+            0
+        }
+        WM_SYSCHAR if app.settings_open => {
+            // TranslateMessage turns Alt keys into this; letting it through opens
+            // the window's system menu, which has no place on the page.
+            0
+        }
+        WM_SYSCOMMAND if app.settings_open && (w & 0xfff0) == SC_KEYMENU => 0,
         WM_KEYDOWN => {
+            if app.settings_open {
+                match w as u16 {
+                    VK_ESCAPE => app.show_search(hwnd),
+                    VK_RETURN | VK_SPACE => {
+                        if let Some(index) = app.settings_cursor {
+                            app.activate_row(hwnd, index);
+                        }
+                    }
+                    VK_DOWN | VK_UP => app.step_cursor(hwnd, w as u16 == VK_DOWN),
+                    _ => return unsafe { DefWindowProcW(hwnd, msg, w, l) },
+                }
+                return 0;
+            }
             match w as u16 {
                 VK_ESCAPE => app.hide_panel(hwnd),
                 VK_RETURN => app.open_selected(hwnd, unsafe { GetKeyState(VK_CONTROL as i32) } < 0),
@@ -2736,7 +2875,7 @@ fn run(start_hidden: bool) -> Result<(), String> {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let controls = INITCOMMONCONTROLSEX {
         dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
-        dwICC: ICC_LISTVIEW_CLASSES | ICC_HOTKEY_CLASS,
+        dwICC: ICC_LISTVIEW_CLASSES,
     };
     if unsafe { InitCommonControlsEx(&controls) } == 0 {
         return Err("cannot initialize common controls".into());
@@ -2929,18 +3068,6 @@ mod tests {
         assert_eq!(height, 728);
         assert_eq!(x, 1920 - width);
         assert_eq!(y, (1040 - height) / 2);
-    }
-
-    #[test]
-    fn hotkey_control_round_trips_alt_space_and_combinations() {
-        for (modifiers, key) in [(1, 32), (3, 75), (7, 90)] {
-            assert_eq!(
-                decode_hotkey(encode_hotkey(modifiers, key) as u32),
-                Some((modifiers, key))
-            );
-        }
-        assert_eq!(decode_hotkey(32), None);
-        assert_eq!(decode_hotkey(4 << 8), None);
     }
 
     fn sizes(
