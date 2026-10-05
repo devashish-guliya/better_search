@@ -341,6 +341,11 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - `apply()` sets or deletes the policy, runs `sc config` and `sc stop WSearch`
   (disabled, or delayed-auto plus start), and ends `SearchHost.exe`. Killing it alone
   is not enough, because it restarts within seconds.
+- **First-run offer:** the first time the panel opens (or is launched visible) while
+  Windows search is still on, `offer_windows_search` shows one `MessageBoxW` Yes/No
+  explaining the saving; `windows_search_asked=true` in `window.cfg` records the answer,
+  and Yes runs the elevated switch. If Windows search is already off, the flag is set
+  without a dialog.
 - One-click button: the label says what the press will do ("Turn Windows search off (asks
   for admin)" or "Turn Windows search back on (asks for admin)"), depending on the current
   state (control id `SETTINGS_WINDOWS_SEARCH` 321, `controls[2]`, the first control under

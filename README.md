@@ -85,11 +85,14 @@ search field; Backspace at the start of the field removes the chip and searches
 everything again. Letters and digits typed while Start is open close Start and go to
 better_search instead.
 
-The Settings checkbox "Turn off Windows search and its indexer" asks for admin once,
-then sets the `DisableSearch` policy, disables the `WSearch` service and closes
-`SearchHost.exe`; if Windows search still comes to the front, better_search closes it
-and opens itself. Unchecking it (or `bs-window --windows-search on`, elevated) turns
-it back on.
+The first time the panel opens while Windows search is still on, it explains what the
+change saves (a background indexer, its database on disk, and machine-wide reach into
+other accounts and apps) and offers to turn it off once; the answer is remembered. The
+gear's one-click switch does the same thing later: it asks for admin, sets the
+`DisableSearch` policy, disables the `WSearch` service and closes `SearchHost.exe`; if
+Windows search still comes to the front, better_search closes it and opens itself. A
+press in the other direction (or `bs-window --windows-search on`, elevated) turns it
+back on.
 
 Windows Settings pages (Display, Sound, Wi-Fi, Background, Installed apps, ...) are
 found by name and by common words (`wallpaper`, `uninstall`, `volume`), and Shut down,

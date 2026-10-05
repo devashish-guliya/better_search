@@ -67,17 +67,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
     ES_AUTOHSCROLL, FindWindowW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
-    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MF_STRING, MSG,
-    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
-    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE,
-    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
-    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE,
+    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_ICONQUESTION, MB_YESNO,
+    MF_STRING, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
+    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOWPOS,
+    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
+    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
+    WM_SIZE, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_BORDER, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 /// Sent when the user changes the Windows accent colour.
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
@@ -87,6 +87,8 @@ const EM_SETSEL: u32 = 0x00b1;
 /// Static control styles: vertically centred, single-line text cut with an ellipsis.
 const SS_CENTERIMAGE: u32 = 0x0200;
 const SS_ENDELLIPSIS: u32 = 0x4000;
+/// The Yes answer from `MessageBoxW`; this windows-sys version does not export it.
+const IDYES: i32 = 6;
 
 const CLASS: &str = "BetterSearchWindow";
 const EDIT_ID: usize = 101;
@@ -123,6 +125,21 @@ const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const KEY_HINTS: &str = "Ctrl+Enter  show in folder";
+/// Shown once, the first time the panel opens while Windows search is still on.
+const WINDOWS_SEARCH_OFFER: &str = "\
+better_search can replace Windows Start and Explorer search.
+
+Windows search keeps a background indexer running, maintains its own index database
+on disk, re-indexes your drives after changes, and is machine-wide: other accounts
+on this PC and apps that use it (Outlook and Photos search, for example) depend on
+it.
+
+better_search reads the file list from the drives directly: about 13 MB of memory,
+nothing at all while idle, and 1-3 milliseconds to answer each keystroke.
+
+Turn Windows search off now? That stops the indexer and frees its memory and disk
+space; Windows can rebuild the index later if you ever turn it back on. The change
+asks for administrator rights.";
 
 /// Default panel geometry: a square whose side is 70% of the work area height,
 /// centred vertically and flush with the right screen edge.
@@ -1060,6 +1077,9 @@ impl App {
         if hidden && !self.last_text.trim().is_empty() {
             self.query(hwnd);
         }
+        if hidden {
+            self.offer_windows_search(hwnd);
+        }
     }
 
     fn hide_panel(&mut self, hwnd: HWND) {
@@ -1085,6 +1105,7 @@ impl App {
                 == CHECKED,
             history: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) } == CHECKED,
             win_s: unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED,
+            windows_search_asked: self.settings.windows_search_asked,
         };
         if next.key != self.settings.key || next.modifiers != self.settings.modifiers {
             if self.hotkey_registered {
@@ -1134,6 +1155,36 @@ impl App {
         };
         let text = wide(windows_search_label());
         unsafe { SetWindowTextW(button, text.as_ptr()) };
+    }
+
+    /// The first-run offer: one explanation, then the user decides. Asked once only.
+    fn offer_windows_search(&mut self, hwnd: HWND) {
+        if self.settings.windows_search_asked {
+            return;
+        }
+        if winsearch::is_off() {
+            self.remember_windows_search(hwnd);
+            return;
+        }
+        let answer = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                hwnd,
+                wide(WINDOWS_SEARCH_OFFER).as_ptr(),
+                wide("Replace Windows search?").as_ptr(),
+                MB_YESNO | MB_ICONQUESTION,
+            )
+        };
+        self.remember_windows_search(hwnd);
+        if answer == IDYES {
+            self.toggle_windows_search(hwnd);
+        }
+    }
+
+    fn remember_windows_search(&mut self, hwnd: HWND) {
+        self.settings.windows_search_asked = true;
+        if let Err(err) = self.settings.save() {
+            message(hwnd, &format!("Could not save settings: {err}"));
+        }
     }
 
     fn layout(&mut self, hwnd: HWND) {
@@ -2398,6 +2449,9 @@ fn run(start_hidden: bool) -> Result<(), String> {
             ShowWindow(hwnd, SW_SHOW);
             SetFocus((*app).edit);
         }
+    }
+    if !start_hidden {
+        unsafe { (*app).offer_windows_search(hwnd) };
     }
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
