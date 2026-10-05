@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated with release `v0.2.3`. `docs/HANDOFF.md` is a shorter, self-contained summary
+Last updated with release `v0.2.6`. `docs/HANDOFF.md` is a shorter, self-contained summary
 of this record for starting a new chat.
 
 Current state, in short:
@@ -126,6 +126,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 | `3021d1a` | The first-run offer quotes measured numbers, turning Windows search off frees its index, the uninstall restores search and removes per-user data; version 0.2.5 |
+| `e310679` | Search finds the drives by letter or `c:`, and the first-run offer is short and plain; version 0.2.6 |
 
 ## 4. Current results on the development machine
 

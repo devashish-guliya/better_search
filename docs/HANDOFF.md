@@ -8,9 +8,8 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.5` (2026-10-05), with unreleased work
-on top: drives are searchable results, and the first-run offer is short and plain. 143
-workspace tests and 8 installer tests pass, and the code is on GitHub with six
+State at writing: branch `main`, released as `v0.2.6` (2026-10-05). The tree is clean, 143
+workspace tests and 8 installer tests pass, and the code is on GitHub with seven
 releases published. Nothing of better_search is installed on this machine; see
 "Current installed state" below.
 
@@ -65,9 +64,11 @@ Ask before big or machine-wide decisions.
   click in Settings, or Yes on the first-run offer.
 - Releases so far: 0.2.0 (first public), 0.2.1 (leftover cleanup), 0.2.2 (clean
   uninstall), 0.2.3 (quit the panel so its image is released), 0.2.4 (start the panel
-  after install), 0.2.5 (the offer quotes measured numbers, and turning Windows search off
-  frees its index). An installed copy upgrades in place through the panel's Check for
-  updates button; `bs-window.exe --check-updates` prints whether a newer release exists.
+  after install), 0.2.5 (the offer quoted measured numbers, and turning Windows search off
+  frees its index), 0.2.6 (drives are search results; the offer is short and plain, with
+  no numbers, and No is the default answer). An installed copy upgrades in place through
+  the panel's Check for updates button; `bs-window.exe --check-updates` prints whether a
+  newer release exists.
 - Settings for the window live at `%LOCALAPPDATA%\better_search\window.cfg`. Open
   history: `%LOCALAPPDATA%\better_search\history.tsv`. Service data (index and log):
   `%ProgramData%\better_search` (protected; only SYSTEM and Administrators can read it).
@@ -674,6 +675,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| `e310679` | Search finds the drives by letter or `c:`; the first-run offer is short and plain; version 0.2.6 |
 | `3021d1a` | The offer quotes measured numbers, and turning Windows search off frees its index; version 0.2.5 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
