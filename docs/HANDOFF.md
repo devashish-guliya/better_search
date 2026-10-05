@@ -8,8 +8,9 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: commit `438c7da` on branch `main` (2026-10-05). The tree is clean,
-and 120 workspace tests pass.
+State at writing: commit `06174d4` on branch `main` (2026-10-05). The tree is clean,
+126 workspace tests and 3 installer tests pass, and the code is on GitHub with the
+first release published.
 
 ---
 
@@ -21,7 +22,9 @@ replacement for **Windows Start search and Explorer search**.
 - Finds files, folders, apps (including Microsoft Store apps), Windows Settings pages
   and power commands by name as you type, in a few milliseconds.
 - Uses about 22 MB of RAM for the service and a few MB for the window, with zero idle CPU.
-- Local only. Nothing leaves the PC. Names only, not file contents (by design).
+- Local only. Nothing about your files or this PC leaves the machine, and no query is
+  ever logged. Names only, not file contents (by design). The single exception is the
+  update check, which the user starts and which only fetches a public file (section 5.7).
 - Opens from a tray icon, the **Alt+Space** hotkey, **Win+S**, or by **typing while
   Start is open**.
 - Target users are ordinary people with 1–2 TB drives, not only developers.
@@ -34,7 +37,10 @@ Ask before big or machine-wide decisions.
 - Windows 11 build 26200, Ryzen 5 3500U, Rust 1.98.1 (MSVC, edition 2024), Git 2.47.1.
 - Drives: `C:` 238 GB SSD; `D:` and `E:` are two partitions of one 932 GB HDD. About
   4 million files in total; about 610 K are kept in the index after clutter skipping.
-- Repository: `D:\better_search`, branch `main`, **local only (no remote, never push)**.
+- Repository: `D:\better_search`, branch `main`, with `origin` =
+  `https://github.com/devashish-guliya/better_search` (public). Releases are published
+  from there with `tools\release.ps1`; installed copies read the manifest at
+  `releases/latest/download/latest.txt`.
 - Shell: **Windows PowerShell 5.1**. No `&&` or `||`; use `;` and `$LASTEXITCODE`.
   Cargo writes progress to stderr, so PowerShell may report exit code 1 on success.
   Check the "Finished" line, or run it through `cmd /c "cargo ... 2>&1"`.
@@ -255,6 +261,7 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 | `settings.rs` | Loads and saves `window.cfg` |
 | `winkey.rs` | Low-level keyboard hook (Win+S, typing in Start), foreground watcher for SearchHost, Explorer folder lookup |
 | `winsearch.rs` | Turns Windows search off or on (elevated) |
+| `update.rs` | Update check, download, SHA-256 check and running the installer |
 
 ### 5.1 Look and behaviour
 
@@ -357,7 +364,28 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   better_search (`WM_WIN_S`).
 - The first elevated run took over 120 s, probably in `sc stop`, but it completed.
 
-### 5.7 The typing crash (fixed)
+### 5.7 Updates (`update.rs`) and releases
+
+- Releases live at `github.com/devashish-guliya/better_search`. Each one carries
+  `better-search-setup.exe` plus `latest.txt` (`version`, `url`, `sha256`), and the URL
+  inside the manifest uses `releases/latest/download`, so it never changes.
+- **Check for updates** in Settings (and in the tray menu) runs `check_updates`: the
+  fetch happens on its own thread, and every answer comes back as a message box. A newer
+  version asks once before downloading anything. The download is HTTPS through WinHTTP
+  with the system proxy, its SHA-256 is checked with `BCrypt`, a mismatch is deleted and
+  refused, and only then does `ShellExecuteExW runas` run the installer (one UAC prompt),
+  checking its exit code. Afterwards the window offers to restart into the new build
+  (`WM_RESTART`, which closes the window and starts the new program hidden or visible).
+- This is the only network access better_search makes. Nothing about the machine is
+  sent. `BETTER_SEARCH_UPDATE_URL` overrides the manifest address for tests (http is
+  allowed for `localhost` only), and `bs-window.exe --check-updates` prints the result
+  and exits 0 / 2 / 1 for nothing newer / newer / failed.
+- Publishing: raise the version in the workspace `Cargo.toml`, then
+  `.\tools\release.ps1 -Version 0.3.0` (add `-DryRun` to stage the files only). The
+  script checks the version, builds, writes the digest into `latest.txt` and runs
+  `gh release create`.
+
+### 5.8 The typing crash (fixed)
 
 - **Symptom:** the window crashed when typing fast. The event log showed USER32 at
   offset `0x24a82` (codes `c0000005` and `c000041d`); `cdb` resolved it to
@@ -368,9 +396,9 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   buffer, and `text_width("")` returns 0. The test `drawing_empty_text_is_safe` covers
   it.
 
-### 5.8 Other window features
+### 5.9 Other window features
 
-- **Tray:** Open, Settings, Pause (pauses window queries only) and Quit.
+- **Tray:** Open, Settings, Pause (pauses window queries only), Check for updates and Quit.
 - **Settings gear:** a glyph button at the right end of the search field opens the same
   Settings page (`WM_LBUTTONDOWN` hit test on `App::gear`), so Settings needs no tray trip.
 - **One panel per session:** `main()` looks for the window class first; a second launch
@@ -401,9 +429,19 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - **Uninstall:** checks `InstallLocation` first, removes the service, registry entries
   and binaries, asks whether to delete the index and logs (default **No**), and queues
   its own deletion for the next reboot.
-- `--inspect` is read-only and safe to run. **Do not run install or uninstall without
-  asking the user.** The binary is not code signed, so SmartScreen will warn.
-- Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`.
+- **Upgrade (added with the update check):** running the setup program on a machine where
+  the install is registered upgrades in place instead of refusing. It stops the service,
+  replaces the three programs and its own copy, refreshes the registry entries, and
+  starts the service again. Each file is written as `.new` and renamed over the target;
+  when the program is running (rename refused) the old image is renamed to `.old` first,
+  which Windows allows for a running image, and the new file takes its name. The running
+  window keeps the old code until it restarts. A failure restores the original, and a
+  folder that exists without a registration is still refused.
+- `--inspect` is read-only and safe to run. **Do not run install, upgrade or uninstall
+  without asking the user.** The binary is not code signed, so SmartScreen will warn.
+- Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`
+  (three tests: payloads are executables, a file swap writes through cleanly, a file
+  without delete sharing is refused without damage).
 
 ## 7. Key decisions (and why)
 
@@ -451,7 +489,8 @@ cargo test --workspace
 cargo build --release
 ```
 
-120 tests: index 37, query 35, engine 9, service 10, pipe 6, ntfs 3, cli 4, window 16.
+126 tests: index 37, query 35, engine 9, service 10, pipe 6, ntfs 3, cli 4, window 22.
+The installer crate has 3 more (its own `--manifest-path`).
 
 ### Updating the installed window after a change
 
@@ -490,12 +529,16 @@ it again.
   quoting gets mangled. A C# class named `K` with a method called `Main` fails to
   compile in `Add-Type` (it is treated as an entry point).
 
-### Commits
+### Commits and releases
 
 - Match the existing style (a short imperative summary).
 - End the message with
   `Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>`.
-- Never change the git identity. Never push; there is no remote.
+- Never change the git identity.
+- `origin` is the public GitHub repository `devashish-guliya/better_search`; `main` is
+  pushed there. To publish a release, raise the version in the workspace `Cargo.toml`
+  and run `.\tools\release.ps1 -Version <version>`. The manifest address compiled into
+  the window uses the repository name, so do not rename the repository casually.
 - Update `README.md` and `docs/PROJECT.md` (and this file) when behaviour changes.
 
 ### Style
@@ -509,6 +552,13 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| `06174d4` | GitHub releases, in-place installer upgrades, and a Check for updates button |
+| `d9b81c6` | First-run offer to turn Windows search off, with the reasoning |
+| `c79bc7a` | Settings gear, one-click Windows search switch, indexing wait, one panel per session |
+| `21b0540` | Drop the legacy hover/left keys from the settings test |
+| `e65a578` | Square panel (side = 70% of screen height), edge-hover pop-in removed |
+| `9a79804` | Default the window to a 9:16 right-edge panel at 70% of the screen |
+| `7b7810a` | Bring the project record up to date with the window work since Phase 5 |
 | `438c7da` | Typing crash fix (empty `DrawTextW`), Windows search off/on plus the SearchHost watcher, typing in Start opens better_search |
 | `0310085` | Win+S hook, `in:` folder scope from Explorer, scope chip, Settings pages and power commands |
 | `3fef8b5` | UI redesign: two-line owner-drawn rows, sections, highlights, `draw.rs` visual system |
@@ -530,7 +580,7 @@ Run `git log --oneline` for the full list of 36 commits.
   user. It needs backend state.
 - **Choosing which drives the service indexes** in the UI: deferred. It needs a
   protocol and backend design.
-- **Installer:** code signing, and a version or update check.
+- **Installer:** code signing (the update check and in-place upgrade are now built).
 - Showing results during the very first scan (about a minute): not decided.
 - More filters (for example folders only). `ext:` and `in:` already exist.
 - Watch in daily use:

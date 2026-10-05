@@ -9,6 +9,7 @@ mod rows;
 mod search;
 mod settings;
 mod thumbs;
+mod update;
 mod winkey;
 mod winsearch;
 
@@ -97,11 +98,14 @@ const STATUS_ID: usize = 103;
 const TRAY_MESSAGE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 /// A second launch asks the running window to come forward instead of opening again.
 const WM_SHOW_PANEL: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 7;
+/// The update worker asks the window to replace itself with the installed build.
+const WM_RESTART: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 8;
 const HOTKEY_ID: i32 = 1;
 const MENU_OPEN: usize = 201;
 const MENU_SETTINGS: usize = 202;
 const MENU_PAUSE: usize = 203;
 const MENU_QUIT: usize = 204;
+const MENU_UPDATE: usize = 205;
 const MENU_RESULT_OPEN: usize = 210;
 const MENU_RESULT_FOLDER: usize = 211;
 const MENU_RESULT_COPY: usize = 212;
@@ -114,6 +118,8 @@ const SETTINGS_BACK: usize = 306;
 const SETTINGS_HISTORY: usize = 307;
 const SETTINGS_WIN_S: usize = 320;
 const SETTINGS_WINDOWS_SEARCH: usize = 321;
+/// The "check for updates" button, at the end of the Settings list.
+const SETTINGS_UPDATE: usize = 322;
 const SETTINGS_CLEAR: usize = 308;
 const CHECKED: isize = 1;
 /// Result icons and previews, in pixels at 96 DPI.
@@ -1461,6 +1467,95 @@ fn message(hwnd: HWND, text: &str) {
     };
 }
 
+/// A yes/no question in the same style as [`message`]; true when the answer is Yes.
+fn confirm(hwnd: HWND, text: &str) -> bool {
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            hwnd,
+            wide(text).as_ptr(),
+            wide("better_search").as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        ) == IDYES
+    }
+}
+
+/// Asks the release host for the newest version and, if the user agrees, installs it.
+/// The network work runs on its own thread, because a slow answer must not freeze the
+/// panel; every answer comes back as a message box.
+fn check_updates(hwnd: HWND) {
+    let owner = hwnd as usize;
+    let started = std::thread::Builder::new()
+        .name("update".into())
+        .spawn(move || {
+            let hwnd = owner as HWND;
+            let manifest = match update::check() {
+                Ok(Some(manifest)) => manifest,
+                Ok(None) => {
+                    message(
+                        hwnd,
+                        &format!(
+                            "You have the newest version, better_search {}.",
+                            update::current()
+                        ),
+                    );
+                    return;
+                }
+                Err(err) => {
+                    message(hwnd, &format!("Could not check for updates.\n\n{err}"));
+                    return;
+                }
+            };
+            let question = format!(
+                "better_search {} is ready; you have {}.\n\nDownload and install it now?\n\nWindows will ask for permission, then the new version starts.",
+                manifest.version,
+                update::current()
+            );
+            if !confirm(hwnd, &question) {
+                return;
+            }
+            let installer = match update::download(&manifest) {
+                Ok(installer) => installer,
+                Err(err) => {
+                    message(hwnd, &err);
+                    return;
+                }
+            };
+            match update::install(hwnd, &installer) {
+                Ok(()) if confirm(hwnd, &format!("Restart better_search {} now?", manifest.version)) => {
+                    unsafe { PostMessageW(hwnd, WM_RESTART, 0, 0) };
+                }
+                Ok(()) => message(
+                    hwnd,
+                    &format!(
+                        "better_search {} starts the next time better_search runs.",
+                        manifest.version
+                    ),
+                ),
+                Err(err) => message(hwnd, &err),
+            }
+        });
+    if started.is_err() {
+        message(hwnd, "Could not start the update check.");
+    }
+}
+
+/// Closes this window and starts the freshly installed program in its place. The
+/// installer moved the old program aside, so the path this one was started from now
+/// holds the new build.
+fn restart(hwnd: HWND) {
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    // Start the new program the way this one started: hidden if the panel is hidden.
+    let visible = unsafe { IsWindowVisible(hwnd) } != 0;
+    unsafe { DestroyWindow(hwnd) };
+    let mut command = std::process::Command::new(program);
+    if !visible {
+        command.arg("--hidden");
+    }
+    let _ = command.spawn();
+}
+
 fn control(hwnd: HWND, class: &[u16], title: &str, id: usize, style: u32) -> HWND {
     let child = unsafe {
         CreateWindowExW(
@@ -1941,6 +2036,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     0,
                     0,
                 ),
+                control(
+                    hwnd,
+                    &button_class,
+                    &format!("Check for updates (installed {})", update::current()),
+                    SETTINGS_UPDATE,
+                    0,
+                ),
                 control(hwnd, &button_class, "Save settings", SETTINGS_SAVE, 0),
                 control(hwnd, &button_class, "Back to search", SETTINGS_BACK, 0),
             ];
@@ -2180,6 +2282,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 SETTINGS_SAVE => app.save_settings(hwnd),
                 SETTINGS_BACK => app.show_search(hwnd),
                 SETTINGS_WINDOWS_SEARCH => app.toggle_windows_search(hwnd),
+                SETTINGS_UPDATE => check_updates(hwnd),
+                MENU_UPDATE => check_updates(hwnd),
                 SETTINGS_CLEAR => match app.history.clear() {
                     Ok(()) => message(hwnd, "Open history cleared."),
                     Err(err) => message(hwnd, &format!("Could not clear the history: {err}")),
@@ -2197,6 +2301,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         (MENU_OPEN, "Open search"),
                         (MENU_SETTINGS, "Settings"),
                         (MENU_PAUSE, if app.paused { "Resume" } else { "Pause" }),
+                        (MENU_UPDATE, "Check for updates"),
                         (MENU_QUIT, "Quit"),
                     ],
                 ),
@@ -2211,6 +2316,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_SHOW_PANEL => {
             app.open_panel(hwnd);
+            0
+        }
+        WM_RESTART => {
+            restart(hwnd);
             0
         }
         winkey::WM_WIN_S => {
@@ -2464,6 +2573,31 @@ fn run(start_hidden: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// `--check-updates`: reports what the release host offers and exits, so the update
+/// path can be checked from a script or a terminal without opening the panel.
+/// Exit codes: 0 nothing newer, 2 something newer, 1 the check failed.
+fn check_updates_here() -> i32 {
+    match update::check() {
+        Ok(Some(manifest)) => {
+            println!(
+                "better_search {} is available (installed {}): {}",
+                manifest.version,
+                update::current(),
+                manifest.url
+            );
+            2
+        }
+        Ok(None) => {
+            println!("better_search {} is the newest version.", update::current());
+            0
+        }
+        Err(err) => {
+            eprintln!("better_search: could not check for updates: {err}");
+            1
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let [flag, state] = args.as_slice()
@@ -2471,6 +2605,9 @@ fn main() {
     {
         winsearch::apply(state == "off");
         return;
+    }
+    if args.iter().any(|arg| arg == "--check-updates") {
+        std::process::exit(check_updates_here());
     }
     let hidden = std::env::args_os()
         .skip(1)

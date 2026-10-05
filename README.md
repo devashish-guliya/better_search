@@ -31,6 +31,10 @@ cargo build --release
 # Launch the unelevated search window. Keep the service running for results.
 .\target\release\bs-window.exe
 
+# Ask the release host what is newer than this build, without opening the panel.
+# Exit code 0: this is the newest version; 2: something newer exists; 1: the check failed.
+.\target\release\bs-window.exe --check-updates
+
 # Search through the running service (no admin rights).
 .\target\release\bs.exe query readme
 .\target\release\bs.exe query --bench
@@ -134,7 +138,9 @@ service. Settings can turn it off or clear it.
 
 Settings let you change the hotkey, switch Windows search off or back on with one click
 (the button says which way it will go, and it asks for admin), and explicitly enable
-per-user start at sign-in (HKCU only). Window settings are saved at
+per-user start at sign-in (HKCU only). Settings also has a **Check for updates** button
+(the same entry is in the tray menu), which is the only network access better_search
+makes; see [Updates](#updates). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
 run `bs-window.exe --hidden` to do that manually. The drives shown in Settings are the fixed
 NTFS drives eligible for the service; changing the indexed drives is deferred because
@@ -201,8 +207,13 @@ What the draft does if it is run:
   `%ProgramFiles%\better_search`, and copies itself there as the uninstaller.
 - Registers and starts `better_search` as an auto-start service running as LocalSystem,
   and adds a machine-wide `Run` entry that starts `bs-window.exe --hidden` at sign-in.
-- Refuses to run if the service, install folder or registry entries already exist, and
-  rolls back files, service and registry entries if any step fails.
+- Refuses to install on a machine where the folder or registration exists but the
+  service does not, and rolls back files, service and registry entries if any step fails.
+- Running it again on an installed machine **upgrades in place**: it stops the service,
+  replaces the three programs and itself, refreshes the registry entries and starts the
+  service again. A running search window keeps working and is replaced by renaming its
+  file aside, so no step needs the window to be closed first. Settings, the snapshot and
+  the log are left alone.
 - Registers an entry in Apps & Features. Its Uninstall string runs
   `better-search-setup.exe --uninstall`, which stops and deletes the service, removes
   the files and registry entries, and asks (default No) before deleting the saved
@@ -217,6 +228,45 @@ removal on the next reboot. The binary is not code signed, so SmartScreen will w
 
 Registering the service can also still be done by hand (`sc.exe create`) or with a
 temporary development test.
+
+## Updates
+
+Releases live in the GitHub repository
+[`devashish-guliya/better_search`](https://github.com/devashish-guliya/better_search).
+Each release carries two files: `better-search-setup.exe` and a small `latest.txt`
+manifest. The manifest names the version, the installer's address and the installer's
+SHA-256:
+
+```
+version=0.1.0
+url=https://github.com/devashish-guliya/better_search/releases/latest/download/better-search-setup.exe
+sha256=…
+```
+
+**Check for updates** in Settings (or the tray menu) asks the release host for
+`latest.txt`, compares it with the installed version, and, if there is something newer,
+says which version is ready and asks before doing anything else. On a yes it downloads
+the installer, checks the SHA-256 against the manifest, refuses anything that does not
+match, and then runs the installer with one UAC prompt. When the installer finishes, the
+window offers to restart into the new version; the old program keeps running until then.
+A check that finds nothing new says so, and a check with no network says why.
+
+This is the only network access better_search makes, it happens only when you press the
+button, and nothing about this machine is sent: the request is a plain HTTPS GET for a
+public file. `BETTER_SEARCH_UPDATE_URL` overrides the manifest address for testing (a
+local HTTP server is accepted for `localhost` only).
+
+To publish a release, raise `version` in the workspace `Cargo.toml`, then:
+
+```powershell
+.\tools\release.ps1 -Version 0.2.0
+```
+
+The script builds the release binaries and the setup program, writes `latest.txt` with
+the new installer's digest, and creates the GitHub release with both files attached.
+Because the manifest URL uses `releases/latest`, no address has to change between
+releases. Nothing is code signed, so the installer still triggers a SmartScreen warning,
+and Windows will ask for permission when an update runs.
 
 ## The service
 

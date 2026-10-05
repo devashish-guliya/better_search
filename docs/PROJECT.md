@@ -4,9 +4,9 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `438c7da` ("Fix typing crash on empty text; turn off Windows
-search; typing in Start opens better_search"). `docs/HANDOFF.md` is a shorter,
-self-contained summary of this record for starting a new chat.
+Last updated after commit `06174d4` ("GitHub releases, in-place upgrades, and a Check for
+updates button"). `docs/HANDOFF.md` is a shorter, self-contained summary of this record
+for starting a new chat.
 
 Current state, in short:
 
@@ -21,7 +21,9 @@ Current state, in short:
   - Settings pages and power commands;
   - Win+S, scoped to the Explorer folder in front;
   - typing in Start;
-  - turning Windows search off (section 5.11).
+  - turning Windows search off (section 5.11);
+  - updates from GitHub releases, with one button that checks, verifies and installs
+    (section 5.12).
 - The pipe protocol is **version 2**. Version 2 adds the options byte and a hidden-match
   count, so system and app-folder matches are hidden by default (`78efd7a`). The skip
   rules are version 8.
@@ -102,6 +104,13 @@ Out of scope: searching file **contents**. Only names are searched.
 | `0310085` | Win+S hook, `in:` folder scope from Explorer, Settings pages and power commands |
 | `438c7da` | Typing crash fix, Windows search off/on with a SearchHost watcher, typing in Start |
 | `ec30dde` | `docs/HANDOFF.md` |
+| `7b7810a` | Bring the project record up to date with the window work since Phase 5 |
+| `9a79804` | Default the window to a 9:16 right-edge panel at 70% of the screen |
+| `e65a578` | Make the panel square and remove the edge-hover pop-in |
+| `21b0540` | Drop the legacy hover/left keys from the settings test |
+| `c79bc7a` | Settings gear, one-click Windows search switch, indexing wait, one panel per session |
+| `d9b81c6` | First-run offer to turn Windows search off, with the reasoning |
+| `06174d4` | GitHub releases, in-place upgrades, and a Check for updates button |
 
 ## 4. Current results on the development machine
 
@@ -774,6 +783,39 @@ elevated path at once instead of waiting for Save. An `EVENT_SYSTEM_FOREGROUND` 
   the index arrays, flags or snapshot format. The pipe moved to version 2 only for the
   hidden-match option (`78efd7a`).
 
+### 5.12 Updates (`crates/ui/src/update.rs`)
+
+Releases are published in the GitHub repository `devashish-guliya/better_search`. Each
+release carries `better-search-setup.exe` and a three-line `latest.txt` (`version`,
+`url`, `sha256`); the URL inside the manifest uses `releases/latest/download`, so the
+address never changes between releases.
+
+- **Check.** Settings has a "Check for updates (installed <version>)" button, and the
+  tray menu has the same entry. Both call `check_updates`, which does the network work on
+  its own thread (a slow answer must not freeze the panel) and reports through message
+  boxes. `update::check` fetches the manifest (64 KB cap), parses it (https only, 64 hex
+  digits for the digest) and compares versions by dotted numbers, so a suffix after `-`
+  or `+` never makes a version newer. A newer version asks once before anything is
+  downloaded.
+- **Download and verify.** WinHTTP (`WinHttpOpen`, automatic proxy setting, 10/10/20/20 s
+  timeouts, redirects followed, 64 MB cap) fetches the installer into
+  `%TEMP%\better-search-setup.exe`; `BCrypt` computes its SHA-256, and a mismatch deletes
+  the file and refuses to install. Only then does `ShellExecuteExW runas` run the
+  installer, and its exit code is checked.
+- **Restart.** The installer cannot overwrite a running program's image, so it renames
+  the old one aside (see Phase 5). The window keeps running the old code until
+  `restart` closes it with `WM_RESTART` and starts the new build from the same path,
+  hidden if the panel was hidden.
+- **Only network access.** A plain HTTPS GET for a public file; nothing about this
+  machine is sent. `BETTER_SEARCH_UPDATE_URL` overrides the manifest address for tests,
+  and `http://` is accepted only for `localhost`.
+- **Diagnostics.** `bs-window.exe --check-updates` prints the result and exits 0 (nothing
+  newer), 2 (something newer) or 1 (the check failed).
+- `tools/release.ps1` publishes: it refuses unless the version matches the workspace
+  `Cargo.toml`, builds the release binaries and the setup program, writes `latest.txt`
+  with the new installer's digest, and creates the release with `gh release create`
+  (`-DryRun` stages the two files without publishing).
+
 ---
 
 ## 6. Decisions and the reasons behind them
@@ -1065,6 +1107,18 @@ removes the registry entries, deletes the written files and removes the folder.
 The window auto-start is machine-wide because the service is, so the panel appears for
 every user; the snapshot and pipe keep their own per-service protection.
 
+Upgrade behaviour (added with the update check): no argument on a machine where the
+installation is registered runs `upgrade` instead of `install`. It opens the service and
+stops it, replaces the three programs and its own copy, refreshes the registry entries
+(`Run`, Apps & Features version and strings), starts the service again and waits for
+`SERVICE_RUNNING`. Files are written to a `.new` file and renamed over the target; when
+that fails because the program is running, the old image is renamed to `.old` first and
+the new file takes its place, which Windows allows because a running image keeps delete
+sharing. A failure puts the original back, so an installed program is never left
+missing. The window keeps running the old code until it restarts; settings, snapshot and
+log are untouched. Files that exist without a registration are still refused, so a
+half-removed install is not silently adopted.
+
 Uninstall behaviour: refuses unless the installer's own `InstallLocation` matches the
 expected folder (so it never deletes a service someone else registered), stops and
 deletes the service, removes the registry entries and the three binaries, then asks
@@ -1099,8 +1153,12 @@ Still open after the test:
 
 - The delayed self-delete was confirmed only through the queued
   `PendingFileRenameOperations` entries, not by observing a reboot.
-- The binary is **not code signed**, so SmartScreen will warn. Signing and a version or
-  update check remain open, as originally planned.
+- The binary is **not code signed**, so SmartScreen will warn. Signing stays open as
+  originally planned; the version and update check are now built (`06174d4`, section
+  5.12).
+- The installer's own checks are three tests in the crate: the bundled payloads are
+  Windows executables, a file swap writes through and leaves no scratch files behind,
+  and a file held without delete sharing is refused without damage.
 - The original Phase 5 plan is otherwise unchanged: one installer file, one UAC prompt,
   clean uninstall offering to keep or delete settings, and later code signing.
 
@@ -1120,17 +1178,16 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  120 workspace tests pass (index crate 37, query crate 35, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 16).
+  126 workspace tests pass (index crate 37, query crate 35, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 22).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
   first, then `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` with
-  `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored.
-  Only `--inspect` is safe to run unattended; install and uninstall were run once with
-  the user's approval through `target\admin_run\phase5_install.ps1`,
-  `phase5_window*.ps1` and `phase5_uninstall.ps1`, and must still not be run again
-  without asking.
+  `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored and
+  its three tests never touch the machine. `--inspect` is safe to run unattended;
+  install, upgrade and uninstall change the machine and must not be run without asking
+  (the one approved end-to-end run is recorded in Phase 5).
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
   in `D:\better_search\target\admin_run\` (ignored by git) and are run with
   `Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList
@@ -1164,6 +1221,11 @@ Still open after the test:
   `git -C D:\better_search commit -q -F .git\COMMIT_DRAFT.txt` in a separate step, then
   delete the draft. Messages end with
   `Co-authored-by: factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>`.
-  Do not change the git identity. There is no remote; do not push.
+  Do not change the git identity.
+- **Remote and releases:** `origin` is `https://github.com/devashish-guliya/better_search`
+  (public). `main` is pushed there, and `tools\release.ps1` publishes the setup program
+  and the manifest as a GitHub release. The manifest address is compiled into every
+  release, so the repository name must not change without a plan for installed copies
+  (GitHub redirects renamed repositories, but the address is still worth keeping).
 - **Style:** match existing code; comments only where the reason is not obvious; plain,
   direct explanations for the user, including trade-offs, before big decisions.

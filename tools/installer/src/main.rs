@@ -1,5 +1,6 @@
 //! Self-contained Windows setup. Building this binary is read-only; install and
 //! uninstall are explicit, elevated operations and are never run by the build.
+//! Running it on a machine where better_search is installed upgrades in place.
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -341,9 +342,96 @@ fn remove_registration() -> io::Result<()> {
     Ok(())
 }
 
+fn register_app(dir: &Path, self_file: &Path) -> io::Result<()> {
+    reg_text(
+        RUN_KEY,
+        SERVICE,
+        &format!("\"{}\" --hidden", dir.join("bs-window.exe").display()),
+    )?;
+    reg_text(UNINSTALL_KEY, "DisplayName", "better_search")?;
+    reg_text(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"))?;
+    reg_text(UNINSTALL_KEY, "Publisher", "better_search")?;
+    reg_text(UNINSTALL_KEY, "InstallLocation", &dir.display().to_string())?;
+    reg_text(
+        UNINSTALL_KEY,
+        "UninstallString",
+        &format!("\"{}\" --uninstall", self_file.display()),
+    )?;
+    reg_number(UNINSTALL_KEY, "NoModify", 1)?;
+    reg_number(UNINSTALL_KEY, "NoRepair", 1)
+}
+
+/// Writes `bytes` over `file`. Windows lets a running program's image be renamed but
+/// not overwritten, so a locked file is moved aside first; the running copy keeps
+/// working from the renamed file until it exits.
+fn replace_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    let temp = file.with_file_name(format!("{name}.new"));
+    {
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp)?;
+        io::Write::write_all(&mut out, bytes)?;
+    }
+    if std::fs::rename(&temp, file).is_ok() {
+        return Ok(());
+    }
+    let old = file.with_file_name(format!("{name}.old"));
+    let _ = std::fs::remove_file(&old);
+    if let Err(err) = std::fs::rename(file, &old) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    if let Err(err) = std::fs::rename(&temp, file) {
+        // Put the original back, so an installed program is never left missing.
+        let _ = std::fs::rename(&old, file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
+/// Replaces an existing installation in place: stops the service, swaps the files
+/// (a running window is moved aside, never killed), refreshes the registry and starts
+/// the service again. The running window keeps the old code until it is restarted.
+fn upgrade(scm: &Sc, dir: &Path) -> io::Result<()> {
+    let service = open_service(scm)?;
+    if let Some(service) = &service {
+        stop_service(service)?;
+    }
+    let swapped = (|| {
+        for &(name, bytes) in &FILES {
+            replace_file(&dir.join(name), bytes)?;
+        }
+        let self_file = dir.join("better-search-setup.exe");
+        replace_file(&self_file, &std::fs::read(std::env::current_exe()?)?)?;
+        register_app(dir, &self_file)
+    })();
+    if let Some(service) = service {
+        // SAFETY: no arguments; the SCM starts the service under LocalSystem.
+        let started = unsafe { StartServiceW(service.0, 0, null()) };
+        let running = if started == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            wait_started(&service)
+        };
+        swapped?;
+        running?;
+    } else {
+        swapped?;
+    }
+    Ok(())
+}
+
 fn install() -> io::Result<()> {
     let dir = install_dir()?;
     let scm = manager(SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE)?;
+    if registered_install(&dir)? {
+        return upgrade(&scm, &dir);
+    }
     if open_service(&scm)?.is_some()
         || dir.exists()
         || reg_text_value(RUN_KEY, SERVICE)?.is_some()
@@ -380,22 +468,7 @@ fn install() -> io::Result<()> {
 
         let service = create_service(&scm, &dir.join("bs-service.exe"))?;
         let registered = (|| {
-            reg_text(
-                RUN_KEY,
-                SERVICE,
-                &format!("\"{}\" --hidden", dir.join("bs-window.exe").display()),
-            )?;
-            reg_text(UNINSTALL_KEY, "DisplayName", "better_search")?;
-            reg_text(UNINSTALL_KEY, "DisplayVersion", env!("CARGO_PKG_VERSION"))?;
-            reg_text(UNINSTALL_KEY, "Publisher", "better_search")?;
-            reg_text(UNINSTALL_KEY, "InstallLocation", &dir.display().to_string())?;
-            reg_text(
-                UNINSTALL_KEY,
-                "UninstallString",
-                &format!("\"{}\" --uninstall", self_file.display()),
-            )?;
-            reg_number(UNINSTALL_KEY, "NoModify", 1)?;
-            reg_number(UNINSTALL_KEY, "NoRepair", 1)?;
+            register_app(&dir, &self_file)?;
             // SAFETY: no arguments; SCM starts under LocalSystem.
             if unsafe { StartServiceW(service.0, 0, null()) } == 0 {
                 return Err(io::Error::last_os_error());
@@ -560,5 +633,72 @@ mod tests {
         );
         assert!(install_dir().unwrap().ends_with("better_search"));
         assert!(data_dir().unwrap().ends_with("better_search"));
+    }
+
+    /// A scratch folder for the file-swap tests; nothing here is installed.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bs-swap-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn replacing_a_file_writes_through_and_leaves_nothing_behind() {
+        let dir = scratch("free");
+        let file = dir.join("bs-window.exe");
+        replace_file(&file, b"first").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"first");
+        replace_file(&file, b"second").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"second");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no scratch files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A running program's image denies write access but allows delete sharing, which
+    /// is what lets `replace_file` swap the file under a running better_search. A file
+    /// held without delete sharing fails cleanly and is left untouched.
+    #[test]
+    fn replacing_a_file_without_delete_sharing_fails_without_damage() {
+        let dir = scratch("locked");
+        let file = dir.join("bs-window.exe");
+        std::fs::write(&file, b"old").unwrap();
+        let name = wide_path(&file);
+        // SAFETY: NUL-terminated path, default security attributes, existing file.
+        let handle = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                name.as_ptr(),
+                windows_sys::Win32::Foundation::GENERIC_READ,
+                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+                null(),
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+        assert_ne!(
+            handle,
+            windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
+            "could not hold the file open: {}",
+            io::Error::last_os_error()
+        );
+        let outcome = replace_file(&file, b"new");
+        // SAFETY: the handle came from CreateFileW above and is closed once.
+        unsafe { CloseHandle(handle) };
+        assert!(
+            outcome.is_err(),
+            "a file without delete sharing must not be replaced"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no scratch files"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,11 +11,13 @@ name = "bs-window"
 path = "src/main.rs"
 
 [dependencies]
-bs-pipe = { version = "0.1.0", path = "../pipe" }
+bs-pipe = { version = "0.2.0", path = "../pipe" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_DataExchange",
