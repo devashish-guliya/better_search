@@ -20,8 +20,6 @@ const VALUE: &str = "better_search";
 pub struct Settings {
     pub modifiers: u32,
     pub key: u32,
-    pub hover: bool,
-    pub left: bool,
     pub start_with_windows: bool,
     /// Rank results the user opened before higher (see `frecency`).
     pub history: bool,
@@ -34,8 +32,6 @@ impl Default for Settings {
         Self {
             modifiers: MOD_ALT,
             key: u32::from(b' '),
-            hover: true,
-            left: false,
             start_with_windows: false,
             history: true,
             win_s: true,
@@ -74,8 +70,6 @@ impl Settings {
                             settings.key = n;
                         }
                     }
-                    "hover" => settings.hover = value == "true",
-                    "left" => settings.left = value == "true",
                     "start_with_windows" => settings.start_with_windows = value == "true",
                     "history" => settings.history = value != "false",
                     "win_s" => settings.win_s = value != "false",
@@ -102,14 +96,8 @@ impl Settings {
         fs::write(
             &tmp,
             format!(
-                "modifiers={}\nkey={}\nhover={}\nleft={}\nstart_with_windows={}\nhistory={}\nwin_s={}\n",
-                self.modifiers,
-                self.key,
-                self.hover,
-                self.left,
-                self.start_with_windows,
-                self.history,
-                self.win_s
+                "modifiers={}\nkey={}\nstart_with_windows={}\nhistory={}\nwin_s={}\n",
+                self.modifiers, self.key, self.start_with_windows, self.history, self.win_s
             ),
         )?;
         fs::rename(tmp, path)
@@ -236,13 +224,12 @@ mod tests {
 
     #[test]
     fn parses_settings_and_recovers_from_broken_hotkeys() {
+        // `hover` and `left` keys from older config files are ignored.
         let settings = Settings::parse(
             "modifiers=3\nkey=75\nhover=false\nleft=true\nstart_with_windows=true\n",
         );
         assert_eq!(settings.key, 75);
         assert_eq!(settings.modifiers, 3);
-        assert!(!settings.hover);
-        assert!(settings.left);
         assert!(settings.start_with_windows);
         assert_eq!(Settings::parse("key=9999").key, u32::from(b' '));
         assert!(settings.history);

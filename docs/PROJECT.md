@@ -44,7 +44,7 @@ The fastest and leanest file and folder **name** search for Windows:
 - Uses as little RAM, CPU and disk as possible. Idle CPU should be zero.
 - Local only. Nothing leaves the PC.
 - One-click install, and instant access from anywhere: a tray icon, the **Alt+Space**
-  hotkey, and a hover zone at the right screen edge that slides the search panel in.
+  hotkey, and Win+S. The panel opens as a square at the right screen edge.
 - Target users: ordinary people with 1–2 TB drives, not only developers.
 
 - Since Phase 5, it also replaces Windows Start and Explorer search. It finds apps
@@ -203,7 +203,7 @@ A Cargo workspace with eight crates:
 | `crates/pipe` | `bs-pipe` | Message format of the service's named pipe, and a client for it |
 | `crates/service` | `bs-service` (binary `bs-service.exe`) | Background service: owns the index, answers searches |
 | `crates/cli` | `bs-cli` (binary `bs`) | Console tools: index and search locally, `bs query` through the service |
-| `crates/ui` | `bs-window` (binary `bs-window.exe`) | Unelevated native Win32 panel, tray, hotkey, edge hover, per-user settings |
+| `crates/ui` | `bs-window` (binary `bs-window.exe`) | Unelevated native Win32 panel, tray, hotkey, per-user settings |
 
 Dependencies are deliberately few: `windows-sys` (raw Win32 bindings), `hashbrown`,
 `zstd`, `memchr`, `rayon`. Release profile: `opt-level=3`, LTO, one codegen unit,
@@ -692,8 +692,8 @@ and reports a clear message when the service is not running.
   Icons or MDL2 glyphs), colour roles (panel, surface, hover, selected, text,
   secondary, edge, accent) on Windows 11's base colours, and the user's accent colour
   (lightened on dark). Rounded Win11 corners and a caption matching the panel. Default
-  geometry (`panel_rect`): 9:16 portrait, 70% of the work area tall, centred vertically
-  against the right (or left) edge; used at startup and by the hover slide.
+  geometry (`panel_rect`): a square whose side is 70% of the work area height, centred
+  vertically against the right edge, used at startup.
 - The panel has three bands: a rounded search field (search glyph, placeholder via
   `EM_SETCUEBANNER`, accent underline while focused), the results, and a footer with
   the result count and a `Ctrl+Enter` hint that gives way when the count needs the
@@ -728,8 +728,8 @@ and reports a clear message when the service is not running.
 - A tray icon provides Open, Settings, Pause and Quit. Pause suspends **window queries
   only**, not the service's journaling and saving. The global hotkey defaults to Alt+Space;
   if Windows or another app owns it, the tray still works and Settings can change it.
-  A transparent non-activating four-pixel edge zone on each monitor waits 280 ms before
-  sliding the panel in; it can be disabled or moved to the left edge. Window positioning
+  The screen-edge hover pop-in and its slide animation were removed by user decision
+  (2026-10-05); Win+S, Alt+Space and the tray open the panel. Window positioning
   and child layout scale with the monitor DPI.
 - **Open history (frecency).** The window records the path of each file it opens (not
   "open folder") in `%LOCALAPPDATA%\better_search\history.tsv` as `weight`, `last-open
@@ -810,7 +810,7 @@ and reports a clear message when the service is not running.
 | `bs query` in the existing console tool, not a new binary | Keeps one small tool; the pipe client is in `bs-pipe` so the UI can reuse it |
 | One persistent window connection and a worker thread | Type-ahead narrowing works across keystrokes, and blocking pipe I/O cannot freeze input or painting |
 | Virtual list and cached shell system icons | Only visible rows request text/icons; an extension-level cache avoids filesystem I/O and a per-result icon allocation |
-| Per-user settings, not service configuration | Hotkey/hover/startup need no admin rights; changing service-wide indexed drives requires a separate backend design |
+| Per-user settings, not service configuration | Hotkey/startup need no admin rights; changing service-wide indexed drives requires a separate backend design |
 | No fake skipped-folder count or drive filtering in the UI | The protocol cannot return skipped contents or search a subset of drives accurately; the user explicitly deferred the locked protocol/index changes |
 
 ## 7. Locked in (do not change without discussing)
@@ -986,7 +986,8 @@ in `run_ui_smoke.ps1`; `run_ui_hidden.ps1` checked tray-first startup. Subsequen
 `ui_denied.txt` and `ui_loading_ready.txt` verified a user-owned fake pipe is denied
 and a real service progresses from loading to 1,674 matches and 200 virtual rows
 (5,640,192 window private bytes). Context actions and theme changes are implemented
-but remain untested end to end.
+but remain untested end to end. The edge hover zone and its slide were removed by
+user decision on 2026-10-05; the panel opens from Win+S, Alt+Space and the tray only.
 
 **Deferred by user decision:** the skipped-folder result count and per-folder
 overrides. Neither the pipe protocol nor index model may change for this increment.

@@ -21,7 +21,7 @@ in [docs/PROJECT.md](docs/PROJECT.md).
 | `crates/pipe` | Message format of the service's named pipe, and a client for it |
 | `crates/service` | `bs-service.exe`: the background service that owns the index |
 | `crates/cli` | `bs`: console tool that indexes and searches locally, and `bs query` through the service |
-| `crates/ui` | `bs-window.exe`: native search panel, virtual results, tray, hotkey, hover zone, per-user settings |
+| `crates/ui` | `bs-window.exe`: native search panel, virtual results, tray, hotkey, per-user settings |
 
 ## Usage
 
@@ -51,9 +51,9 @@ cargo build --release
 .\target\release\bs.exe --synthetic 5000000 --bench
 ```
 
-The window starts with Alt+Space (if Windows has not reserved it) and a short hover at
-the right screen edge. It opens as a tall 9:16 panel, 70% of the screen height, centred
-vertically against that edge. Double-click its tray icon to open it; right-click for Open,
+The window starts with Alt+Space (if Windows has not reserved it) or Win+S. It opens as a
+square panel whose side is 70% of the screen height, centred vertically against the right
+edge. Double-click its tray icon to open it; right-click for Open,
 Settings, Pause or Quit. Pause stops window searches, not the background index. Type to
 search, use the arrow keys, Enter to open, Ctrl+Enter to select the result in Explorer,
 or right-click a result for Open, Open folder and Copy path. Esc hides the window.
@@ -127,7 +127,7 @@ recently you opened a file and is capped, so only heavy use overtakes an exact n
 `%LOCALAPPDATA%\better_search\history.tsv` (at most 2,000 paths) and never reaches the
 service. Settings can turn it off or clear it.
 
-Settings let you change the hotkey and edge side, disable edge hover, and explicitly
+Settings let you change the hotkey and explicitly
 enable per-user start at sign-in (HKCU only). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
 run `bs-window.exe --hidden` to do that manually. The drives shown in Settings are the fixed

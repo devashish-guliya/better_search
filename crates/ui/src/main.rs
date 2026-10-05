@@ -5,7 +5,6 @@ mod apps;
 mod commands;
 mod draw;
 mod frecency;
-mod hover;
 mod rows;
 mod search;
 mod settings;
@@ -29,8 +28,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
     DEFAULT_GUI_FONT, DT_CENTER, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC,
     DeleteObject, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
-    PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
+    ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -73,10 +72,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
     SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON,
     TrackPopupMenu, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
-    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
+    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM,
+    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
     WM_WINDOWPOSCHANGED, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
     WS_VISIBLE,
 };
@@ -102,12 +101,9 @@ const MENU_QUIT: usize = 204;
 const MENU_RESULT_OPEN: usize = 210;
 const MENU_RESULT_FOLDER: usize = 211;
 const MENU_RESULT_COPY: usize = 212;
-const ANIMATION_TIMER: usize = 2;
 const RETRY_TIMER: usize = 3;
 const NOTICE_TIMER: usize = 4;
 const SETTINGS_HOTKEY: usize = 301;
-const SETTINGS_HOVER: usize = 302;
-const SETTINGS_SIDE: usize = 303;
 const SETTINGS_STARTUP: usize = 304;
 const SETTINGS_SAVE: usize = 305;
 const SETTINGS_BACK: usize = 306;
@@ -126,25 +122,15 @@ const EC_RIGHTMARGIN: usize = 0x0002;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const KEY_HINTS: &str = "Ctrl+Enter  show in folder";
 
-struct Slide {
-    from: i32,
-    to: i32,
-    top: i32,
-    width: i32,
-    height: i32,
-    frame: i32,
-}
-
-/// Default panel geometry: 9:16 portrait, 70% of the work area tall, centred
-/// vertically and flush with the right (or left) screen edge.
-fn panel_rect(work: RECT, left: bool) -> (i32, i32, i32, i32) {
+/// Default panel geometry: a square whose side is 70% of the work area height,
+/// centred vertically and flush with the right screen edge.
+fn panel_rect(work: RECT) -> (i32, i32, i32, i32) {
     let work_width = work.right - work.left;
     let work_height = work.bottom - work.top;
-    let height = (work_height * 7 / 10).max(1);
-    let width = (height * 9 / 16).min(work_width);
-    let x = if left { work.left } else { work.right - width };
-    let y = work.top + (work_height - height) / 2;
-    (x, y, width, height)
+    let side = (work_height * 7 / 10).max(1).min(work_width);
+    let x = work.right - side;
+    let y = work.top + (work_height - side) / 2;
+    (x, y, side, side)
 }
 
 struct App {
@@ -191,8 +177,6 @@ struct App {
     /// Per session, so the window always starts with the tidy view.
     include_system: bool,
     hotkey_registered: bool,
-    hover: hover::Hover,
-    slide: Option<Slide>,
     settings_open: bool,
     controls: Vec<HWND>,
     light: Option<bool>,
@@ -248,8 +232,6 @@ impl App {
             paused: false,
             include_system: false,
             hotkey_registered: false,
-            hover: hover::Hover::new(),
-            slide: None,
             settings_open: false,
             controls: Vec::new(),
             light: None,
@@ -1001,72 +983,6 @@ impl App {
         }
     }
 
-    fn slide_in(&mut self, hwnd: HWND) {
-        if unsafe { IsWindowVisible(hwnd) } != 0 {
-            unsafe { SetForegroundWindow(hwnd) };
-            return;
-        }
-        if self.settings_open {
-            self.show_search(hwnd);
-        }
-        let mut cursor = POINT::default();
-        unsafe { GetCursorPos(&mut cursor) };
-        let monitor = unsafe { MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST) };
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
-            return;
-        }
-        let work = info.rcWork;
-        let left = self.settings.left;
-        let (to, top, width, height) = panel_rect(work, left);
-        let from = if left { work.left - width } else { work.right };
-        self.slide = Some(Slide {
-            from,
-            to,
-            top,
-            width,
-            height,
-            frame: 0,
-        });
-        unsafe {
-            SetWindowPos(hwnd, null_mut(), from, top, width, height, SWP_NOZORDER);
-            ShowWindow(hwnd, SW_SHOW);
-            SetTimer(hwnd, ANIMATION_TIMER, 15, None);
-        }
-        if !self.last_text.trim().is_empty() {
-            self.query(hwnd);
-        }
-    }
-
-    fn advance_slide(&mut self, hwnd: HWND) {
-        let Some(slide) = &mut self.slide else { return };
-        slide.frame += 1;
-        let fraction = slide.frame.min(12);
-        let x = slide.from + (slide.to - slide.from) * fraction * (24 - fraction) / 144;
-        unsafe {
-            SetWindowPos(
-                hwnd,
-                null_mut(),
-                x,
-                slide.top,
-                slide.width,
-                slide.height,
-                SWP_NOZORDER,
-            )
-        };
-        if fraction == 12 {
-            unsafe {
-                KillTimer(hwnd, ANIMATION_TIMER);
-                SetForegroundWindow(hwnd);
-                SetFocus(self.edit)
-            };
-            self.slide = None;
-        }
-    }
-
     fn show_settings(&mut self, hwnd: HWND) {
         self.settings_open = true;
         unsafe {
@@ -1084,35 +1000,23 @@ impl App {
             SendMessageW(
                 self.controls[2],
                 BM_SETCHECK,
-                self.settings.hover as usize,
+                self.settings.start_with_windows as usize,
                 0,
             );
             SendMessageW(
                 self.controls[3],
                 BM_SETCHECK,
-                self.settings.left as usize,
+                self.settings.history as usize,
                 0,
             );
             SendMessageW(
                 self.controls[4],
                 BM_SETCHECK,
-                self.settings.start_with_windows as usize,
-                0,
-            );
-            SendMessageW(
-                self.controls[5],
-                BM_SETCHECK,
-                self.settings.history as usize,
-                0,
-            );
-            SendMessageW(
-                self.controls[6],
-                BM_SETCHECK,
                 self.settings.win_s as usize,
                 0,
             );
             SendMessageW(
-                self.controls[7],
+                self.controls[5],
                 BM_SETCHECK,
                 winsearch::is_off() as usize,
                 0,
@@ -1159,11 +1063,9 @@ impl App {
 
     fn hide_panel(&mut self, hwnd: HWND) {
         unsafe {
-            KillTimer(hwnd, ANIMATION_TIMER);
             KillTimer(hwnd, RETRY_TIMER);
             ShowWindow(hwnd, SW_HIDE);
         }
-        self.slide = None;
     }
 
     fn save_settings(&mut self, hwnd: HWND) {
@@ -1178,12 +1080,10 @@ impl App {
         let next = settings::Settings {
             key,
             modifiers,
-            hover: unsafe { SendMessageW(self.controls[2], BM_GETCHECK, 0, 0) } == CHECKED,
-            left: unsafe { SendMessageW(self.controls[3], BM_GETCHECK, 0, 0) } == CHECKED,
-            start_with_windows: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) }
+            start_with_windows: unsafe { SendMessageW(self.controls[2], BM_GETCHECK, 0, 0) }
                 == CHECKED,
-            history: unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED,
-            win_s: unsafe { SendMessageW(self.controls[6], BM_GETCHECK, 0, 0) } == CHECKED,
+            history: unsafe { SendMessageW(self.controls[3], BM_GETCHECK, 0, 0) } == CHECKED,
+            win_s: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) } == CHECKED,
         };
         if next.key != self.settings.key || next.modifiers != self.settings.modifiers {
             if self.hotkey_registered {
@@ -1208,7 +1108,7 @@ impl App {
             message(hwnd, &format!("Could not save settings: {err}"));
             return;
         }
-        let search_off = unsafe { SendMessageW(self.controls[7], BM_GETCHECK, 0, 0) } == CHECKED;
+        let search_off = unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED;
         if search_off != winsearch::is_off() && !winsearch::request(hwnd, search_off) {
             message(
                 hwnd,
@@ -1218,8 +1118,6 @@ impl App {
         winkey::set_search_off(winsearch::is_off());
         self.settings = next;
         winkey::set_enabled(self.settings.win_s);
-        self.hover
-            .rebuild(hwnd, self.settings.hover, self.settings.left);
         self.show_search(hwnd);
     }
 
@@ -1235,7 +1133,7 @@ impl App {
             let top = scale(hwnd, 20);
             let mut y = top;
             for (i, &control) in self.controls.iter().enumerate() {
-                let height = if i == 10 {
+                let height = if i == 8 {
                     line * 2
                 } else {
                     line - scale(hwnd, 3)
@@ -1916,20 +1814,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 control(
                     hwnd,
                     &button_class,
-                    "Open on screen-edge hover",
-                    SETTINGS_HOVER,
-                    BS_AUTOCHECKBOX as u32,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
-                    "Use left edge (unchecked: right)",
-                    SETTINGS_SIDE,
-                    BS_AUTOCHECKBOX as u32,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
                     "Start with Windows (current user only)",
                     SETTINGS_STARTUP,
                     BS_AUTOCHECKBOX as u32,
@@ -2254,14 +2138,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
-        hover::WM_HOVER_TRIGGER => {
-            app.slide_in(hwnd);
-            0
-        }
-        WM_TIMER if w == ANIMATION_TIMER => {
-            app.advance_slide(hwnd);
-            0
-        }
         WM_TIMER if w == RETRY_TIMER => {
             unsafe { KillTimer(hwnd, RETRY_TIMER) };
             if !app.paused
@@ -2277,11 +2153,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     });
                 }
             }
-            0
-        }
-        WM_DISPLAYCHANGE => {
-            app.hover
-                .rebuild(hwnd, app.settings.hover, app.settings.left);
             0
         }
         WM_DPICHANGED => {
@@ -2389,10 +2260,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_DESTROY => {
             unsafe {
                 KillTimer(hwnd, RETRY_TIMER);
-                KillTimer(hwnd, ANIMATION_TIMER);
                 KillTimer(hwnd, NOTICE_TIMER)
             };
-            app.hover.rebuild(hwnd, false, false);
             if app.hotkey_registered {
                 unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
             }
@@ -2427,9 +2296,6 @@ fn run(start_hidden: bool) -> Result<(), String> {
     if unsafe { RegisterClassW(&class) } == 0 {
         return Err("cannot register the window class".into());
     }
-    if !hover::register() {
-        return Err("cannot register the hover zone".into());
-    }
     let hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -2453,20 +2319,17 @@ fn run(start_hidden: bool) -> Result<(), String> {
         ));
     }
     let app = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App };
-    // The startup default: a 9:16 panel at the right edge, centred vertically.
+    // The startup default: a square panel at the right edge, centred vertically.
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     let mut info = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
         ..Default::default()
     };
     if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
-        let (x, y, width, height) = panel_rect(info.rcWork, unsafe { (*app).settings.left });
+        let (x, y, width, height) = panel_rect(info.rcWork);
         unsafe { SetWindowPos(hwnd, null_mut(), x, y, width, height, SWP_NOZORDER) };
     }
     unsafe {
-        (*app)
-            .hover
-            .rebuild(hwnd, (*app).settings.hover, (*app).settings.left);
         if !start_hidden {
             ShowWindow(hwnd, SW_SHOW);
             SetFocus((*app).edit);
@@ -2555,22 +2418,18 @@ mod tests {
     }
 
     #[test]
-    fn default_panel_is_nine_by_sixteen_and_centred() {
+    fn default_panel_is_square_at_seventy_percent_height() {
         let work = RECT {
             left: 0,
             top: 0,
             right: 1920,
             bottom: 1040,
         };
-        let (x, y, width, height) = panel_rect(work, false);
+        let (x, y, width, height) = panel_rect(work);
+        assert_eq!(width, 728);
         assert_eq!(height, 728);
-        assert_eq!(width, 409);
         assert_eq!(x, 1920 - width);
         assert_eq!(y, (1040 - height) / 2);
-        let (left_x, _, left_width, left_height) = panel_rect(work, true);
-        assert_eq!(left_x, 0);
-        assert_eq!(left_width, width);
-        assert_eq!(left_height, height);
     }
 
     #[test]

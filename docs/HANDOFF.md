@@ -22,8 +22,8 @@ replacement for **Windows Start search and Explorer search**.
   and power commands by name as you type, in a few milliseconds.
 - Uses about 22 MB of RAM for the service and a few MB for the window, with zero idle CPU.
 - Local only. Nothing leaves the PC. Names only, not file contents (by design).
-- Opens from a tray icon, the **Alt+Space** hotkey, a hover zone at the screen edge,
-  **Win+S**, or by **typing while Start is open**.
+- Opens from a tray icon, the **Alt+Space** hotkey, **Win+S**, or by **typing while
+  Start is open**.
 - Target users are ordinary people with 1–2 TB drives, not only developers.
 
 The user (Devashish Guliya) wants plain, direct explanations and minimal token use.
@@ -252,16 +252,14 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 | `apps.rs` | Microsoft Store and MSIX apps read from `shell:AppsFolder`, refreshed after 2 minutes |
 | `commands.rs` | About 50 `ms-settings:` pages with keywords, plus power commands |
 | `frecency.rs` | Open history (`history.tsv`), seeded from Windows Recent |
-| `hover.rs` | Screen-edge hover zone (4 px, 280 ms delay, slide-in animation) |
 | `settings.rs` | Loads and saves `window.cfg` |
 | `winkey.rs` | Low-level keyboard hook (Win+S, typing in Start), foreground watcher for SearchHost, Explorer folder lookup |
 | `winsearch.rs` | Turns Windows search off or on (elevated) |
 
 ### 5.1 Look and behaviour
 
-- Default geometry: a 9:16 portrait panel, 70% of the work area tall, centred
-  vertically and flush with the right (or left) screen edge (`panel_rect`). The
-  startup placement and the hover slide both use it.
+- Default geometry: a square panel whose side is 70% of the work area height, centred
+  vertically and flush with the right screen edge (`panel_rect`), used at startup.
 - Three bands: a rounded search field (glyph, placeholder, accent underline), the
   results, and a footer with the count and a hint.
 - Results are an owner-data, owner-drawn ListView with two-line rows: an icon, the
@@ -368,7 +366,7 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - **Tray:** Open, Settings, Pause (pauses window queries only) and Quit.
 - **Hotkey:** default Alt+Space, changeable in Settings. If another program owns it,
   the tray still works.
-- **Hover zone:** right edge by default, left edge optional, can be disabled.
+- **No edge hover:** the screen-edge pop-in was removed by user decision (2026-10-05); Win+S, Alt+Space and the tray open the panel.
 - **Start with Windows:** a per-user HKCU Run entry, off unless enabled. The installer
   adds a machine-wide HKLM Run entry.
 - The theme follows the Windows light or dark app setting.
@@ -427,7 +425,7 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - Snapshot format v3 (bump `VERSION` on change) and its locations and DACLs.
 - Pipe name, security, owner check and the 1,000-hit cap.
 - Privacy rules (other profiles hidden, `Public` shared).
-- UI: tray, Alt+Space, edge hover.
+- UI: tray, Alt+Space, Win+S.
 
 ## 8. How to work on this repository
 
