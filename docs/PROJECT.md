@@ -128,6 +128,8 @@ Out of scope: searching file **contents**. Only names are searched.
 | `3021d1a` | The first-run offer quotes measured numbers, turning Windows search off frees its index, the uninstall restores search and removes per-user data; version 0.2.5 |
 | `e310679` | Search finds the drives by letter or `c:`, and the first-run offer is short and plain; version 0.2.6 |
 | `bc202d8` | Settings redesigned in the search panel's design language: parent-drawn page, switches, hand-written hotkey capture |
+| `b995be5` | Settings redesign released; version 0.2.7 |
+| `00f43f0` | Installer version 0.2.7 |
 
 ## 4. Current results on the development machine
 
