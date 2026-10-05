@@ -9,7 +9,7 @@ the security audit and per-phase notes). This file is the condensed, self-contai
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
 State at writing: commit `9227386` on branch `main` (2026-10-05). The tree is clean,
-126 workspace tests and 3 installer tests pass, and the code is on GitHub with the
+126 workspace tests and 4 installer tests pass, and the code is on GitHub with the
 first release published.
 
 ---
@@ -434,14 +434,19 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   replaces the three programs and its own copy, refreshes the registry entries, and
   starts the service again. Each file is written as `.new` and renamed over the target;
   when the program is running (rename refused) the old image is renamed to `.old` first,
-  which Windows allows for a running image, and the new file takes its name. The running
-  window keeps the old code until it restarts. A failure restores the original, and a
-  folder that exists without a registration is still refused.
+  which Windows allows for a running image, and the new file takes its name. The renamed
+  copy is deleted afterwards when it is free (the service's always, the window's when it
+  exits, or at the next upgrade or uninstall). The running window keeps the old code
+  until it restarts. A failure restores the original, and a folder that exists without a
+  registration is still refused. Verified on this machine with the released installer
+  while the service and the window were running: the service stopped and started, the
+  `.old` copies appeared, and the old window kept answering searches during and after the
+  upgrade.
 - `--inspect` is read-only and safe to run. **Do not run install, upgrade or uninstall
   without asking the user.** The binary is not code signed, so SmartScreen will warn.
 - Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`
-  (three tests: payloads are executables, a file swap writes through cleanly, a file
-  without delete sharing is refused without damage).
+  (four tests: payloads are executables, a file swap writes through cleanly, a file
+  without delete sharing is refused without damage, renamed-old images are cleared).
 
 ## 7. Key decisions (and why)
 

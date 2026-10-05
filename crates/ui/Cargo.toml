@@ -11,7 +11,7 @@ name = "bs-window"
 path = "src/main.rs"
 
 [dependencies]
-bs-pipe = { version = "0.2.0", path = "../pipe" }
+bs-pipe = { version = "0.2.1", path = "../pipe" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",

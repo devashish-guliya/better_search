@@ -1115,9 +1115,18 @@ stops it, replaces the three programs and its own copy, refreshes the registry e
 that fails because the program is running, the old image is renamed to `.old` first and
 the new file takes its place, which Windows allows because a running image keeps delete
 sharing. A failure puts the original back, so an installed program is never left
-missing. The window keeps running the old code until it restarts; settings, snapshot and
-log are untouched. Files that exist without a registration are still refused, so a
-half-removed install is not silently adopted.
+missing. `remove_leftovers` deletes renamed-old images afterwards, best effort: the
+service's copy goes because the service is stopped, and a running window's copy goes
+when that window exits, or at the next upgrade or uninstall. The window keeps running
+the old code until it restarts; settings, snapshot and log are untouched. Files that
+exist without a registration are still refused, so a half-removed install is not
+silently adopted.
+
+Verified twice on the development machine (2026-10-05) with the released installer while
+both the service and the window were running: the service stopped and started again,
+`bs-service.exe.old` and `bs-window.exe.old` appeared, the running 0.1.0 window kept
+answering searches through the service during and after the upgrade, and a fresh window
+started from the replaced file.
 
 Uninstall behaviour: refuses unless the installer's own `InstallLocation` matches the
 expected folder (so it never deletes a service someone else registered), stops and
@@ -1156,9 +1165,10 @@ Still open after the test:
 - The binary is **not code signed**, so SmartScreen will warn. Signing stays open as
   originally planned; the version and update check are now built (`9227386`, section
   5.12).
-- The installer's own checks are three tests in the crate: the bundled payloads are
-  Windows executables, a file swap writes through and leaves no scratch files behind,
-  and a file held without delete sharing is refused without damage.
+- The installer's own checks are four tests in the crate: the bundled payloads are
+  Windows executables, a file swap writes through and leaves no scratch files behind, a
+  file held without delete sharing is refused without damage, and renamed-old images
+  from an earlier upgrade are cleared without touching the current program.
 - The original Phase 5 plan is otherwise unchanged: one installer file, one UAC prompt,
   clean uninstall offering to keep or delete settings, and later code signing.
 
@@ -1185,7 +1195,7 @@ Still open after the test:
   first, then `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` with
   `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored and
-  its three tests never touch the machine. `--inspect` is safe to run unattended;
+  its four tests never touch the machine. `--inspect` is safe to run unattended;
   install, upgrade and uninstall change the machine and must not be run without asking
   (the one approved end-to-end run is recorded in Phase 5).
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go

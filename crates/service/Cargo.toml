@@ -11,10 +11,10 @@ name = "bs-service"
 path = "src/main.rs"
 
 [dependencies]
-bs-engine = { version = "0.2.0", path = "../engine" }
-bs-index = { version = "0.2.0", path = "../index" }
-bs-pipe = { version = "0.2.0", path = "../pipe" }
-bs-query = { version = "0.2.0", path = "../query" }
+bs-engine = { version = "0.2.1", path = "../engine" }
+bs-index = { version = "0.2.1", path = "../index" }
+bs-pipe = { version = "0.2.1", path = "../pipe" }
+bs-query = { version = "0.2.1", path = "../query" }
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",

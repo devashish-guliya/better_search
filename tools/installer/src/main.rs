@@ -394,6 +394,16 @@ fn replace_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Deletes the renamed-old images an earlier upgrade left behind. A running program's
+/// image cannot be deleted until it exits, so this is best effort; the next upgrade and
+/// the uninstall both try again.
+fn remove_leftovers(dir: &Path) {
+    for &(name, _) in &FILES {
+        let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
+    }
+    let _ = std::fs::remove_file(dir.join("better-search-setup.exe.old"));
+}
+
 /// Replaces an existing installation in place: stops the service, swaps the files
 /// (a running window is moved aside, never killed), refreshes the registry and starts
 /// the service again. The running window keeps the old code until it is restarted.
@@ -423,6 +433,9 @@ fn upgrade(scm: &Sc, dir: &Path) -> io::Result<()> {
     } else {
         swapped?;
     }
+    // The service is stopped while its image is renamed, so its old copy goes now; the
+    // running window's copy stays until the window exits.
+    remove_leftovers(dir);
     Ok(())
 }
 
@@ -520,6 +533,7 @@ fn uninstall() -> io::Result<()> {
             std::fs::remove_file(&file)?;
         }
     }
+    remove_leftovers(&dir);
     let question = wide("Delete the saved index and service logs? Choose No to keep them.");
     let title = wide("better_search uninstall");
     let erase = unsafe {
@@ -656,6 +670,23 @@ mod tests {
             1,
             "no scratch files"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An upgrade renames a running program's image aside; the copy goes as soon as the
+    /// program has exited, and the next upgrade or the uninstall clears the rest.
+    #[test]
+    fn leftovers_from_an_earlier_upgrade_are_removed() {
+        let dir = scratch("leftovers");
+        std::fs::write(dir.join("bs-window.exe"), b"current").unwrap();
+        std::fs::write(dir.join("bs-window.exe.old"), b"old").unwrap();
+        std::fs::write(dir.join("better-search-setup.exe.old"), b"old").unwrap();
+        remove_leftovers(&dir);
+        assert_eq!(
+            std::fs::read(dir.join("bs-window.exe")).unwrap(),
+            b"current"
+        );
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
