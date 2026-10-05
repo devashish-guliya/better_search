@@ -32,6 +32,9 @@ pub struct Query {
     hide_system: bool,
     /// Lowercased extensions without the dot; empty means any.
     extensions: Vec<Vec<u8>>,
+    /// `in:"C:\Some Folder"`: lowercased, without a trailing backslash. Only entries
+    /// below this folder match.
+    folder: Option<String>,
     /// Several terms, so a term the name lacks may be found in a parent folder's name
     /// instead (`acme contract` finds `Clients\Acme\Contract.pdf`). Term masks are a
     /// `u8`, which caps this at [`MAX_PARTIAL_TERMS`].
@@ -48,7 +51,13 @@ impl Query {
         self
     }
 
+    /// The `in:` folder, lowercased.
+    pub fn folder(&self) -> Option<&str> {
+        self.folder.as_deref()
+    }
+
     pub fn parse(input: &str) -> Option<Self> {
+        let (input, folder) = take_folder(input);
         let mut extensions: Vec<Vec<u8>> = Vec::new();
         let mut words: Vec<String> = Vec::new();
         for word in input.split_whitespace() {
@@ -86,6 +95,7 @@ impl Query {
             scan_term,
             hide_system: false,
             extensions,
+            folder,
             partial,
         })
     }
@@ -136,6 +146,81 @@ impl Query {
             || memchr::memrchr(b'.', lower)
                 .is_some_and(|dot| self.extensions.iter().any(|e| e[..] == lower[dot + 1..]))
     }
+}
+
+/// Splits the `in:` token off the query. Its value may be quoted to hold spaces
+/// (`in:"C:\My Files"`); the last one wins.
+fn take_folder(input: &str) -> (String, Option<String>) {
+    let mut rest = String::with_capacity(input.len());
+    let mut folder = None;
+    let mut s = input.trim_start();
+    while !s.is_empty() {
+        let word_end = |v: &str| v.find(char::is_whitespace).unwrap_or(v.len());
+        let len = match s.get(..3).filter(|p| p.eq_ignore_ascii_case("in:")) {
+            Some(_) => {
+                let value = &s[3..];
+                let (len, path) = match value.strip_prefix('"') {
+                    Some(quoted) => match quoted.find('"') {
+                        Some(end) => (end + 2, &quoted[..end]),
+                        None => (quoted.len() + 1, quoted),
+                    },
+                    None => {
+                        let end = word_end(value);
+                        (end, &value[..end])
+                    }
+                };
+                let path = path.trim().replace('/', "\\");
+                let path = path.trim_end_matches('\\');
+                if !path.is_empty() {
+                    folder = Some(path.to_lowercase());
+                }
+                3 + len
+            }
+            None => {
+                let len = word_end(s);
+                rest.push_str(&s[..len]);
+                rest.push(' ');
+                len
+            }
+        };
+        s = s[len..].trim_start();
+    }
+    (rest, folder)
+}
+
+/// Directories whose path is `folder` (lowercased, no trailing backslash). Usually
+/// one; none when the folder is not indexed.
+fn folder_entries(index: &Index, folder: &str) -> Vec<u32> {
+    let last = folder.rsplit('\\').next().unwrap_or(folder).as_bytes();
+    let names = index.names();
+    let ids: Vec<u32> = (0..names.len() as u32)
+        .into_par_iter()
+        .with_min_len(1 << 14)
+        .filter(|&id| names.folded(id) == last)
+        .collect();
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    index
+        .name_ids()
+        .par_iter()
+        .enumerate()
+        .filter(|&(e, n)| ids.contains(n) && index.is_dir(e as u32))
+        .map(|(e, _)| e as u32)
+        .filter(|&e| index.full_path(e).to_lowercase().trim_end_matches('\\') == folder)
+        .collect()
+}
+
+fn is_below(index: &Index, entry: u32, folders: &[u32]) -> bool {
+    let mut current = entry;
+    for _ in 0..MAX_FOLDER_DEPTH {
+        match index.parent(current) {
+            Some(up) if folders.contains(&up) => return true,
+            Some(up) => current = up,
+            None => return false,
+        }
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,6 +644,11 @@ fn rank(
     let entry_flags = index.flags();
     let full = query.full_mask();
     let masks = &names.masks;
+    let scope = query.folder.as_deref().map(|f| folder_entries(index, f));
+    if scope.as_ref().is_some_and(Vec::is_empty) {
+        return SearchResult::empty();
+    }
+    let in_scope = |entry: u32| scope.as_ref().is_none_or(|s| is_below(index, entry, s));
     let top = name_ids
         .par_chunks(CHUNK)
         .zip(entry_flags.par_chunks(CHUNK))
@@ -584,7 +674,7 @@ fn rank(
                             continue;
                         }
                     }
-                    if filter.is_none_or(|f| f(entry)) {
+                    if filter.is_none_or(|f| f(entry)) && in_scope(entry) {
                         if query.hide_system && is_system(f) {
                             top.hidden += 1;
                         } else {
@@ -1568,6 +1658,33 @@ mod tests {
         let q = Query::parse("report ext:pdf").unwrap();
         assert!(q.narrows(&last(&["rep"], &["pdf"])));
         assert!(!q.narrows(&last(&["rep"], &[])));
+    }
+
+    #[test]
+    fn in_filter_keeps_entries_below_the_folder() {
+        let index = index_of(&[
+            "Users\\bob\\My Files\\report.pdf",
+            "Users\\bob\\My Files\\Old\\report.docx",
+            "Users\\bob\\Other\\report.pdf",
+            "Users\\bob\\My Files Backup\\report.pdf",
+        ]);
+        let mut found = paths(&index, "report in:\"t:\\users\\BOB\\My Files\\\"", 10);
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "T:\\Users\\bob\\My Files\\Old\\report.docx",
+                "T:\\Users\\bob\\My Files\\report.pdf",
+            ]
+        );
+        assert_eq!(paths(&index, "in:T:/Users/bob/Other report", 10).len(), 1);
+        assert_eq!(paths(&index, "report in:T:\\", 10).len(), 4);
+        assert!(paths(&index, "report in:T:\\Nowhere", 10).is_empty());
+        assert!(Query::parse("in:\"T:\\My Files\"").is_none());
+        assert_eq!(
+            Query::parse("a in:\"T:\\X Y\" b").unwrap().folder(),
+            Some("t:\\x y")
+        );
     }
 
     #[test]

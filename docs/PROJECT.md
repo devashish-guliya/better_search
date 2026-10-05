@@ -698,6 +698,7 @@ and reports a clear message when the service is not running.
   checkbox (`history=` in `window.cfg`, default on) and a "Clear open history" button.
 - **Kind ranking.** Name-score nudges by extension: launchable +15 (installers -20), documents +14, media +9, source/config -8, generated (`.class`, `.o`, `.map`, `.lock`...) -10; folders +6; Start Menu shortcuts +60; a name equal to the query (stem or whole) gets +40 (files only, not launchable stems that already score 120). Exact stems skip the length penalty. Frecency now adds `min(60, 16 ln(1+w))`. Start Menu shortcuts with the same name in equally named parent folders collapse to the best one. `SKIP_RULES_VERSION` 6 adds `.idea`, `.eggs`, `.sass-cache`; the service rescans when the stored version differs.
 - **Folder words, `ext:` and ranking fixes.** With 2 to 8 terms, pass 1 scans for each term and keeps a per-name term mask; a term missing from the name may be found in a parent folder name (volume root excluded) and counts 20 instead of its match score. Pass 2 resolves folder masks and depths through a small per-thread folder cache. Narrowing for such queries requires each new term to contain an old one. `ext:a,b` filters by extension (alone it lists that type). Exact stems with a demoted extension (`notes.log`) score 60 without the exact bonus; `.lnk`/`.url` vendor extras (`Readme`, `Help`, `<App> Website`) are capped at 20 before the Start Menu boost; word starts score 56; documents and media pay half the length penalty; ties go to fewer folders. `key`, `pages`, `numbers` left the document list; `xlsm`, `docm`, `msg`, `eml`, `one`, `vsdx`, RAW photo and more media types joined. Locations (`SKIP_RULES_VERSION` 7): `OneDrive - <org>`, Dropbox, `my drive`, iCloud, `source`, `repos`, `projects` count as user content; `certs`, `bun`, `vcpkg` are noisy only outside user content; listed `Windows` and `System32` tools rank as Start Menu entries; non-launchable files directly in `Program Files\<app>` are app files. The window imports Windows Recent opens newer than its history file on every start and records Ctrl+Enter. Measured on a 1.27M-entry profile walk: single-term searches unchanged (`readme` 2.0 ms), two-term searches 1.1 → 2.3 ms; the synthetic benchmark, whose folders are random, is about twice as slow.
+- **`in:` folder scope, Win+S, Settings pages.** `in:"<path>"` (quotes optional without spaces, `/` accepted, last one wins) limits matches to entries below that folder: pass 2 finds the folder's entries once per query (name table scan plus a full-path check) and walks each candidate's parents; an unindexed folder gives no results. About 11 ms through the service on the development machine. The window installs a `WH_KEYBOARD_LL` hook on its own thread (Windows drops slow low-level hooks), swallows Win+S (not with Shift, Ctrl or Alt, so Win+Shift+S still screenshots), taps the unassigned key 0xE8 so releasing Win does not open Start, and posts `WM_APP+5`. The handler reads the folder of the foreground Explorer window's active tab through `IShellWindows` → `IServiceProvider` → `IShellBrowser` → `IFolderView` → `IPersistFolder2` (hand-written vtables; virtual folders give no scope), borrows foreground rights with `AttachThreadInput`, and shows the folder as a chip; requests are then sent as `in:"<folder>" <text>` and Store apps and Settings are left out. Backspace at the start of the field drops the chip; Alt+Space always opens unscoped. `win_s=` in `window.cfg`, default on. `commands.rs` lists about 50 `ms-settings:` pages and `windowsdefender:` with search words, plus `command:` power entries (shut down, restart, sign out ask first; sleep via `SetSuspendState`, lock via `LockWorkStation`); names score like Store apps minus 12, a keyword prefix (3+ letters) scores 120 minus 12. They form a Settings section with the Settings app's icon. Store apps and Settings rows are no longer cut by the result limit.
 - **Hidden system matches.** A measurement of the real index (`bs report <index.bin>`)
   found 94% of entries in system, app-data or program folders and 3.8% in ordinary
   locations. The window therefore asks the service to hide those by default and shows
@@ -1051,7 +1052,7 @@ Still open after the test:
 ### Later ideas (not decided)
 
 - Showing results during the very first scan.
-- More filters (only folders, only a drive). `ext:` exists.
+- More filters (only folders). `ext:` and `in:` exist.
 
 ---
 
@@ -1064,8 +1065,8 @@ Still open after the test:
   cargo clippy --workspace --all-targets -- -D warnings
   cargo build --release
   ```
-  117 workspace tests pass (index crate 37, query crate 34, engine crate 9,
-  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 14).
+  119 workspace tests pass (index crate 37, query crate 35, engine crate 9,
+  service crate 10, pipe crate 6, ntfs crate 3, cli crate 4, window crate 15).
   The release build produces `bs.exe`, `bs-service.exe` and `bs-window.exe`.
 - **Installer crate checks** (it is outside the workspace): build the release binaries
   first, then `cargo fmt`, `cargo test`, and

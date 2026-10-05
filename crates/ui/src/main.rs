@@ -2,6 +2,7 @@
 //! Unelevated search UI. All index access goes through bs_pipe::Client in `search`.
 
 mod apps;
+mod commands;
 mod draw;
 mod frecency;
 mod hover;
@@ -9,6 +10,7 @@ mod rows;
 mod search;
 mod settings;
 mod thumbs;
+mod winkey;
 
 use std::collections::{HashMap, HashSet};
 use std::ptr::{null, null_mut};
@@ -24,10 +26,10 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
-    DEFAULT_GUI_FONT, DT_CENTER, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC, DeleteObject, EndPaint,
-    FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT, ReleaseDC, SRCCOPY,
-    SelectObject, SetBkColor, SetTextColor,
+    DEFAULT_GUI_FONT, DT_CENTER, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC,
+    DeleteObject, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT,
+    ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -49,34 +51,38 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, RegisterHotKey, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    UnregisterHotKey, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
+    UnregisterHotKey, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_TAB, VK_UP,
 };
 
 use draw::scale;
+use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     RemoveWindowSubclass, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
     SHGetFileInfoW, SetWindowSubclass, Shell_NotifyIconW, ShellExecuteW,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
-    ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION,
-    IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MF_STRING, MSG, MoveWindow,
-    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN,
-    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
+    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MF_STRING, MSG,
+    MoveWindow, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DRAWITEM,
+    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
+    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
 };
 /// Sent when the user changes the Windows accent colour.
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const WM_MOUSELEAVE: u32 = 0x02a3;
+const EM_GETSEL: u32 = 0x00b0;
 /// Static control styles: vertically centred, single-line text cut with an ellipsis.
 const SS_CENTERIMAGE: u32 = 0x0200;
 const SS_ENDELLIPSIS: u32 = 0x4000;
@@ -104,6 +110,7 @@ const SETTINGS_STARTUP: usize = 304;
 const SETTINGS_SAVE: usize = 305;
 const SETTINGS_BACK: usize = 306;
 const SETTINGS_HISTORY: usize = 307;
+const SETTINGS_WIN_S: usize = 320;
 const SETTINGS_CLEAR: usize = 308;
 const CHECKED: isize = 1;
 /// Result icons and previews, in pixels at 96 DPI.
@@ -183,6 +190,10 @@ struct App {
     footer: RECT,
     show_hints: std::cell::Cell<bool>,
     taskbar_message: u32,
+    /// Folder the search is limited to (Win+S over an Explorer window), shown as a
+    /// chip in the field; Backspace at the start of the field removes it.
+    scope: Option<String>,
+    chip: RECT,
 }
 
 impl App {
@@ -233,7 +244,32 @@ impl App {
             footer: RECT::default(),
             show_hints: std::cell::Cell::new(true),
             taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
+            scope: None,
+            chip: RECT::default(),
         }
+    }
+
+    /// What is sent to the service: the typed text, limited to the scope folder.
+    fn request_text(&self) -> String {
+        match &self.scope {
+            Some(folder) => format!("in:\"{folder}\" {}", self.last_text),
+            None => self.last_text.clone(),
+        }
+    }
+
+    fn set_scope(&mut self, hwnd: HWND, scope: Option<String>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        let cue = wide(if self.scope.is_some() {
+            "Search this folder"
+        } else {
+            "Search apps, files and folders"
+        });
+        unsafe { SendMessageW(self.edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize) };
+        self.layout(hwnd);
+        self.query(hwnd);
     }
 
     fn query(&mut self, hwnd: HWND) {
@@ -248,7 +284,7 @@ impl App {
         self.clear_results();
         if query.trim().is_empty() {
             self.status = String::new();
-        } else if query.len() + 4 > bs_pipe::MAX_REQUEST {
+        } else if self.request_text().len() + 4 > bs_pipe::MAX_REQUEST {
             self.status = "The search is too long".into();
         } else if self.paused {
             self.status = "Search paused from the tray".into();
@@ -257,7 +293,7 @@ impl App {
             if let Some(sender) = &self.sender {
                 let _ = sender.send(search::Request {
                     serial: self.serial,
-                    text: query,
+                    text: self.request_text(),
                     include_system: self.include_system,
                 });
             }
@@ -295,12 +331,16 @@ impl App {
                         .map(|hit| display_name(hit).to_lowercase())
                         .collect();
                     // A packaged app that also has a Start Menu shortcut is shown once.
-                    let store: Vec<(Hit, String)> = self
-                        .apps
-                        .matches(&self.last_text)
-                        .into_iter()
-                        .filter(|(_, name)| !shortcut_names.contains(&name.to_lowercase()))
-                        .collect();
+                    let store: Vec<(Hit, String)> = if self.scope.is_some() {
+                        Vec::new()
+                    } else {
+                        self.apps
+                            .matches(&self.last_text)
+                            .into_iter()
+                            .filter(|(_, name)| !shortcut_names.contains(&name.to_lowercase()))
+                            .chain(commands::matching(&self.last_text))
+                            .collect()
+                    };
                     let shown = reply.total_matches + store.len() as u32;
                     let hidden = reply.hidden_matches;
                     self.app_names.clear();
@@ -323,7 +363,14 @@ impl App {
                         };
                         std::cmp::Reverse(hit.score + boost)
                     });
-                    reply.hits.truncate(search::LIMIT as usize);
+                    // Apps and Settings pages are few and always listed; files fill the
+                    // rest of the list.
+                    let mut files = 0;
+                    reply.hits.retain(|hit| {
+                        let extra = self.app_names.contains_key(&hit.path);
+                        files += usize::from(!extra);
+                        extra || files <= search::LIMIT as usize
+                    });
                     let (hits, rows) = rows::group(reply.hits, kind_of);
                     let names: Vec<String> = hits.iter().map(|hit| self.name_of(hit)).collect();
                     self.marks = names
@@ -728,15 +775,20 @@ impl App {
             self.reset_images(size);
         }
         let hit = &self.hits[index];
-        if let Some(&slot) = self.path_icons.get(&hit.path) {
+        let source = if commands::is_command(&hit.path) {
+            commands::ICON_SOURCE
+        } else {
+            &hit.path
+        };
+        if let Some(&slot) = self.path_icons.get(source) {
             return slot;
         }
-        if self.requested.insert(hit.path.clone())
+        if self.requested.insert(source.to_owned())
             && let Some(sender) = &self.thumb_sender
         {
             let _ = sender.send(thumbs::Request {
                 generation: self.thumb_generation.load(Ordering::Relaxed),
-                path: hit.path.clone(),
+                path: source.to_owned(),
                 size,
             });
         }
@@ -861,7 +913,15 @@ impl App {
             let _ = self.history.save();
         }
         let hit = &self.hits[index];
-        let (file, args) = if folder && hit.path.starts_with(apps::PREFIX) {
+        if commands::is_power(&hit.path) {
+            if !folder {
+                commands::run(hwnd, &hit.path);
+            }
+            return;
+        }
+        let (file, args) = if folder && commands::is_command(&hit.path) {
+            (wide("ms-settings:"), wide(""))
+        } else if folder && hit.path.starts_with(apps::PREFIX) {
             // A packaged app has no folder of its own; show it among all apps.
             (wide("explorer.exe"), wide("shell:AppsFolder"))
         } else if folder {
@@ -1026,6 +1086,12 @@ impl App {
                 self.settings.history as usize,
                 0,
             );
+            SendMessageW(
+                self.controls[6],
+                BM_SETCHECK,
+                self.settings.win_s as usize,
+                0,
+            );
             SetForegroundWindow(hwnd);
             SetFocus(self.controls[1]);
         }
@@ -1092,6 +1158,7 @@ impl App {
             start_with_windows: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) }
                 == CHECKED,
             history: unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED,
+            win_s: unsafe { SendMessageW(self.controls[6], BM_GETCHECK, 0, 0) } == CHECKED,
         };
         if next.key != self.settings.key || next.modifiers != self.settings.modifiers {
             if self.hotkey_registered {
@@ -1117,6 +1184,7 @@ impl App {
             return;
         }
         self.settings = next;
+        winkey::set_enabled(self.settings.win_s);
         self.hover
             .rebuild(hwnd, self.settings.hover, self.settings.left);
         self.show_search(hwnd);
@@ -1134,7 +1202,7 @@ impl App {
             let top = scale(hwnd, 20);
             let mut y = top;
             for (i, &control) in self.controls.iter().enumerate() {
-                let height = if i == 8 {
+                let height = if i == 9 {
                     line * 2
                 } else {
                     line - scale(hwnd, 3)
@@ -1153,7 +1221,24 @@ impl App {
             bottom: pad + s(40),
         };
         let edit_height = s(24);
-        let edit_left = self.field.left + s(40);
+        let mut edit_left = self.field.left + s(40);
+        self.chip = RECT::default();
+        if let (Some(scope), Some(fonts)) = (&self.scope, &self.fonts) {
+            let label: Vec<u16> = scope_label(scope).encode_utf16().collect();
+            let dc = unsafe { GetDC(hwnd) };
+            let text_width = draw::text_width(dc, fonts.detail, &label);
+            unsafe { ReleaseDC(hwnd, dc) };
+            let width = (text_width + 2 * s(draw::SPACE_M)).min(width / 2);
+            let height = s(26);
+            let top = self.field.top + (s(40) - height) / 2;
+            self.chip = RECT {
+                left: edit_left,
+                top,
+                right: edit_left + width,
+                bottom: top + height,
+            };
+            edit_left = self.chip.right + s(draw::SPACE_S);
+        }
         let footer_height = s(28);
         self.footer = RECT {
             left: pad,
@@ -1491,6 +1576,21 @@ unsafe extern "system" fn child_proc(
                 unsafe { SetFocus(if id == EDIT_ID { app.list } else { app.edit }) };
                 return 0;
             }
+            VK_BACK if id == EDIT_ID && app.scope.is_some() => {
+                let (mut start, mut end) = (0u32, 0u32);
+                unsafe {
+                    SendMessageW(
+                        hwnd,
+                        EM_GETSEL,
+                        (&raw mut start) as usize,
+                        (&raw mut end) as isize,
+                    )
+                };
+                if start == 0 && end == 0 {
+                    app.set_scope(main, None);
+                    return 0;
+                }
+            }
             0x48 if unsafe { GetKeyState(VK_CONTROL as i32) } < 0 => {
                 app.include_system = !app.include_system;
                 app.query(main);
@@ -1560,6 +1660,12 @@ fn display_name(hit: &Hit) -> String {
     }
 }
 
+/// The scope chip's text: the folder's own name, or the drive for a root.
+fn scope_label(folder: &str) -> String {
+    let folder = folder.trim_end_matches('\\');
+    format!("In {}", folder.rsplit('\\').next().unwrap_or(folder))
+}
+
 /// The folder holding `path`, or the path itself for a drive root.
 fn parent_folder(path: &str) -> &str {
     let path = path.trim_end_matches('\\');
@@ -1570,6 +1676,12 @@ fn parent_folder(path: &str) -> &str {
 fn describe(hit: &Hit) -> String {
     if hit.path.starts_with(apps::PREFIX) {
         return "App".into();
+    }
+    if commands::is_power(&hit.path) {
+        return "Power command".into();
+    }
+    if commands::is_command(&hit.path) {
+        return "Windows Settings".into();
     }
     let folder = parent_folder(&hit.path);
     let Some(ext) = extension(hit) else {
@@ -1610,6 +1722,9 @@ const MEDIA_EXTENSIONS: &[&str] = &[
 
 /// The section a hit is listed under.
 fn kind_of(hit: &Hit) -> rows::Kind {
+    if commands::is_command(&hit.path) {
+        return rows::Kind::Settings;
+    }
     if is_app(hit) {
         return rows::Kind::Apps;
     }
@@ -1773,6 +1888,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     SETTINGS_HISTORY,
                     BS_AUTOCHECKBOX as u32,
                 ),
+                control(
+                    hwnd,
+                    &button_class,
+                    "Win+S opens better_search (in the Explorer folder in front)",
+                    SETTINGS_WIN_S,
+                    BS_AUTOCHECKBOX as u32,
+                ),
                 control(hwnd, &button_class, "Clear open history", SETTINGS_CLEAR, 0),
                 control(
                     hwnd,
@@ -1827,6 +1949,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             app.apps.refresh_if_stale();
             app.theme(hwnd);
             app.register_hotkey(hwnd);
+            winkey::install(hwnd, app.settings.win_s);
             unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
             app.update_title(hwnd);
             0
@@ -1886,6 +2009,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     colors.secondary,
                     DT_CENTER,
                 );
+                if let Some(scope) = &app.scope
+                    && app.chip.right > app.chip.left
+                {
+                    let chip = app.chip;
+                    draw::fill_round(device, &chip, chip.bottom - chip.top, colors.selected);
+                    let text = RECT {
+                        left: chip.left + s(draw::SPACE_M),
+                        right: chip.right - s(draw::SPACE_M),
+                        ..chip
+                    };
+                    draw::text(
+                        device,
+                        &scope_label(scope),
+                        &text,
+                        fonts.detail,
+                        colors.text,
+                        DT_CENTER | DT_END_ELLIPSIS,
+                    );
+                }
                 let footer = app.footer;
                 let divider = RECT {
                     top: footer.top - s(draw::SPACE_S),
@@ -2008,7 +2150,32 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             0
         }
         WM_HOTKEY if w as i32 == HOTKEY_ID => {
+            app.set_scope(hwnd, None);
             app.open_panel(hwnd);
+            0
+        }
+        winkey::WM_WIN_S => {
+            // Still the window the user was in: this one has not been activated yet.
+            let front = unsafe { GetForegroundWindow() };
+            let scope = if front == hwnd {
+                app.scope.clone()
+            } else {
+                winkey::explorer_folder(front)
+            };
+            if scope.is_some() {
+                unsafe { SetWindowTextW(app.edit, wide("").as_ptr()) };
+            }
+            app.set_scope(hwnd, scope);
+            // Unlike a registered hotkey, a hook does not give the right to take the
+            // foreground, so borrow it from the window in front.
+            let front_thread = unsafe { GetWindowThreadProcessId(front, null_mut()) };
+            let own_thread = unsafe { GetCurrentThreadId() };
+            let attached = front_thread != own_thread
+                && unsafe { AttachThreadInput(own_thread, front_thread, 1) } != 0;
+            app.open_panel(hwnd);
+            if attached {
+                unsafe { AttachThreadInput(own_thread, front_thread, 0) };
+            }
             0
         }
         hover::WM_HOVER_TRIGGER => {
@@ -2029,7 +2196,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 if let Some(sender) = &app.sender {
                     let _ = sender.send(search::Request {
                         serial: app.serial,
-                        text: app.last_text.clone(),
+                        text: app.request_text(),
                         include_system: app.include_system,
                     });
                 }

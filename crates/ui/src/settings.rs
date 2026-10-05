@@ -25,6 +25,8 @@ pub struct Settings {
     pub start_with_windows: bool,
     /// Rank results the user opened before higher (see `frecency`).
     pub history: bool,
+    /// Win+S opens this window instead of Windows search.
+    pub win_s: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +38,7 @@ impl Default for Settings {
             left: false,
             start_with_windows: false,
             history: true,
+            win_s: true,
         }
     }
 }
@@ -75,6 +78,7 @@ impl Settings {
                     "left" => settings.left = value == "true",
                     "start_with_windows" => settings.start_with_windows = value == "true",
                     "history" => settings.history = value != "false",
+                    "win_s" => settings.win_s = value != "false",
                     _ => {}
                 }
             }
@@ -98,13 +102,14 @@ impl Settings {
         fs::write(
             &tmp,
             format!(
-                "modifiers={}\nkey={}\nhover={}\nleft={}\nstart_with_windows={}\nhistory={}\n",
+                "modifiers={}\nkey={}\nhover={}\nleft={}\nstart_with_windows={}\nhistory={}\nwin_s={}\n",
                 self.modifiers,
                 self.key,
                 self.hover,
                 self.left,
                 self.start_with_windows,
-                self.history
+                self.history,
+                self.win_s
             ),
         )?;
         fs::rename(tmp, path)

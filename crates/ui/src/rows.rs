@@ -6,6 +6,7 @@ use bs_pipe::Hit;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Apps,
+    Settings,
     Folders,
     Documents,
     Media,
@@ -16,6 +17,7 @@ impl Kind {
     pub fn label(self) -> &'static str {
         match self {
             Kind::Apps => "Apps",
+            Kind::Settings => "Settings",
             Kind::Folders => "Folders",
             Kind::Documents => "Documents",
             Kind::Media => "Photos, videos and music",

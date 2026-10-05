@@ -112,7 +112,7 @@ pub fn matching(apps: &[StoreApp], query: &str) -> Vec<(Hit, String)> {
     found
 }
 
-fn term_score(name: &str, term: &str) -> Option<i32> {
+pub fn term_score(name: &str, term: &str) -> Option<i32> {
     // Longer names fit a short term less well.
     let penalty = ((name.len().saturating_sub(term.len())) / 3).min(10) as i32;
     let word_start = name.match_indices(term).any(|(at, _)| {

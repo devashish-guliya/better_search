@@ -68,13 +68,23 @@ search box and the result list, and a Segoe UI Variable font.
 
 Results include matching file and folder **names**, with their full location in the
 Path column. Enter opens the selected item, including an app's `.exe` or a shortcut
-when that file is indexed. This is not a general app catalog, and Store apps without a
-shortcut are not found. Contents of skipped clutter folders are absent by design.
+when that file is indexed. Contents of skipped clutter folders are absent by design.
 
 With several words, a word the name lacks may match a folder above it instead:
 `acme contract` finds `Clients\Acme\Contract.pdf` (below files whose own name holds both
 words). `ext:pdf` keeps only that type, `ext:xlsx,docx` several, and `ext:pdf` alone
-lists every PDF.
+lists every PDF. `in:"C:\Some Folder"` keeps only what is below that folder.
+
+Win+S opens better_search instead of Windows search (Win+Shift+S still takes a
+screenshot; turn it off in the tray's Settings). Pressed over an Explorer window, it
+searches only the folder that window shows, marked by an "In <folder>" chip in the
+search field; Backspace at the start of the field removes the chip and searches
+everything again.
+
+Windows Settings pages (Display, Sound, Wi-Fi, Background, Installed apps, ...) are
+found by name and by common words (`wallpaper`, `uninstall`, `volume`), and Shut down,
+Restart, Sleep, Lock and Sign out are results too. Shut down, Restart and Sign out ask
+first.
 
 Apps appear by name with their own icon (`Excel`, described as `App`, rather than
 `Excel.lnk`), and photos, videos and documents show a thumbnail. Microsoft Store apps
