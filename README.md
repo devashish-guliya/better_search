@@ -53,13 +53,15 @@ cargo build --release
 
 The window starts with Alt+Space (if Windows has not reserved it) or Win+S. It opens as a
 square panel whose side is 70% of the screen height, centred vertically against the right
-edge. Double-click its tray icon to open it; right-click for Open,
-Settings, Pause or Quit. Pause stops window searches, not the background index. Type to
-search, use the arrow keys, Enter to open, Ctrl+Enter to select the result in Explorer,
-or right-click a result for Open, Open folder and Copy path. Esc hides the window.
-The status line distinguishes a stopped service, an index still loading and access
-denied. It shows the highlighted result's full path. The window retries while a
-service is starting.
+edge, and only one panel runs: launching it again brings the open one forward. A gear
+button at the right end of the search box opens Settings. Double-click its tray icon to
+open it; right-click for Open, Settings, Pause or Quit. Pause stops window searches, not
+the background index. Type to search, use the arrow keys, Enter to open, Ctrl+Enter to
+select the result in Explorer, or right-click a result for Open, Open folder and Copy
+path. Esc hides the window.
+The status line distinguishes a stopped service, an index still loading (it asks you to
+wait for the first scan) and access denied. It shows the highlighted result's full path.
+The window retries while a service is starting.
 
 The window is plain Win32 through `windows-sys` (no C#, no web view, no extra runtime;
 the binary is about 260 KB). An embedded app manifest activates the modern common
@@ -127,8 +129,9 @@ recently you opened a file and is capped, so only heavy use overtakes an exact n
 `%LOCALAPPDATA%\better_search\history.tsv` (at most 2,000 paths) and never reaches the
 service. Settings can turn it off or clear it.
 
-Settings let you change the hotkey and explicitly
-enable per-user start at sign-in (HKCU only). Window settings are saved at
+Settings let you change the hotkey, switch Windows search off or back on with one click
+(the button says which way it will go, and it asks for admin), and explicitly enable
+per-user start at sign-in (HKCU only). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
 run `bs-window.exe --hidden` to do that manually. The drives shown in Settings are the fixed
 NTFS drives eligible for the service; changing the indexed drives is deferred because

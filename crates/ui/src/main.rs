@@ -65,17 +65,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, CreatePopupMenu, CreateWindowExW,
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
-    ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
+    ES_AUTOHSCROLL, FindWindowW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
     IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MF_STRING, MSG,
-    MoveWindow, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
-    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
-    WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM,
-    WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE,
+    WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM,
+    WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER,
     WM_WINDOWPOSCHANGED, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
     WS_VISIBLE,
 };
@@ -93,6 +93,8 @@ const EDIT_ID: usize = 101;
 const LIST_ID: usize = 102;
 const STATUS_ID: usize = 103;
 const TRAY_MESSAGE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 2;
+/// A second launch asks the running window to come forward instead of opening again.
+const WM_SHOW_PANEL: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 7;
 const HOTKEY_ID: i32 = 1;
 const MENU_OPEN: usize = 201;
 const MENU_SETTINGS: usize = 202;
@@ -193,6 +195,8 @@ struct App {
     /// chip in the field; Backspace at the start of the field removes it.
     scope: Option<String>,
     chip: RECT,
+    /// The settings button drawn at the right end of the search field.
+    gear: RECT,
     /// When a letter typed in Start last arrived.
     start_typed_at: Option<std::time::Instant>,
 }
@@ -245,6 +249,7 @@ impl App {
             taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
             scope: None,
             chip: RECT::default(),
+            gear: RECT::default(),
             start_typed_at: None,
         }
     }
@@ -406,7 +411,8 @@ impl App {
                     }
                 }
                 Status::Loading => {
-                    self.status = "The index is still loading".into();
+                    self.status =
+                        "Indexing your drives; results appear when the first scan finishes".into();
                     retry = true;
                 }
                 Status::Denied => self.status = "Access denied by the search service".into(),
@@ -995,30 +1001,25 @@ impl App {
             unsafe { ShowWindow(control, SW_SHOW) };
         }
         let hotkey = encode_hotkey(self.settings.modifiers, self.settings.key);
+        self.update_search_button();
         unsafe {
             SendMessageW(self.controls[1], HKM_SETHOTKEY, hotkey, 0);
             SendMessageW(
-                self.controls[2],
+                self.controls[3],
                 BM_SETCHECK,
                 self.settings.start_with_windows as usize,
                 0,
             );
             SendMessageW(
-                self.controls[3],
+                self.controls[4],
                 BM_SETCHECK,
                 self.settings.history as usize,
                 0,
             );
             SendMessageW(
-                self.controls[4],
-                BM_SETCHECK,
-                self.settings.win_s as usize,
-                0,
-            );
-            SendMessageW(
                 self.controls[5],
                 BM_SETCHECK,
-                winsearch::is_off() as usize,
+                self.settings.win_s as usize,
                 0,
             );
             SetForegroundWindow(hwnd);
@@ -1080,10 +1081,10 @@ impl App {
         let next = settings::Settings {
             key,
             modifiers,
-            start_with_windows: unsafe { SendMessageW(self.controls[2], BM_GETCHECK, 0, 0) }
+            start_with_windows: unsafe { SendMessageW(self.controls[3], BM_GETCHECK, 0, 0) }
                 == CHECKED,
-            history: unsafe { SendMessageW(self.controls[3], BM_GETCHECK, 0, 0) } == CHECKED,
-            win_s: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) } == CHECKED,
+            history: unsafe { SendMessageW(self.controls[4], BM_GETCHECK, 0, 0) } == CHECKED,
+            win_s: unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED,
         };
         if next.key != self.settings.key || next.modifiers != self.settings.modifiers {
             if self.hotkey_registered {
@@ -1108,17 +1109,31 @@ impl App {
             message(hwnd, &format!("Could not save settings: {err}"));
             return;
         }
-        let search_off = unsafe { SendMessageW(self.controls[5], BM_GETCHECK, 0, 0) } == CHECKED;
-        if search_off != winsearch::is_off() && !winsearch::request(hwnd, search_off) {
+        winkey::set_search_off(winsearch::is_off());
+        self.settings = next;
+        winkey::set_enabled(self.settings.win_s);
+        self.show_search(hwnd);
+    }
+
+    /// One click switches Windows search; the button label says what the next press does.
+    fn toggle_windows_search(&mut self, hwnd: HWND) {
+        let off = !winsearch::is_off();
+        if !winsearch::request(hwnd, off) {
             message(
                 hwnd,
                 "Windows search was not changed. Approve the administrator prompt to change it.",
             );
         }
         winkey::set_search_off(winsearch::is_off());
-        self.settings = next;
-        winkey::set_enabled(self.settings.win_s);
-        self.show_search(hwnd);
+        self.update_search_button();
+    }
+
+    fn update_search_button(&self) {
+        let Some(&button) = self.controls.get(2) else {
+            return;
+        };
+        let text = wide(windows_search_label());
+        unsafe { SetWindowTextW(button, text.as_ptr()) };
     }
 
     fn layout(&mut self, hwnd: HWND) {
@@ -1129,6 +1144,7 @@ impl App {
         if self.settings_open {
             self.field = RECT::default();
             self.footer = RECT::default();
+            self.gear = RECT::default();
             let line = scale(hwnd, 35);
             let top = scale(hwnd, 20);
             let mut y = top;
@@ -1170,6 +1186,14 @@ impl App {
             };
             edit_left = self.chip.right + s(draw::SPACE_S);
         }
+        // The settings button sits at the right end of the field.
+        let gear = s(36);
+        self.gear = RECT {
+            left: self.field.right - gear,
+            top: self.field.top,
+            right: self.field.right,
+            bottom: self.field.bottom,
+        };
         let footer_height = s(28);
         self.footer = RECT {
             left: pad,
@@ -1187,7 +1211,7 @@ impl App {
                 self.edit,
                 edit_left,
                 self.field.top + (s(40) - edit_height) / 2,
-                (self.field.right - s(draw::SPACE_L) - edit_left).max(0),
+                (self.gear.left - s(draw::SPACE_S) - edit_left).max(0),
                 edit_height,
                 1,
             );
@@ -1611,6 +1635,15 @@ fn display_name(hit: &Hit) -> String {
     }
 }
 
+/// What the one-click Windows-search button in Settings will do next.
+fn windows_search_label() -> &'static str {
+    if winsearch::is_off() {
+        "Turn Windows search back on (asks for admin)"
+    } else {
+        "Turn Windows search off (asks for admin)"
+    }
+}
+
 /// The scope chip's text: the folder's own name, or the drive for a root.
 fn scope_label(folder: &str) -> String {
     let folder = folder.trim_end_matches('\\');
@@ -1814,6 +1847,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 control(
                     hwnd,
                     &button_class,
+                    windows_search_label(),
+                    SETTINGS_WINDOWS_SEARCH,
+                    0,
+                ),
+                control(
+                    hwnd,
+                    &button_class,
                     "Start with Windows (current user only)",
                     SETTINGS_STARTUP,
                     BS_AUTOCHECKBOX as u32,
@@ -1830,13 +1870,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     &button_class,
                     "Win+S and typing in Start open better_search",
                     SETTINGS_WIN_S,
-                    BS_AUTOCHECKBOX as u32,
-                ),
-                control(
-                    hwnd,
-                    &button_class,
-                    "Turn off Windows search and its indexer (asks for admin)",
-                    SETTINGS_WINDOWS_SEARCH,
                     BS_AUTOCHECKBOX as u32,
                 ),
                 control(hwnd, &button_class, "Clear open history", SETTINGS_CLEAR, 0),
@@ -1906,6 +1939,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             app.theme(hwnd);
             unsafe { DefWindowProcW(hwnd, msg, w, l) }
         }
+        WM_LBUTTONDOWN => {
+            let x = (l & 0xffff) as i16 as i32;
+            let y = ((l >> 16) & 0xffff) as i16 as i32;
+            let gear = app.gear;
+            if !app.settings_open
+                && gear.right > gear.left
+                && x >= gear.left
+                && x < gear.right
+                && y >= gear.top
+                && y < gear.bottom
+            {
+                app.show_settings(hwnd);
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, w, l) }
+        }
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let device = unsafe { BeginPaint(hwnd, &mut paint) };
@@ -1970,6 +2019,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         fonts.detail,
                         colors.text,
                         DT_CENTER | DT_END_ELLIPSIS,
+                    );
+                }
+                if app.gear.right > app.gear.left {
+                    draw::text(
+                        device,
+                        draw::GLYPH_SETTINGS,
+                        &app.gear,
+                        fonts.glyph,
+                        colors.secondary,
+                        DT_CENTER,
                     );
                 }
                 let footer = app.footer;
@@ -2069,6 +2128,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 }
                 SETTINGS_SAVE => app.save_settings(hwnd),
                 SETTINGS_BACK => app.show_search(hwnd),
+                SETTINGS_WINDOWS_SEARCH => app.toggle_windows_search(hwnd),
                 SETTINGS_CLEAR => match app.history.clear() {
                     Ok(()) => message(hwnd, "Open history cleared."),
                     Err(err) => message(hwnd, &format!("Could not clear the history: {err}")),
@@ -2095,6 +2155,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_HOTKEY if w as i32 == HOTKEY_ID => {
             app.set_scope(hwnd, None);
+            app.open_panel(hwnd);
+            0
+        }
+        WM_SHOW_PANEL => {
             app.open_panel(hwnd);
             0
         }
@@ -2357,6 +2421,12 @@ fn main() {
     let hidden = std::env::args_os()
         .skip(1)
         .any(|arg| arg == std::ffi::OsStr::new("--hidden"));
+    // One panel per session: a second launch just brings the running one forward.
+    let existing = unsafe { FindWindowW(wide(CLASS).as_ptr(), null()) };
+    if !existing.is_null() {
+        unsafe { PostMessageW(existing, WM_SHOW_PANEL, 0, 0) };
+        return;
+    }
     if let Err(err) = run(hidden) {
         let text = wide(&err);
         unsafe {

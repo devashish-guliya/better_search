@@ -341,10 +341,12 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - `apply()` sets or deletes the policy, runs `sc config` and `sc stop WSearch`
   (disabled, or delayed-auto plus start), and ends `SearchHost.exe`. Killing it alone
   is not enough, because it restarts within seconds.
-- Settings checkbox: "Turn off Windows search and its indexer (asks for admin)"
-  (control id `SETTINGS_WINDOWS_SEARCH` 321, `controls[7]`). The double-height control
-  index is 10. `save_settings` calls `winsearch::request` only when the box changed,
-  then `winkey::set_search_off`.
+- One-click button: the label says what the press will do ("Turn Windows search off (asks
+  for admin)" or "Turn Windows search back on (asks for admin)"), depending on the current
+  state (control id `SETTINGS_WINDOWS_SEARCH` 321, `controls[2]`, the first control under
+  the hotkey field). A press calls `winsearch::request` at once and then
+  `winkey::set_search_off`; nothing about it goes through Save. The double-height control
+  index is 8.
 - **Watcher:** an `EVENT_SYSTEM_FOREGROUND` WinEvent hook (`foreground_changed`). If
   `SearchHost.exe` comes to the front while search is off, the hook ends it and opens
   better_search (`WM_WIN_S`).
@@ -364,6 +366,12 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 ### 5.8 Other window features
 
 - **Tray:** Open, Settings, Pause (pauses window queries only) and Quit.
+- **Settings gear:** a glyph button at the right end of the search field opens the same
+  Settings page (`WM_LBUTTONDOWN` hit test on `App::gear`), so Settings needs no tray trip.
+- **One panel per session:** `main()` looks for the window class first; a second launch
+  posts `WM_SHOW_PANEL` (`WM_APP+7`) to the running window and exits.
+- **Indexing wait:** while the service answers `Loading`, the status line says
+  "Indexing your drives; results appear when the first scan finishes".
 - **Hotkey:** default Alt+Space, changeable in Settings. If another program owns it,
   the tray still works.
 - **No edge hover:** the screen-edge pop-in was removed by user decision (2026-10-05); Win+S, Alt+Space and the tray open the panel.

@@ -24,6 +24,7 @@ pub const ROW_HEIGHT: i32 = 48;
 pub const RADIUS: i32 = 6;
 
 pub const GLYPH_SEARCH: &str = "\u{E721}";
+pub const GLYPH_SETTINGS: &str = "\u{E713}";
 pub const GLYPH_FOLDER: &str = "\u{E838}";
 pub const GLYPH_COPY: &str = "\u{E8C8}";
 
