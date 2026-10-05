@@ -115,7 +115,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
-| (this commit) | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
+| `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 
 ## 4. Current results on the development machine
 
