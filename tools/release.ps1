@@ -55,9 +55,11 @@ if ($installerVersion -ne $Version) {
 
 Push-Location $root
 try {
-    cargo build --release
+    # cargo and gh write progress to stderr; through cmd.exe that is plain output, so
+    # PowerShell's ErrorActionPreference does not turn it into a failure.
+    cmd /c "cargo build --release 2>&1" | Write-Output
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
-    cargo build --release --manifest-path tools\installer\Cargo.toml
+    cmd /c "cargo build --release --manifest-path tools\installer\Cargo.toml 2>&1" | Write-Output
     if ($LASTEXITCODE -ne 0) { throw 'the setup program failed to build' }
 
     $setup = Join-Path $root 'tools\installer\target\release\better-search-setup.exe'
@@ -84,8 +86,9 @@ try {
         return
     }
     if (-not $Notes) { $Notes = "better_search $Version" }
-    gh release create "v$Version" --repo $Repo --title "better_search $Version" `
-        --notes $Notes $stagedManifest $stagedSetup
+    $stagedNotes = Join-Path $stage 'notes.md'
+    Set-Content -LiteralPath $stagedNotes -Value $Notes -Encoding utf8
+    cmd /c "gh release create v$Version --repo $Repo --title `"better_search $Version`" --notes-file `"$stagedNotes`" `"$stagedManifest`" `"$stagedSetup`" 2>&1" | Write-Output
     if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
     Write-Output "Published v$Version to $Repo (sha256 $hash)"
 }
