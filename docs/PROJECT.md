@@ -114,7 +114,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `85669b7` | Run cargo and gh through `cmd.exe` in the release script |
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
-| (this commit) | Quit the panel on uninstall so its image is released; version 0.2.3 |
+| `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 
 ## 4. Current results on the development machine
 

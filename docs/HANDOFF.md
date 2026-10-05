@@ -585,7 +585,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
-| (this commit) | Quit the panel on uninstall so its image is released; version 0.2.3 |
+| `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
 | `85669b7` | Run cargo and gh through `cmd.exe` in the release script |
