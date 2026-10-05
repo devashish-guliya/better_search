@@ -10,6 +10,19 @@ client and a native Win32 search window search through a named pipe without admi
 The full design record (decisions, what is settled, and the plan for the next phases) is
 in [docs/PROJECT.md](docs/PROJECT.md).
 
+## Install
+
+Download `better-search-setup.exe` from the
+[latest release](https://github.com/devashish-guliya/better_search/releases/latest) and
+run it. It asks for one administrator prompt, installs into
+`C:\Program Files\better_search`, registers the service and adds the panel to startup.
+Running it again upgrades an existing install in place, keeping settings and the index.
+The installer is not code signed, so Windows SmartScreen will warn; the same program
+uninstalls from Apps & Features.
+
+The panel then checks for new releases from this repository when you press **Check for
+updates** in Settings (or in the tray menu). See [Updates](#updates).
+
 ## Layout
 
 | Crate | Purpose |
