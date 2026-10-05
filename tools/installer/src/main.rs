@@ -404,6 +404,83 @@ fn remove_leftovers(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("better-search-setup.exe.old"));
 }
 
+/// The files an uninstall or an upgrade can leave behind: the setup program that was
+/// still running when the folder was cleared, and the renamed-old image of an upgrade.
+fn is_our_leftover(name: &str) -> bool {
+    if name == "better-search-setup.exe" {
+        return true;
+    }
+    let Some(base) = name.strip_suffix(".old") else {
+        return false;
+    };
+    base == "better-search-setup.exe" || FILES.iter().any(|&(program, _)| program == base)
+}
+
+/// True when the folder holds nothing but our own leftovers, so a fresh install may take
+/// it over instead of refusing. Anything else means the folder is not ours to reuse.
+fn only_leftovers(dir: &Path) -> io::Result<bool> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !is_our_leftover(&entry.file_name().to_string_lossy()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Removes the leftovers so a fresh install can write its own files. Unlike
+/// `remove_leftovers` this reports failures: a leftover that is still running would
+/// otherwise fail later with a message about a file that already exists.
+fn clear_leftovers(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if is_our_leftover(&entry.file_name().to_string_lossy()) {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Asks Windows to delete a file at the next reboot, the only way to remove a program's
+/// image while that program is running. Needs the caller to be elevated.
+fn schedule_delete(path: &Path) -> bool {
+    // SAFETY: the path is NUL-terminated and the destination is null, which asks for
+    // deletion at the next reboot.
+    unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+            wide_path(path).as_ptr(),
+            null(),
+            windows_sys::Win32::Storage::FileSystem::MOVEFILE_DELAY_UNTIL_REBOOT,
+        ) != 0
+    }
+}
+
+/// Deletes `file`, or gets it out of the install folder when Windows refuses to delete a
+/// running image (the panel is usually running during an uninstall). Returns whether the
+/// file is now out of the way, either gone, moved to the temp folder, or scheduled for
+/// deletion where it stands at the next reboot.
+fn delete_or_move_out(file: &Path) -> bool {
+    if !file.exists() {
+        return true;
+    }
+    if std::fs::remove_file(file).is_ok() {
+        return true;
+    }
+    let name = file
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let moved = std::env::temp_dir().join(format!("{name}-removed-{}", std::process::id()));
+    if std::fs::rename(file, &moved).is_err() {
+        // The temp folder is on another volume, or the move was refused: leave the file
+        // where it is and let Windows delete it there at the next reboot.
+        return schedule_delete(file);
+    }
+    let _ = schedule_delete(&moved);
+    true
+}
+
 /// Replaces an existing installation in place: stops the service, swaps the files
 /// (a running window is moved aside, never killed), refreshes the registry and starts
 /// the service again. The running window keeps the old code until it is restarted.
@@ -446,16 +523,39 @@ fn install() -> io::Result<()> {
         return upgrade(&scm, &dir);
     }
     if open_service(&scm)?.is_some()
-        || dir.exists()
         || reg_text_value(RUN_KEY, SERVICE)?.is_some()
         || reg_text_value(UNINSTALL_KEY, "DisplayName")?.is_some()
     {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "better_search is already installed (or its install folder exists); nothing was changed",
+            "better_search is already installed; nothing was changed",
         ));
     }
-    std::fs::create_dir(&dir)?;
+    // An uninstall can leave the folder behind, because the copy that was running could
+    // not be deleted. Take it over when it holds nothing but our own leftovers, so a
+    // reinstall does not have to wait for a restart.
+    if dir.exists() {
+        if !only_leftovers(&dir)? {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and holds other files; nothing was changed",
+                    dir.display()
+                ),
+            ));
+        }
+        clear_leftovers(&dir).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!(
+                    "the copy of the setup program in {} is still in use ({err}); close it and run the installer again",
+                    dir.display()
+                ),
+            )
+        })?;
+    } else {
+        std::fs::create_dir(&dir)?;
+    }
     let mut created = Vec::new();
     let outcome = (|| {
         for &(name, bytes) in &FILES {
@@ -507,30 +607,38 @@ fn install() -> io::Result<()> {
 
 fn uninstall() -> io::Result<()> {
     let dir = install_dir()?;
-    if !registered_install(&dir)? {
+    let scm = manager(SC_MANAGER_CONNECT)?;
+    let registered = registered_install(&dir)?;
+    let service = open_service(&scm)?;
+    if !registered {
+        // Without our own registration nothing here is ours to delete, except that a
+        // missing service alone is not a reason to refuse: an earlier run may have
+        // removed it and then stopped.
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "the installer registration is missing; refusing to remove an unknown service",
+            if service.is_some() {
+                "the installer registration is missing; refusing to remove an unknown service"
+            } else {
+                "better_search is not installed (no service and no installer registration)"
+            },
         ));
     }
-    let scm = manager(SC_MANAGER_CONNECT)?;
-    let service = open_service(&scm)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "better_search service is not installed",
-        )
-    })?;
-    stop_service(&service)?;
-    // SAFETY: service is stopped and handle remains valid for the delete call.
-    if unsafe { DeleteService(service.0) } == 0 {
-        return Err(io::Error::last_os_error());
+    if let Some(service) = &service {
+        stop_service(service)?;
+        // SAFETY: the service is stopped and the handle stays valid for the delete call.
+        if unsafe { DeleteService(service.0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
     }
-    drop(service);
     remove_registration()?;
+    // The panel is usually still running, and Windows will not delete a running image.
+    // Such a copy is moved out of the folder (and deleted at the next reboot) instead of
+    // blocking the uninstall or lingering in Program Files.
+    let mut stuck = None;
     for &(name, _) in &FILES {
         let file = dir.join(name);
-        if file.exists() {
-            std::fs::remove_file(&file)?;
+        if !delete_or_move_out(&file) && stuck.is_none() {
+            stuck = Some(file);
         }
     }
     remove_leftovers(&dir);
@@ -554,27 +662,20 @@ fn uninstall() -> io::Result<()> {
         }
         let _ = std::fs::remove_dir(data); // Never recursively delete unknown content.
     }
-    // The uninstaller is running from this location. Windows deletes it, then the
-    // empty directory, on reboot. Unknown extra files prevent directory removal.
+    // The uninstaller is running from this folder too, so it is moved out the same way.
     let self_file = dir.join("better-search-setup.exe");
-    let scheduled = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            wide_path(&self_file).as_ptr(),
-            null(),
-            windows_sys::Win32::Storage::FileSystem::MOVEFILE_DELAY_UNTIL_REBOOT,
-        )
-    };
-    if scheduled == 0 {
-        return Err(io::Error::last_os_error());
+    if !delete_or_move_out(&self_file) && stuck.is_none() {
+        stuck = Some(self_file);
     }
-    let _ = unsafe {
-        windows_sys::Win32::Storage::FileSystem::MoveFileExW(
-            wide_path(&dir).as_ptr(),
-            null(),
-            windows_sys::Win32::Storage::FileSystem::MOVEFILE_DELAY_UNTIL_REBOOT,
-        )
-    };
-    Ok(())
+    // Unknown files keep the folder, which is not ours to delete; ours are out of it.
+    let _ = std::fs::remove_dir(&dir);
+    match stuck {
+        Some(file) => Err(io::Error::other(format!(
+            "could not remove {}; close it and run the uninstall again",
+            file.display()
+        ))),
+        None => Ok(()),
+    }
 }
 
 fn main() {
@@ -730,6 +831,52 @@ mod tests {
             1,
             "no scratch files"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_our_own_files_count_as_leftovers() {
+        assert!(is_our_leftover("better-search-setup.exe"));
+        assert!(is_our_leftover("better-search-setup.exe.old"));
+        assert!(is_our_leftover("bs-window.exe.old"));
+        assert!(is_our_leftover("bs-service.exe.old"));
+        assert!(!is_our_leftover("bs-window.exe"));
+        assert!(!is_our_leftover("index.bin"));
+        assert!(!is_our_leftover("notes.txt"));
+        assert!(!is_our_leftover("bs-window.exe.old.bak"));
+    }
+
+    /// The folder an uninstall can leave behind is taken over by a fresh install, but
+    /// only when it holds nothing but our own files.
+    #[test]
+    fn a_folder_of_leftovers_is_adopted_and_any_other_file_stops_that() {
+        let dir = scratch("adopt");
+        std::fs::write(dir.join("better-search-setup.exe"), b"old").unwrap();
+        std::fs::write(dir.join("bs-window.exe.old"), b"old").unwrap();
+        assert!(only_leftovers(&dir).unwrap());
+        clear_leftovers(&dir).unwrap();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+
+        std::fs::write(dir.join("better-search-setup.exe"), b"old").unwrap();
+        std::fs::write(dir.join("someone-elses-file.txt"), b"keep").unwrap();
+        assert!(!only_leftovers(&dir).unwrap());
+        clear_leftovers(&dir).unwrap();
+        assert!(!dir.join("better-search-setup.exe").exists());
+        assert!(dir.join("someone-elses-file.txt").exists());
+
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        assert!(!only_leftovers(&dir).unwrap(), "a folder is not a leftover");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_free_file_is_removed_and_a_missing_one_needs_no_work() {
+        let dir = scratch("remove");
+        let file = dir.join("bs.exe");
+        assert!(delete_or_move_out(&file), "a missing file is already gone");
+        std::fs::write(&file, b"old").unwrap();
+        assert!(delete_or_move_out(&file));
+        assert!(!file.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

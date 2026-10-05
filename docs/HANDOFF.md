@@ -8,9 +8,9 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.1` (2026-10-05). The tree is clean,
-126 workspace tests and 4 installer tests pass, and the code is on GitHub with the
-first two releases published.
+State at writing: branch `main`, released as `v0.2.2` (2026-10-05). The tree is clean,
+126 workspace tests and 7 installer tests pass, and the code is on GitHub with three
+releases published.
 
 ---
 
@@ -50,20 +50,24 @@ Ask before big or machine-wide decisions.
 
 ### Current installed state (important)
 
-- better_search is **installed** in `C:\Program Files\better_search` (`bs-service.exe`,
-  `bs-window.exe`, `bs.exe`, `better-search-setup.exe`), at version 0.2.1. The
-  `better_search` service runs
-  as LocalSystem and starts automatically. The window auto-starts with `--hidden` from an
-  HKLM `Run` entry.
-- Version 0.2.0 was the first published release and 0.2.1 is the newest; the installed
-  copy has been upgraded in place with the released installer, both by hand and through
-  the panel's Check for updates button. `bs-window.exe --check-updates` prints whether a
-  newer release exists.
-- **Windows search is turned OFF on this PC.** The `DisableSearch=1` policy is set, the
-  `WSearch` service is stopped and disabled, and `SearchHost.exe` is closed. To turn it
-  back on, uncheck the Settings box or run `bs-window.exe --windows-search on` elevated.
-- Settings for the window: `%LOCALAPPDATA%\better_search\window.cfg`. Open history:
-  `%LOCALAPPDATA%\better_search\history.tsv`. Service data (index and log):
+- better_search is **not installed** on this machine (2026-10-05). It was uninstalled
+  with the 0.2.2 setup program to test the removal end to end and to leave the machine
+  clean for a fresh manual install; before that it lived in
+  `C:\Program Files\better_search` (`bs-service.exe`, `bs-window.exe`, `bs.exe`,
+  `better-search-setup.exe`) with the `better_search` service running as LocalSystem and
+  the window auto-starting with `--hidden` from an HKLM `Run` entry.
+- Releases so far: 0.2.0 (first public), 0.2.1 (leftover cleanup), 0.2.2 (clean
+  uninstall). The installed copy was upgraded in place by hand and through the panel's
+  Check for updates button; `bs-window.exe --check-updates` prints whether a newer
+  release exists.
+- **Windows search is turned back ON on this PC** (the `DisableSearch` policy was
+  removed and `WSearch` set to delayed-auto and started), so the first-run offer in
+  better_search will appear during a fresh install.
+- **Nothing of better_search remains:** the folder, the service, the `Run` value, the
+  Apps & Features entry, `%LOCALAPPDATA%\better_search` (settings and open history) and
+  `%ProgramData%\better_search` (index and logs) were all removed.
+- Settings for the window live at `%LOCALAPPDATA%\better_search\window.cfg`. Open
+  history: `%LOCALAPPDATA%\better_search\history.tsv`. Service data (index and log):
   `%ProgramData%\better_search` (protected; only SYSTEM and Administrators can read it).
 
 ## 3. Architecture overview
@@ -430,10 +434,18 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   - creates and starts the `better_search` service (auto start, LocalSystem);
   - adds an HKLM Run entry for `bs-window.exe --hidden` and an Apps & Features
     uninstall entry;
-  - rolls back fully if any step fails.
-- **Uninstall:** checks `InstallLocation` first, removes the service, registry entries
-  and binaries, asks whether to delete the index and logs (default **No**), and queues
-  its own deletion for the next reboot.
+  - rolls back fully if any step fails;
+  - refuses a folder that exists, **unless** it holds nothing but our own leftovers (the
+    setup program and `.old` images), which it clears and takes over, so a reinstall
+    straight after an uninstall works without a restart.
+- **Uninstall:** checks `InstallLocation` first (a missing service alone no longer stops
+  it), removes the service, registry entries and binaries, asks whether to delete the
+  index and logs (default **No**), and removes the folder. The panel is usually running,
+  and Windows refuses to delete a running image, so such a file is renamed into the temp
+  folder (allowed for a running image) and that copy is deleted at the next reboot; the
+  uninstaller itself is removed the same way. `%ProgramFiles%\better_search` is therefore
+  gone immediately, with nothing left for a reboot to clear inside it. Unknown files are
+  never deleted and keep the folder.
 - **Upgrade (added with the update check):** running the setup program on a machine where
   the install is registered upgrades in place instead of refusing. It stops the service,
   replaces the three programs and its own copy, refreshes the registry entries, and
@@ -443,16 +455,18 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   copy is deleted afterwards when it can be (the service's always, because it is stopped
   for the swap; a running window's image cannot be deleted at all, so it goes at the next
   upgrade or uninstall). The running window keeps the old code
-  until it restarts. A failure restores the original, and a folder that exists without a
-  registration is still refused. Verified on this machine with the released installer
+  until it restarts. A failure restores the original. Verified on this machine with the
+  released installer
   while the service and the window were running: the service stopped and started, the
   `.old` copies appeared, and the old window kept answering searches during and after the
   upgrade. A later run cleared a leftover `.old` file once no window was running from it.
 - `--inspect` is read-only and safe to run. **Do not run install, upgrade or uninstall
   without asking the user.** The binary is not code signed, so SmartScreen will warn.
 - Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`
-  (four tests: payloads are executables, a file swap writes through cleanly, a file
-  without delete sharing is refused without damage, renamed-old images are cleared).
+  (seven tests: payloads are executables, a file swap writes through cleanly, a file
+  without delete sharing is refused without damage, renamed-old images are cleared, only
+  our own files count as leftovers, a folder of leftovers is adopted while any other file
+  stops that, and a free file is removed while a missing one needs no work).
 
 ## 7. Key decisions (and why)
 

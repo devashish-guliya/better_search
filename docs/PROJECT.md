@@ -1098,16 +1098,20 @@ Modes:
   and refuses otherwise.
 - `--uninstall`: the Apps & Features entry runs this; it elevates the same way.
 
-Install behaviour: requires the folder `%ProgramFiles%\better_search` and the registry
-entries to be absent, and the service not to exist, then copies the three binaries plus
+Install behaviour: requires the registry entries and the service to be absent, then copies
+the three binaries plus
 itself as the uninstaller, creates the `better_search` service (`SERVICE_AUTO_START`,
 LocalSystem, own process) and starts it, waits for `SERVICE_RUNNING`, and writes an HKLM
 `Run` entry (`bs-window.exe --hidden`) and the HKLM `...\Uninstall\better_search` keys
 (DisplayName, version, publisher, location, UninstallString, NoModify, NoRepair). Every
-step after `create_dir` is inside a rollback: on error it stops and deletes the service,
-removes the registry entries, deletes the written files and removes the folder.
+step after creating the folder is inside a rollback: on error it stops and deletes the
+service, removes the registry entries, deletes the written files and removes the folder.
 The window auto-start is machine-wide because the service is, so the panel appears for
 every user; the snapshot and pipe keep their own per-service protection.
+An existing folder is normally refused, but one that holds **nothing but our own
+leftovers** (the setup program, and `.old` images from an upgrade) is taken over after
+those files are cleared, so a reinstall after an uninstall does not have to wait for a
+restart. A folder with any other file or subfolder is still refused, unchanged.
 
 Upgrade behaviour (added with the update check): no argument on a machine where the
 installation is registered runs `upgrade` instead of `install`. It opens the service and
@@ -1121,9 +1125,7 @@ missing. `remove_leftovers` deletes renamed-old images afterwards, best effort: 
 service's copy goes immediately because the service is stopped, while a running window's
 copy cannot be deleted at all (Windows denies deleting a running image) and goes at the
 next upgrade or uninstall. The window keeps running
-the old code until it restarts; settings, snapshot and log are untouched. Files that
-exist without a registration are still refused, so a half-removed install is not
-silently adopted.
+the old code until it restarts; settings, snapshot and log are untouched.
 
 Verified twice on the development machine (2026-10-05) with the released installer while
 both the service and the window were running: the service stopped and started again,
@@ -1133,13 +1135,22 @@ started from the replaced file. A third run confirmed the cleanup: with no windo
 running from the renamed image, the leftover `.old` file was gone afterwards.
 
 Uninstall behaviour: refuses unless the installer's own `InstallLocation` matches the
-expected folder (so it never deletes a service someone else registered), stops and
-deletes the service, removes the registry entries and the three binaries, then asks
-(default **No**) whether to delete the saved `index.bin` and logs. It removes only those
-named files and then the now-empty data folder; it never deletes unknown files
-recursively. The uninstaller queues itself and its folder for deletion on the next
-reboot (`MoveFileExW` with `MOVEFILE_DELAY_UNTIL_REBOOT`), because Windows cannot delete
-a running executable.
+expected folder (so it never deletes a service someone else registered); a missing
+service alone no longer stops it, because an earlier run may have removed the service and
+then failed. It stops and deletes the service, removes the registry entries and the three
+binaries, then asks (default **No**) whether to delete the saved `index.bin` and logs. It
+removes only those named files and then the now-empty data folder; it never deletes
+unknown files recursively. Unknown files in the install folder are also left alone, and
+they keep the folder.
+
+The panel is usually running during an uninstall, and Windows refuses to delete a running
+image. `delete_or_move_out` handles that: it deletes the file when it can, otherwise it
+renames it into the temp folder (allowed for a running image, and on the same volume) and
+schedules that copy for deletion at the next reboot; if the temp folder is on another
+volume it schedules the file where it stands instead. The uninstaller itself is removed
+the same way, so `%ProgramFiles%\better_search` is gone straight away rather than after a
+restart, and no `.old` file is left in it. A file that cannot be deleted or moved is
+reported with a message asking for it to be closed, instead of a raw error.
 
 **End-to-end test on the development machine (2026-09-28).** With the user's approval
 the draft was installed and uninstalled once, on the real C:, D:, E: drives, using the
@@ -1157,22 +1168,26 @@ ignored elevated scripts `target\admin_run\phase5_install.ps1`,
   `readme` results in its Name/Path columns.
 - Uninstall removed the service (SCM 1060 afterwards), the `Run` value and the uninstall
   key, deleted the three binaries, and kept the snapshot and log when the prompt's
-  default (No) was chosen. The uninstall queue (`MoveFileExW`) held the uninstaller and
-  its folder for reboot-time deletion, which is why one
-  `better-search-setup.exe` remains in the folder until the next reboot; Program Files
-  needs elevation, so a normal shell cannot remove it sooner.
+  default (No) was chosen. That version queued the uninstaller and its folder for
+  reboot-time deletion, which left one `better-search-setup.exe` in the folder until the
+  next reboot; the later `delete_or_move_out` change removes both at once instead (see
+  the paragraph above).
 
 Still open after the test:
 
-- The delayed self-delete was confirmed only through the queued
-  `PendingFileRenameOperations` entries, not by observing a reboot.
+- The delayed self-delete is confirmed only through the queued
+  `PendingFileRenameOperations` entries, not by observing a reboot. Since the uninstall
+  now moves a running copy into the temp folder first, the queued entry concerns a temp
+  copy rather than a file in Program Files.
 - The binary is **not code signed**, so SmartScreen will warn. Signing stays open as
   originally planned; the version and update check are now built (`9227386`, section
   5.12).
-- The installer's own checks are four tests in the crate: the bundled payloads are
+- The installer's own checks are seven tests in the crate: the bundled payloads are
   Windows executables, a file swap writes through and leaves no scratch files behind, a
-  file held without delete sharing is refused without damage, and renamed-old images
-  from an earlier upgrade are cleared without touching the current program.
+  file held without delete sharing is refused without damage, renamed-old images from an
+  earlier upgrade are cleared without touching the current program, only our own files
+  count as leftovers, a folder of leftovers is adopted while any other file stops that,
+  and a free file is removed while a missing one needs no work.
 - The original Phase 5 plan is otherwise unchanged: one installer file, one UAC prompt,
   clean uninstall offering to keep or delete settings, and later code signing.
 
@@ -1199,7 +1214,7 @@ Still open after the test:
   first, then `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` with
   `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored and
-  its four tests never touch the machine. `--inspect` is safe to run unattended;
+  its seven tests never touch the machine. `--inspect` is safe to run unattended;
   install, upgrade and uninstall change the machine and must not be run without asking
   (the one approved end-to-end run is recorded in Phase 5).
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go
@@ -1227,10 +1242,12 @@ Still open after the test:
   elevated script deletes only the test service and the folder it created.
 - **Shell:** Windows PowerShell 5.1. No `&&` / `||`; use `;` and `$LASTEXITCODE`. Run
   cargo through `cmd /c "... 2>&1"` so stderr output does not produce a false error
-  exit code. Two PowerShell traps hit in practice: `r` is an alias for `Invoke-History`
-  (a one-letter report function silently swallowed its output), and PowerShell quoting
+  exit code. Three PowerShell traps hit in practice: `r` is an alias for `Invoke-History`
+  (a one-letter report function silently swallowed its output), PowerShell quoting
   mangles the `binPath= "..."` argument of `sc.exe create`, so pass the binary path
-  unquoted or build the argument list as an array.
+  unquoted or build the argument list as an array, and `-replace` with a `$1`/`${1}`
+  group inside a double-quoted pattern plus a `,` in the replacement silently mangles
+  Cargo.toml dependency lines (use `.Replace()` for version bumps).
 - **Commits:** write the message to `.git\COMMIT_DRAFT.txt`, run
   `git -C D:\better_search commit -q -F .git\COMMIT_DRAFT.txt` in a separate step, then
   delete the draft. Messages end with
