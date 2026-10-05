@@ -29,8 +29,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
     DEFAULT_GUI_FONT, DT_CENTER, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC,
     DeleteObject, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, PAINTSTRUCT,
-    ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
+    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+    PAINTSTRUCT, ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -133,6 +133,18 @@ struct Slide {
     width: i32,
     height: i32,
     frame: i32,
+}
+
+/// Default panel geometry: 9:16 portrait, 70% of the work area tall, centred
+/// vertically and flush with the right (or left) screen edge.
+fn panel_rect(work: RECT, left: bool) -> (i32, i32, i32, i32) {
+    let work_width = work.right - work.left;
+    let work_height = work.bottom - work.top;
+    let height = (work_height * 7 / 10).max(1);
+    let width = (height * 9 / 16).min(work_width);
+    let x = if left { work.left } else { work.right - width };
+    let y = work.top + (work_height - height) / 2;
+    (x, y, width, height)
 }
 
 struct App {
@@ -1008,12 +1020,9 @@ impl App {
             return;
         }
         let work = info.rcWork;
-        let width = scale(hwnd, 490).min(work.right - work.left);
-        let height = scale(hwnd, 550).min(work.bottom - work.top);
         let left = self.settings.left;
+        let (to, top, width, height) = panel_rect(work, left);
         let from = if left { work.left - width } else { work.right };
-        let to = if left { work.left } else { work.right - width };
-        let top = work.top + scale(hwnd, 24);
         self.slide = Some(Slide {
             from,
             to,
@@ -2444,6 +2453,16 @@ fn run(start_hidden: bool) -> Result<(), String> {
         ));
     }
     let app = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App };
+    // The startup default: a 9:16 panel at the right edge, centred vertically.
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        let (x, y, width, height) = panel_rect(info.rcWork, unsafe { (*app).settings.left });
+        unsafe { SetWindowPos(hwnd, null_mut(), x, y, width, height, SWP_NOZORDER) };
+    }
     unsafe {
         (*app)
             .hover
@@ -2533,6 +2552,25 @@ mod tests {
         assert_eq!(describe(&store), "App");
         assert!(is_app(&store));
         assert_eq!(extension(&store), None);
+    }
+
+    #[test]
+    fn default_panel_is_nine_by_sixteen_and_centred() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        let (x, y, width, height) = panel_rect(work, false);
+        assert_eq!(height, 728);
+        assert_eq!(width, 409);
+        assert_eq!(x, 1920 - width);
+        assert_eq!(y, (1040 - height) / 2);
+        let (left_x, _, left_width, left_height) = panel_rect(work, true);
+        assert_eq!(left_x, 0);
+        assert_eq!(left_width, width);
+        assert_eq!(left_height, height);
     }
 
     #[test]

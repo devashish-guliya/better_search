@@ -259,6 +259,9 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 
 ### 5.1 Look and behaviour
 
+- Default geometry: a 9:16 portrait panel, 70% of the work area tall, centred
+  vertically and flush with the right (or left) screen edge (`panel_rect`). The
+  startup placement and the hover slide both use it.
 - Three bands: a rounded search field (glyph, placeholder, accent underline), the
   results, and a footer with the count and a hint.
 - Results are an owner-data, owner-drawn ListView with two-line rows: an icon, the

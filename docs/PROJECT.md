@@ -691,7 +691,9 @@ and reports a clear message when the service is not running.
   headings 9 pt semibold, Segoe UI Variable with a Segoe UI fallback, Segoe Fluent
   Icons or MDL2 glyphs), colour roles (panel, surface, hover, selected, text,
   secondary, edge, accent) on Windows 11's base colours, and the user's accent colour
-  (lightened on dark). Rounded Win11 corners and a caption matching the panel.
+  (lightened on dark). Rounded Win11 corners and a caption matching the panel. Default
+  geometry (`panel_rect`): 9:16 portrait, 70% of the work area tall, centred vertically
+  against the right (or left) edge; used at startup and by the hover slide.
 - The panel has three bands: a rounded search field (search glyph, placeholder via
   `EM_SETCUEBANNER`, accent underline while focused), the results, and a footer with
   the result count and a `Ctrl+Enter` hint that gives way when the count needs the

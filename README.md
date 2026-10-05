@@ -52,7 +52,8 @@ cargo build --release
 ```
 
 The window starts with Alt+Space (if Windows has not reserved it) and a short hover at
-the right screen edge. Double-click its tray icon to open it; right-click for Open,
+the right screen edge. It opens as a tall 9:16 panel, 70% of the screen height, centred
+vertically against that edge. Double-click its tray icon to open it; right-click for Open,
 Settings, Pause or Quit. Pause stops window searches, not the background index. Type to
 search, use the arrow keys, Enter to open, Ctrl+Enter to select the result in Explorer,
 or right-click a result for Open, Open folder and Copy path. Esc hides the window.
