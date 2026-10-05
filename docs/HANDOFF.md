@@ -8,7 +8,7 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: commit `06174d4` on branch `main` (2026-10-05). The tree is clean,
+State at writing: commit `9227386` on branch `main` (2026-10-05). The tree is clean,
 126 workspace tests and 3 installer tests pass, and the code is on GitHub with the
 first release published.
 
@@ -552,7 +552,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
-| `06174d4` | GitHub releases, in-place installer upgrades, and a Check for updates button |
+| `9227386` | GitHub releases, in-place installer upgrades, and a Check for updates button |
 | `d9b81c6` | First-run offer to turn Windows search off, with the reasoning |
 | `c79bc7a` | Settings gear, one-click Windows search switch, indexing wait, one panel per session |
 | `21b0540` | Drop the legacy hover/left keys from the settings test |

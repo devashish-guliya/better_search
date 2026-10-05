@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `06174d4` ("GitHub releases, in-place upgrades, and a Check for
+Last updated after commit `9227386` ("GitHub releases, in-place upgrades, and a Check for
 updates button"). `docs/HANDOFF.md` is a shorter, self-contained summary of this record
 for starting a new chat.
 
@@ -110,7 +110,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `21b0540` | Drop the legacy hover/left keys from the settings test |
 | `c79bc7a` | Settings gear, one-click Windows search switch, indexing wait, one panel per session |
 | `d9b81c6` | First-run offer to turn Windows search off, with the reasoning |
-| `06174d4` | GitHub releases, in-place upgrades, and a Check for updates button |
+| `9227386` | GitHub releases, in-place upgrades, and a Check for updates button |
 
 ## 4. Current results on the development machine
 
@@ -1154,7 +1154,7 @@ Still open after the test:
 - The delayed self-delete was confirmed only through the queued
   `PendingFileRenameOperations` entries, not by observing a reboot.
 - The binary is **not code signed**, so SmartScreen will warn. Signing stays open as
-  originally planned; the version and update check are now built (`06174d4`, section
+  originally planned; the version and update check are now built (`9227386`, section
   5.12).
 - The installer's own checks are three tests in the crate: the bundled payloads are
   Windows executables, a file swap writes through and leaves no scratch files behind,
