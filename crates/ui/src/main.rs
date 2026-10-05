@@ -100,6 +100,9 @@ const TRAY_MESSAGE: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 
 const WM_SHOW_PANEL: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 7;
 /// The update worker asks the window to replace itself with the installed build.
 const WM_RESTART: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 8;
+/// The setup program asks the window to exit before it removes the files, so the program
+/// image is released instead of being left running from a folder that no longer exists.
+const WM_QUIT_PANEL: u32 = windows_sys::Win32::UI::WindowsAndMessaging::WM_APP + 9;
 const HOTKEY_ID: i32 = 1;
 const MENU_OPEN: usize = 201;
 const MENU_SETTINGS: usize = 202;
@@ -2320,6 +2323,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_RESTART => {
             restart(hwnd);
+            0
+        }
+        WM_QUIT_PANEL => {
+            // The tray's Quit does the same: the panel has nothing to save.
+            unsafe { DestroyWindow(hwnd) };
             0
         }
         winkey::WM_WIN_S => {

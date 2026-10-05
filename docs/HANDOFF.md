@@ -8,8 +8,8 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.2` (2026-10-05). The tree is clean,
-126 workspace tests and 7 installer tests pass, and the code is on GitHub with three
+State at writing: branch `main`, released as `v0.2.3` (2026-10-05). The tree is clean,
+126 workspace tests and 8 installer tests pass, and the code is on GitHub with four
 releases published.
 
 ---
@@ -50,22 +50,25 @@ Ask before big or machine-wide decisions.
 
 ### Current installed state (important)
 
-- better_search is **not installed** on this machine (2026-10-05). It was uninstalled
-  with the 0.2.2 setup program to test the removal end to end and to leave the machine
-  clean for a fresh manual install; before that it lived in
+- better_search is **not installed** on this machine (2026-10-05). It was removed with
+  the 0.2.3 setup program to test the removal end to end and to leave the machine clean
+  for a fresh manual install; before that it lived in
   `C:\Program Files\better_search` (`bs-service.exe`, `bs-window.exe`, `bs.exe`,
   `better-search-setup.exe`) with the `better_search` service running as LocalSystem and
   the window auto-starting with `--hidden` from an HKLM `Run` entry.
 - Releases so far: 0.2.0 (first public), 0.2.1 (leftover cleanup), 0.2.2 (clean
-  uninstall). The installed copy was upgraded in place by hand and through the panel's
-  Check for updates button; `bs-window.exe --check-updates` prints whether a newer
-  release exists.
+  uninstall), 0.2.3 (quit the panel so its image is released). The installed copy was
+  upgraded in place by hand and through the panel's Check for updates button;
+  `bs-window.exe --check-updates` prints whether a newer release exists.
 - **Windows search is turned back ON on this PC** (the `DisableSearch` policy was
   removed and `WSearch` set to delayed-auto and started), so the first-run offer in
   better_search will appear during a fresh install.
 - **Nothing of better_search remains:** the folder, the service, the `Run` value, the
   Apps & Features entry, `%LOCALAPPDATA%\better_search` (settings and open history) and
-  `%ProgramData%\better_search` (index and logs) were all removed.
+  `%ProgramData%\better_search` (index and logs) were all removed, and the temp copies
+  the uninstall queued were deleted too. The only trace of the removal that can remain on
+  a machine is a queued `PendingFileRenameOperations` entry for a file that is already
+  gone, which Windows skips.
 - Settings for the window live at `%LOCALAPPDATA%\better_search\window.cfg`. Open
   history: `%LOCALAPPDATA%\better_search\history.tsv`. Service data (index and log):
   `%ProgramData%\better_search` (protected; only SYSTEM and Administrators can read it).
@@ -411,7 +414,9 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - **Settings gear:** a glyph button at the right end of the search field opens the same
   Settings page (`WM_LBUTTONDOWN` hit test on `App::gear`), so Settings needs no tray trip.
 - **One panel per session:** `main()` looks for the window class first; a second launch
-  posts `WM_SHOW_PANEL` (`WM_APP+7`) to the running window and exits.
+  posts `WM_SHOW_PANEL` (`WM_APP+7`) to the running window and exits. `WM_RESTART`
+  (`WM_APP+8`) is the update flow's "start the new build", and `WM_QUIT_PANEL`
+  (`WM_APP+9`) is the setup program's "exit before I remove the files".
 - **Indexing wait:** while the service answers `Loading`, the status line says
   "Indexing your drives; results appear when the first scan finishes".
 - **Hotkey:** default Alt+Space, changeable in Settings. If another program owns it,
@@ -441,32 +446,34 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - **Uninstall:** checks `InstallLocation` first (a missing service alone no longer stops
   it), removes the service, registry entries and binaries, asks whether to delete the
   index and logs (default **No**), and removes the folder. The panel is usually running,
-  and Windows refuses to delete a running image, so such a file is renamed into the temp
-  folder (allowed for a running image) and that copy is deleted at the next reboot; the
-  uninstaller itself is removed the same way. `%ProgramFiles%\better_search` is therefore
-  gone immediately, with nothing left for a reboot to clear inside it. Unknown files are
-  never deleted and keep the folder.
+  and Windows refuses to delete a running image, so the uninstall first posts
+  `WM_QUIT_PANEL` (`WM_APP+9`) to the search window, which quits like the tray's Quit.
+  Anything still locked after that (a panel from an older version, another user's panel,
+  and always the uninstaller's own copy) is renamed into the temp folder and deleted at
+  the next reboot, so `%ProgramFiles%\better_search` is gone immediately with nothing left
+  inside it. Unknown files are never deleted and keep the folder.
 - **Upgrade (added with the update check):** running the setup program on a machine where
   the install is registered upgrades in place instead of refusing. It stops the service,
   replaces the three programs and its own copy, refreshes the registry entries, and
   starts the service again. Each file is written as `.new` and renamed over the target;
   when the program is running (rename refused) the old image is renamed to `.old` first,
   which Windows allows for a running image, and the new file takes its name. The renamed
-  copy is deleted afterwards when it can be (the service's always, because it is stopped
-  for the swap; a running window's image cannot be deleted at all, so it goes at the next
-  upgrade or uninstall). The running window keeps the old code
+  copy is moved out of the folder during the upgrade (`clear_upgrade_leftovers`, using the
+  same treatment as an uninstall, because the panel keeps running from it). The running
+  window keeps the old code
   until it restarts. A failure restores the original. Verified on this machine with the
   released installer
   while the service and the window were running: the service stopped and started, the
-  `.old` copies appeared, and the old window kept answering searches during and after the
-  upgrade. A later run cleared a leftover `.old` file once no window was running from it.
+  `.old` copies appeared and were then cleared, and the old window kept answering searches
+  during and after the upgrade.
 - `--inspect` is read-only and safe to run. **Do not run install, upgrade or uninstall
   without asking the user.** The binary is not code signed, so SmartScreen will warn.
 - Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`
-  (seven tests: payloads are executables, a file swap writes through cleanly, a file
+  (eight tests: payloads are executables, a file swap writes through cleanly, a file
   without delete sharing is refused without damage, renamed-old images are cleared, only
   our own files count as leftovers, a folder of leftovers is adopted while any other file
-  stops that, and a free file is removed while a missing one needs no work).
+  stops that, a free file is removed while a missing one needs no work, and a file that
+  cannot be removed is reported).
 
 ## 7. Key decisions (and why)
 
@@ -578,6 +585,8 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| (this commit) | Quit the panel on uninstall so its image is released; version 0.2.3 |
+| `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
 | `85669b7` | Run cargo and gh through `cmd.exe` in the release script |
 | `9227386` | GitHub releases, in-place installer upgrades, and a Check for updates button |

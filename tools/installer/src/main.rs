@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::Shell::{
     FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW, SW_SHOWNORMAL,
+    FindWindowW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW, PostMessageW, SW_SHOWNORMAL,
 };
 
 const SERVICE: &str = "better_search";
@@ -394,14 +394,23 @@ fn replace_file(file: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Deletes the renamed-old images an earlier upgrade left behind. A running program's
-/// image cannot be deleted until it exits, so this is best effort; the next upgrade and
-/// the uninstall both try again.
-fn remove_leftovers(dir: &Path) {
-    for &(name, _) in &FILES {
-        let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
+/// Deletes the images an upgrade renamed aside, with the same treatment as an uninstall
+/// because one of them may still be running: an upgrade renames the panel's image while
+/// the panel keeps working from it, and Windows refuses to delete a running image.
+/// Returns the first leftover that could not be moved out of the folder.
+fn clear_upgrade_leftovers(dir: &Path) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = FILES
+        .iter()
+        .map(|&(name, _)| dir.join(format!("{name}.old")))
+        .collect();
+    candidates.push(dir.join("better-search-setup.exe.old"));
+    let mut stuck = None;
+    for path in candidates {
+        if !delete_or_move_out(&path) && stuck.is_none() {
+            stuck = Some(path);
+        }
     }
-    let _ = std::fs::remove_file(dir.join("better-search-setup.exe.old"));
+    stuck
 }
 
 /// The files an uninstall or an upgrade can leave behind: the setup program that was
@@ -429,8 +438,8 @@ fn only_leftovers(dir: &Path) -> io::Result<bool> {
 }
 
 /// Removes the leftovers so a fresh install can write its own files. Unlike
-/// `remove_leftovers` this reports failures: a leftover that is still running would
-/// otherwise fail later with a message about a file that already exists.
+/// `clear_upgrade_leftovers` this reports failures: a leftover that is still running
+/// would otherwise fail later with a message about a file that already exists.
 fn clear_leftovers(dir: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -510,9 +519,9 @@ fn upgrade(scm: &Sc, dir: &Path) -> io::Result<()> {
     } else {
         swapped?;
     }
-    // The service is stopped while its image is renamed, so its old copy goes now; the
-    // running window's copy stays until the window exits.
-    remove_leftovers(dir);
+    // The renamed images go now: the service is stopped, and the panel's copy is moved
+    // out of the folder even though the panel keeps running from it.
+    clear_upgrade_leftovers(dir);
     Ok(())
 }
 
@@ -605,6 +614,31 @@ fn install() -> io::Result<()> {
     outcome
 }
 
+/// Asks a running search panel to exit before the files are removed, so its program image
+/// is released and can be deleted rather than moved out of the folder. The window class
+/// and the message are better_search's own; a panel from an older version ignores the
+/// message and keeps running, in which case the file is moved aside instead.
+fn close_panel() {
+    /// `WM_APP + 9` in the search window: quit, exactly as the tray's Quit does.
+    const WM_QUIT_PANEL: u32 = 0x8000 + 9;
+    let class = wide("BetterSearchWindow");
+    // SAFETY: NUL-terminated class name, no window title filter.
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), null()) };
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: the handle came from FindWindowW, and the message takes no arguments.
+    unsafe { PostMessageW(hwnd, WM_QUIT_PANEL, 0, 0) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+        // SAFETY: as above; the class is still registered while a window of it exists.
+        if unsafe { FindWindowW(class.as_ptr(), null()) }.is_null() {
+            return;
+        }
+    }
+}
+
 fn uninstall() -> io::Result<()> {
     let dir = install_dir()?;
     let scm = manager(SC_MANAGER_CONNECT)?;
@@ -631,17 +665,26 @@ fn uninstall() -> io::Result<()> {
         }
     }
     remove_registration()?;
-    // The panel is usually still running, and Windows will not delete a running image.
-    // Such a copy is moved out of the folder (and deleted at the next reboot) instead of
-    // blocking the uninstall or lingering in Program Files.
+    // The panel is usually running, and Windows will not delete a running image. Ask it to
+    // exit first; if it does not (an older version, or another user's session), the copy
+    // is moved out of the folder and deleted at the next reboot instead of blocking the
+    // uninstall or lingering in Program Files.
+    close_panel();
     let mut stuck = None;
-    for &(name, _) in &FILES {
-        let file = dir.join(name);
-        if !delete_or_move_out(&file) && stuck.is_none() {
-            stuck = Some(file);
+    for path in FILES
+        .iter()
+        .map(|&(name, _)| dir.join(name))
+        .chain([dir.join("better-search-setup.exe")])
+    {
+        if !delete_or_move_out(&path) && stuck.is_none() {
+            stuck = Some(path);
         }
     }
-    remove_leftovers(&dir);
+    if let Some(leftover) = clear_upgrade_leftovers(&dir)
+        && stuck.is_none()
+    {
+        stuck = Some(leftover);
+    }
     let question = wide("Delete the saved index and service logs? Choose No to keep them.");
     let title = wide("better_search uninstall");
     let erase = unsafe {
@@ -774,15 +817,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// An upgrade renames a running program's image aside; the copy goes as soon as the
-    /// program has exited, and the next upgrade or the uninstall clears the rest.
+    /// An upgrade renames a running program's image aside, and the uninstall clears
+    /// those copies. The current programs are left alone, and a copy that cannot be
+    /// removed is reported rather than silently keeping the folder.
     #[test]
     fn leftovers_from_an_earlier_upgrade_are_removed() {
         let dir = scratch("leftovers");
         std::fs::write(dir.join("bs-window.exe"), b"current").unwrap();
         std::fs::write(dir.join("bs-window.exe.old"), b"old").unwrap();
+        std::fs::write(dir.join("bs-service.exe.old"), b"old").unwrap();
         std::fs::write(dir.join("better-search-setup.exe.old"), b"old").unwrap();
-        remove_leftovers(&dir);
+        assert_eq!(clear_upgrade_leftovers(&dir), None);
         assert_eq!(
             std::fs::read(dir.join("bs-window.exe")).unwrap(),
             b"current"
@@ -831,6 +876,39 @@ mod tests {
             1,
             "no scratch files"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file that can be neither deleted nor moved is reported, so the uninstall tells
+    /// the user to close it instead of leaving the folder behind without a word. (A
+    /// running image is the real case: Windows refuses to delete it but allows a rename,
+    /// which the end-to-end run on the development machine covers.)
+    #[test]
+    fn a_file_that_cannot_be_removed_is_reported() {
+        let dir = scratch("stuck");
+        let file = dir.join("bs-window.exe.old");
+        std::fs::write(&file, b"running").unwrap();
+        let name = wide_path(&file);
+        // SAFETY: NUL-terminated path, default security attributes, existing file.
+        let handle = unsafe {
+            windows_sys::Win32::Storage::FileSystem::CreateFileW(
+                name.as_ptr(),
+                windows_sys::Win32::Foundation::GENERIC_READ,
+                windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ,
+                null(),
+                windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+        assert_ne!(handle, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+        let stuck = clear_upgrade_leftovers(&dir);
+        // SAFETY: the handle came from CreateFileW above and is closed once.
+        unsafe { CloseHandle(handle) };
+        assert_eq!(stuck, Some(file.clone()));
+        assert!(file.exists());
+        assert_eq!(clear_upgrade_leftovers(&dir), None, "now it can go");
+        assert!(!file.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

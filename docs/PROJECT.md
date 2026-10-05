@@ -113,6 +113,8 @@ Out of scope: searching file **contents**. Only names are searched.
 | `02d0b37` | Record the release and update work in the project docs |
 | `85669b7` | Run cargo and gh through `cmd.exe` in the release script |
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
+| `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
+| (this commit) | Quit the panel on uninstall so its image is released; version 0.2.3 |
 
 ## 4. Current results on the development machine
 
@@ -813,6 +815,8 @@ address never changes between releases.
   and `http://` is accepted only for `localhost`.
 - **Diagnostics.** `bs-window.exe --check-updates` prints the result and exits 0 (nothing
   newer), 2 (something newer) or 1 (the check failed).
+- **Messages from the setup program.** `WM_QUIT_PANEL` (`WM_APP+9`) asks the panel to
+  quit, which the uninstall uses before removing the files (see Phase 5).
 - `tools/release.ps1` publishes: it refuses unless the version matches the workspace
   `Cargo.toml`, builds the release binaries and the setup program, writes `latest.txt`
   with the new installer's digest, and creates the release with `gh release create`
@@ -1144,13 +1148,33 @@ unknown files recursively. Unknown files in the install folder are also left alo
 they keep the folder.
 
 The panel is usually running during an uninstall, and Windows refuses to delete a running
-image. `delete_or_move_out` handles that: it deletes the file when it can, otherwise it
-renames it into the temp folder (allowed for a running image, and on the same volume) and
-schedules that copy for deletion at the next reboot; if the temp folder is on another
-volume it schedules the file where it stands instead. The uninstaller itself is removed
-the same way, so `%ProgramFiles%\better_search` is gone straight away rather than after a
-restart, and no `.old` file is left in it. A file that cannot be deleted or moved is
-reported with a message asking for it to be closed, instead of a raw error.
+image. The uninstall therefore first posts `WM_QUIT_PANEL` (`WM_APP+9`) to the search
+window, which quits exactly as the tray's Quit does, so the image is released and deleted
+outright. A panel that does not answer (an older version, or another user's session) is
+handled by `delete_or_move_out`: the file is renamed into the temp folder (allowed for a
+running image, and on the same volume) and that copy is deleted at the next reboot; if the
+temp folder is on another volume the file is scheduled for deletion where it stands. The
+uninstaller's own copy is the one file that always takes that route, because it cannot
+delete itself, so the only trace an uninstall leaves is one temp file that Windows removes
+at the next reboot. A file that can be neither deleted nor moved is reported with a
+message asking for it to be closed, instead of a raw error.
+
+Because the panel quits on request and an upgrade moves the renamed image out of the
+folder, `%ProgramFiles%\better_search` is gone as soon as the uninstall finishes, with
+nothing left inside it for a reboot to clear.
+
+Verified on the development machine (2026-10-05) with release 0.2.3 and one elevated
+script: it installed over a folder that held only a leftover `bs-window.exe.old` (adopted
+and cleared), started the panel, upgraded over that running panel (the renamed image was
+moved out of the folder during the upgrade, and the panel kept working), then uninstalled
+while the panel ran. Afterwards the install folder, the service, the `Run` value, the
+Apps & Features entry, `%ProgramData%\better_search` and `%LOCALAPPDATA%\better_search`
+were all gone, and the only trace was the uninstaller's own copy in the temp folder,
+scheduled for deletion at the next reboot.
+
+An earlier version left a `bs-window.exe.old` in the folder, because the uninstall's
+leftover cleanup used a plain delete that Windows refuses for a running image; that is
+what `clear_upgrade_leftovers` and `WM_QUIT_PANEL` fixed.
 
 **End-to-end test on the development machine (2026-09-28).** With the user's approval
 the draft was installed and uninstalled once, on the real C:, D:, E: drives, using the
@@ -1182,12 +1206,13 @@ Still open after the test:
 - The binary is **not code signed**, so SmartScreen will warn. Signing stays open as
   originally planned; the version and update check are now built (`9227386`, section
   5.12).
-- The installer's own checks are seven tests in the crate: the bundled payloads are
+- The installer's own checks are eight tests in the crate: the bundled payloads are
   Windows executables, a file swap writes through and leaves no scratch files behind, a
   file held without delete sharing is refused without damage, renamed-old images from an
   earlier upgrade are cleared without touching the current program, only our own files
-  count as leftovers, a folder of leftovers is adopted while any other file stops that,
-  and a free file is removed while a missing one needs no work.
+  count as leftovers, a folder of leftovers is adopted while any other file stops that, a
+  free file is removed while a missing one needs no work, and a file that cannot be
+  removed is reported rather than silently leaving the folder behind.
 - The original Phase 5 plan is otherwise unchanged: one installer file, one UAC prompt,
   clean uninstall offering to keep or delete settings, and later code signing.
 
@@ -1214,7 +1239,7 @@ Still open after the test:
   first, then `cargo fmt`, `cargo test`, and
   `cargo clippy --all-targets -- -D warnings` with
   `--manifest-path tools\installer\Cargo.toml`. Its `target\` folder is git-ignored and
-  its seven tests never touch the machine. `--inspect` is safe to run unattended;
+  its eight tests never touch the machine. `--inspect` is safe to run unattended;
   install, upgrade and uninstall change the machine and must not be run without asking
   (the one approved end-to-end run is recorded in Phase 5).
 - **Measuring on real drives:** the assistant's terminal is not elevated. Test scripts go

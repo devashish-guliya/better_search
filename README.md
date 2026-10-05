@@ -220,8 +220,10 @@ What the draft does if it is run:
   `%ProgramFiles%\better_search`, and copies itself there as the uninstaller.
 - Registers and starts `better_search` as an auto-start service running as LocalSystem,
   and adds a machine-wide `Run` entry that starts `bs-window.exe --hidden` at sign-in.
-- Refuses to install on a machine where the folder or registration exists but the
-  service does not, and rolls back files, service and registry entries if any step fails.
+- Refuses to install when the registration exists, and rolls back files, service and
+  registry entries if any step fails. A leftover folder from an uninstall (which holds
+  nothing but our own files) is cleared and reused, so a reinstall does not need a
+  restart.
 - Running it again on an installed machine **upgrades in place**: it stops the service,
   replaces the three programs and itself, refreshes the registry entries and starts the
   service again. A running search window keeps working and is replaced by renaming its
@@ -231,13 +233,16 @@ What the draft does if it is run:
   `better-search-setup.exe --uninstall`, which stops and deletes the service, removes
   the files and registry entries, and asks (default No) before deleting the saved
   snapshot and logs. It refuses to uninstall unless the install registration matches.
-  The uninstaller removes itself and its folder on the next reboot.
+  A running search panel is asked to exit first, so its program file can be deleted; a
+  copy that is still locked (an older panel, another user's panel, and the uninstaller
+  itself) is moved to the temp folder and deleted at the next reboot. The install folder
+  itself is removed at once, so nothing is left in `Program Files`.
 
 Verified end to end on this machine: install started the service and the unelevated
-window showed "1674 matches" for `readme`, and uninstall removed the service, the
-files and the registry entries while keeping the snapshot. The one remaining file, the
-uninstaller itself, needs `Program Files` write access to delete and is queued for
-removal on the next reboot. The binary is not code signed, so SmartScreen will warn.
+window showed "1674 matches" for `readme`; an upgrade over the running window kept it
+working; and an uninstall removed the service, the files and the registry entries while
+keeping the snapshot (when asked to). The install folder is gone as soon as the uninstall
+finishes. The binary is not code signed, so SmartScreen will warn.
 
 Registering the service can also still be done by hand (`sc.exe create`) or with a
 temporary development test.
