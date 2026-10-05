@@ -17,7 +17,7 @@ use windows_sys::Win32::System::Pipes::{
     PIPE_READMODE_MESSAGE, SetNamedPipeHandleState, TransactNamedPipe, WaitNamedPipeW,
 };
 
-use crate::{PIPE_NAME, Reply, Request};
+use crate::{PIPE_NAME, Reply, Request, StatsReply};
 
 const READ_CHUNK: usize = 64 * 1024;
 const BUSY_WAIT_MS: u32 = 2000;
@@ -107,6 +107,15 @@ impl Client {
         .encode(&mut self.request);
         let len = self.transact()?;
         Reply::decode(&self.reply[..len])
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed reply"))
+    }
+
+    /// Asks what better_search costs. Read-only: the service changes nothing to answer.
+    pub fn stats(&mut self) -> io::Result<StatsReply> {
+        self.request.clear();
+        self.request.extend_from_slice(&StatsReply::request());
+        let len = self.transact()?;
+        StatsReply::decode(&self.reply[..len])
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed reply"))
     }
 

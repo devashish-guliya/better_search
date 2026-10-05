@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use bs_engine::profiles::Profiles;
 use bs_engine::{Engine, Log, fmt};
 use bs_index::Index;
-use bs_pipe::{Hit, MAX_REQUEST, PIPE_NAME, Reply, Request, Status};
+use bs_pipe::{Hit, MAX_REQUEST, PIPE_NAME, Reply, Request, StatsReply, Status};
 use bs_query::{Query, Session};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
@@ -242,32 +242,83 @@ fn serve(state: &State, pipe: &Pipe) {
         };
         let reply = match len {
             Err(()) => Reply::status(Status::BadRequest),
-            Ok(len) => match Request::decode(&request[..len]) {
-                None => Reply::status(Status::BadRequest),
-                Some(req) => {
-                    if viewer.is_none() {
-                        match caller::identify(pipe.0) {
-                            Ok(c) => {
-                                state.note_client(&c.sid, c.profile.as_deref());
-                                viewer = Some(Viewer { profile: c.profile });
-                            }
-                            Err(e) => {
-                                (state.log)(&format!("could not identify a client: {e}"));
-                                Reply::status(Status::Denied).encode(&mut out);
-                                let _ = write_message(pipe, &out);
-                                return;
+            Ok(len) => {
+                let data = &request[..len];
+                // A sizes request needs no viewer: it says nothing about any file, and a
+                // window that is not allowed to search still may ask what things cost.
+                if StatsReply::is_request(data) {
+                    answer_stats(state).encode(&mut out);
+                    if write_message(pipe, &out).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                match Request::decode(data) {
+                    None => Reply::status(Status::BadRequest),
+                    Some(req) => {
+                        if viewer.is_none() {
+                            match caller::identify(pipe.0) {
+                                Ok(c) => {
+                                    state.note_client(&c.sid, c.profile.as_deref());
+                                    viewer = Some(Viewer { profile: c.profile });
+                                }
+                                Err(e) => {
+                                    (state.log)(&format!("could not identify a client: {e}"));
+                                    Reply::status(Status::Denied).encode(&mut out);
+                                    let _ = write_message(pipe, &out);
+                                    return;
+                                }
                             }
                         }
+                        let viewer = viewer.as_ref().expect("identified above");
+                        answer(state, &mut session, viewer, &req)
                     }
-                    let viewer = viewer.as_ref().expect("identified above");
-                    answer(state, &mut session, viewer, &req)
                 }
-            },
+            }
         };
         reply.encode(&mut out);
         if write_message(pipe, &out).is_err() {
             return;
         }
+    }
+}
+
+/// What better_search costs, and what Windows search costs beside it.
+fn answer_stats(state: &State) -> StatsReply {
+    let memory = bs_engine::memory::process_memory();
+    let engine = state.engine.get();
+    let index_heap = engine.map(|engine| {
+        let index = engine.read();
+        let mut bytes = index.memory_usage().total() as u64;
+        drop(index);
+        if let Some(removable) = state.removable.get() {
+            for data in removable.indexes() {
+                bytes =
+                    bytes.saturating_add(data.index.read().unwrap().memory_usage().total() as u64);
+            }
+        }
+        bytes
+    });
+    let entries = engine.map(|engine| engine.read().live_len() as u64);
+    let dir = bs_engine::machine_data_dir();
+    let size_of = |path: PathBuf| std::fs::metadata(&path).ok().map(|m| m.len());
+    let windows = crate::winsearch::footprint();
+    StatsReply {
+        // Without an engine the numbers below are not just missing, they are meaningless.
+        status: if engine.is_some() {
+            Status::Ok
+        } else {
+            Status::Loading
+        },
+        service_private: memory.as_ref().map(|m| m.private as u64),
+        service_working_set: memory.as_ref().map(|m| m.working_set as u64),
+        index_heap,
+        snapshot_disk: size_of(dir.join("index.bin")),
+        log_disk: size_of(dir.join("service.log")),
+        service_binary_disk: std::env::current_exe().ok().and_then(size_of),
+        entries,
+        windows_search_memory: windows.memory,
+        windows_search_disk: windows.disk,
     }
 }
 
@@ -462,5 +513,20 @@ mod tests {
         );
         assert_eq!(total, 3);
         assert_eq!(hidden, 0);
+    }
+
+    #[test]
+    fn sizes_say_loading_before_the_first_scan() {
+        let state = State::new(Arc::new(|_: &str| {}));
+        let reply = answer_stats(&state);
+        assert_eq!(reply.status, Status::Loading);
+        // A size that was never measured must be unknown, never a confident zero.
+        assert_eq!(reply.index_heap, None);
+        assert_eq!(reply.entries, None);
+        // The service's own process exists whether or not the index does.
+        assert!(reply.service_private.is_some_and(|bytes| bytes > 0));
+        assert!(reply.service_working_set.is_some());
+        // The binary it is running from is on disk either way.
+        assert!(reply.service_binary_disk.is_some_and(|bytes| bytes > 0));
     }
 }

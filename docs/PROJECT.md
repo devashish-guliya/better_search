@@ -26,9 +26,15 @@ Current state, in short:
 - The pipe protocol is **version 2**. Version 2 adds the options byte and a hidden-match
   count, so system and app-folder matches are hidden by default (`78efd7a`). The skip
   rules are version 8.
-- On the development machine, better_search is installed in
-  `C:\Program Files\better_search` and its service is running. Windows search is
-  turned off there (`DisableSearch` policy set, `WSearch` disabled).
+- On the development machine, better_search is **not installed** (2026-10-05). The last
+  install (0.2.5) was removed with its own uninstaller to test the removal end to end, and
+  the machine was left with **Windows search on** (`DisableSearch` policy absent,
+  `WSearch` running and rebuilding its index), which is the state an uninstall must always
+  leave behind.
+- Since 0.2.5, the panel shows what each side costs, measured live: the service answers a
+  read-only sizes request, and the first-run offer quotes Windows search's own memory and
+  index size next to better_search's, waiting for the first scan so the figures are real
+  (section 5.11a).
 
 The temporary live resource display added at `06ce1f7` was removed at the user's
 request before packaging (`f8bee52`). Its isolated test measured 24.1 MiB of combined
@@ -116,6 +122,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
+| (this commit) | The first-run offer quotes measured numbers, turning Windows search off frees its index, the uninstall restores search and removes per-user data; version 0.2.5 |
 
 ## 4. Current results on the development machine
 
@@ -609,6 +616,15 @@ bs-service.exe --console  Same thing in a terminal, for testing
   `ERROR_PIPE_BUSY` for a few seconds. Overhead measured from the console tool:
   0.1-0.2 ms per query (connection 0.2 ms), against a service-side search of 0.6-11 ms
   (repeated queries, see section 4).
+- **Sizes request (since 0.2.5, same version):** `version u8 · kind u8 (2)` in, and
+  `version u8 · status u8` plus nine `u64` sizes out in the order of `StatsReply`:
+  service private and working set, index heap, index and log on disk, the service binary,
+  entry count, and Windows search's memory and disk. A size that is not known yet is
+  `u64::MAX`, which decodes to `None`: unknown is not the same as zero, and a test pins
+  that a real zero reads back as a measurement. It needs no viewer lookup, because it says
+  nothing about any file, so a window that may not search may still ask what things cost.
+  The service is the only part of better_search with the rights to read
+  `C:\ProgramData\Microsoft\Search`, so the Windows search figures come from it.
 - **Connections:** one blocking thread per connection, at most 64 at a time for all
   users together.
 
@@ -787,6 +803,63 @@ elevated path at once instead of waiting for Save. An `EVENT_SYSTEM_FOREGROUND` 
   this instead of displaying invented counts. The window features above did not change
   the index arrays, flags or snapshot format. The pipe moved to version 2 only for the
   hidden-match option (`78efd7a`).
+
+### 5.11a Saying what each one costs, and freeing the disk space (0.2.5)
+
+The first-run offer used to explain Windows search's *architecture*: a background
+indexer, its own database, machine-wide reach. That was accurate and hard to act on. It
+now says what the change is worth **on this PC**, in numbers, and it takes the disk space
+seriously.
+
+- **Measured, not claimed.** The service answers a read-only sizes request (section 5.8)
+  and is the only part of better_search with the rights to read Windows' own search
+  folders. It sums the **working set** of every `SearchIndexer.exe` (the number Task
+  Manager's Memory column shows, so a user can check it) and walks
+  `C:\ProgramData\Microsoft\Search` for its index size. A figure it cannot get is reported
+  as unknown, never as zero, and the panel's text leaves a sentence out rather than
+  filling it with a guess. `offer_text` has tests for the full, partial and absent cases.
+- **The offer waits for the first scan.** `stats::start` asks every 3 s (60 tries at most)
+  and the dialog opens on the first `Status::Ok`, so a machine still scanning shows the
+  offer with no numbers instead of numbers taken from a half-built index. The same reply
+  fills the Settings line, which is measured once per start and again after a Windows
+  search switch.
+- **Measured on this PC** (2026-10-05, 574 K entries, Ryzen 5 3500U): the service uses
+  20-21 MB private, 25-29 MB working set just after a scan, and Windows trims it to 0.8 MB
+  when idle; its index is 4.2 MB on disk and 17.6 MB in memory. `SearchIndexer` uses
+  8.6 MB private and 19.3 MB working set while idle on a fresh index, 29 MB while
+  rebuilding, and its index folder held 34.3 MB for a full index (10-11.5 MB after a
+  rebuild). **better_search does not win on memory**: the honest pitch is speed, no
+  background indexing, and the disk space. The text therefore states both sets of numbers
+  without a comparison it cannot support.
+- **The disk comparison is index against index**, because that is what grows with the
+  number of files. The offer says "keeping 34 MB of index files" for Windows search and
+  "keeps a 4 MB index" for better_search, and never claims the programs are free.
+- **Turning Windows search off now frees the space.** The policy and the stopped service
+  freed no disk: the index files stayed. `clear_index()` removes the contents of
+  `C:\ProgramData\Microsoft\Search\Data` and keeps the folders, so Windows' own
+  permissions stay; the indexer is stopped and waited for first (up to 10 s), because its
+  files stay locked while the process runs. Windows rebuilds the index by itself, so
+  nothing is lost. Measured: 10.9 MB and 17 files before, 0 MB and 0 files after, and
+  8.3 MB rebuilt within 30 s of turning search back on.
+- **Turning it back on does not wait for the indexer.** Windows brings it up in its own
+  time; the panel is blocked while the elevated copy runs, and a wait long enough to see it
+  would freeze the window. What is reported is the setting that makes search work again
+  (`ChangeServiceConfigW` to auto start, delayed, as Windows ships it, plus a start
+  request).
+- **The elevated copy reports through its exit code**, the only channel it has: `0` off
+  and index removed, `1` off but the index stayed, `2` on and settings restored, `3` on but
+  Windows would not take its indexer back, `4` the policy could not be written. A test pins
+  every mapping, so a code can never be read as a success it does not mean. The panel says
+  which of those happened instead of a single "done".
+- **An uninstall gives Windows search back.** Removing better_search while it had turned
+  search off used to leave the machine with search disabled and nothing left to undo it.
+  The uninstaller now clears the policy and restores the indexer's start type and start
+  before it finishes. It also removes this account's settings and history
+  (`%LOCALAPPDATA%\better_search`), which the old uninstaller left behind, and which would
+  otherwise keep the "already asked" answer so a fresh install would never offer again.
+- **A dismissed UAC prompt is reported.** It used to exit silently, which looked exactly
+  like a program that had stopped for no reason. It now says the prompt was dismissed and
+  nothing was changed.
 
 ### 5.12 Updates (`crates/ui/src/update.rs`)
 

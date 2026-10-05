@@ -10,6 +10,7 @@ mod removable;
 mod scm;
 mod security;
 mod server;
+mod winsearch;
 
 use std::process::ExitCode;
 use std::sync::mpsc::{self, Receiver, Sender};

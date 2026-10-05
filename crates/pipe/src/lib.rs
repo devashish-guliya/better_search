@@ -8,6 +8,13 @@
 //! time µs u32 · hit count u16`, then per hit `score i32 · flags u8 (1 = folder) · path
 //! length u16 · path UTF-8`. Hidden matches are those left out because the request did
 //! not include system and program folders. All numbers are little-endian.
+//!
+//! A read-only diagnostics request uses the same version and a second kind:
+//!
+//! Request: `version u8 · kind u8 (2 = sizes)`. Reply: `version u8 · status u8`, then
+//! nine `u64` sizes in the order of [`StatsReply`], `u64::MAX` for one that is not
+//! available yet. Nothing in it can change the service, so a window can ask for it
+//! without any risk of disturbing a search.
 
 mod client;
 
@@ -21,10 +28,13 @@ pub const MAX_LIMIT: u16 = 1000;
 pub const MAX_REQUEST: usize = 4096;
 
 const KIND_SEARCH: u8 = 1;
+const KIND_STATS: u8 = 2;
 const FLAG_DIR: u8 = 1;
 const OPTION_INCLUDE_SYSTEM: u8 = 1;
 const REQUEST_HEADER: usize = 5;
 const REPLY_HEADER: usize = 16;
+/// Two bytes of header and the nine sizes of [`StatsReply`].
+const STATS_REPLY_BYTES: usize = 2 + 9 * 8;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Request {
@@ -93,6 +103,102 @@ impl Reply {
             search_micros: 0,
             hits: Vec::new(),
         }
+    }
+}
+
+/// What better_search costs and what it holds, in bytes. `None` means the number is not
+/// known yet, which is not the same as zero: the first scan is still running, or a file
+/// could not be read.
+///
+/// Both memory figures are working sets, the number Task Manager's Memory column shows, so
+/// the two can be compared by looking at them side by side. The disk figures are the index
+/// each one keeps, not the size of the programs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatsReply {
+    pub status: Status,
+    /// Committed memory of the service process, which stays reserved even when trimmed.
+    pub service_private: Option<u64>,
+    /// Memory of the service process in RAM right now.
+    pub service_working_set: Option<u64>,
+    /// The index in memory. Part of `service_private`, not additional to it.
+    pub index_heap: Option<u64>,
+    /// The saved index on disk.
+    pub snapshot_disk: Option<u64>,
+    pub log_disk: Option<u64>,
+    pub service_binary_disk: Option<u64>,
+    /// Files and folders the index holds.
+    pub entries: Option<u64>,
+    /// What Windows search is using right now, so a window can show both side by side.
+    /// Measured by the service, which is the only part of better_search allowed to read
+    /// Windows' own search folders.
+    pub windows_search_memory: Option<u64>,
+    pub windows_search_disk: Option<u64>,
+}
+
+impl StatsReply {
+    /// The request bytes that ask for this reply.
+    pub fn request() -> [u8; 2] {
+        [VERSION, KIND_STATS]
+    }
+
+    pub fn is_request(data: &[u8]) -> bool {
+        data == Self::request()
+    }
+
+    /// Everything unknown, for a caller that may not be told or could not be asked.
+    pub fn unavailable(status: Status) -> Self {
+        Self {
+            status,
+            service_private: None,
+            service_working_set: None,
+            index_heap: None,
+            snapshot_disk: None,
+            log_disk: None,
+            service_binary_disk: None,
+            entries: None,
+            windows_search_memory: None,
+            windows_search_disk: None,
+        }
+    }
+
+    pub fn encode(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&[VERSION, self.status.code()]);
+        for size in [
+            self.service_private,
+            self.service_working_set,
+            self.index_heap,
+            self.snapshot_disk,
+            self.log_disk,
+            self.service_binary_disk,
+            self.entries,
+            self.windows_search_memory,
+            self.windows_search_disk,
+        ] {
+            out.extend_from_slice(&size.unwrap_or(u64::MAX).to_le_bytes());
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() != STATS_REPLY_BYTES || data[0] != VERSION {
+            return None;
+        }
+        let field = |offset: usize| {
+            let raw = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            (raw != u64::MAX).then_some(raw)
+        };
+        Some(Self {
+            status: Status::from_code(data[1])?,
+            service_private: field(2),
+            service_working_set: field(10),
+            index_heap: field(18),
+            snapshot_disk: field(26),
+            log_disk: field(34),
+            service_binary_disk: field(42),
+            entries: field(50),
+            windows_search_memory: field(58),
+            windows_search_disk: field(66),
+        })
     }
 }
 
@@ -298,5 +404,73 @@ mod tests {
         }
         buf.push(0);
         assert_eq!(Reply::decode(&buf), None);
+    }
+
+    #[test]
+    fn a_sizes_request_is_not_a_search() {
+        assert!(StatsReply::is_request(&StatsReply::request()));
+        // A search for the empty query is the same length, and must not be mistaken for it.
+        let mut search = Vec::new();
+        Request {
+            query: String::new(),
+            limit: 0,
+            include_system: false,
+        }
+        .encode(&mut search);
+        assert!(!StatsReply::is_request(&search));
+        assert_eq!(Request::decode(&StatsReply::request()), None);
+    }
+
+    #[test]
+    fn sizes_round_trip_and_keep_unknown_apart_from_zero() {
+        let reply = StatsReply {
+            status: Status::Ok,
+            service_private: Some(21 * 1024 * 1024),
+            service_working_set: Some(0),
+            index_heap: Some(18 * 1024 * 1024),
+            snapshot_disk: Some(4_300_000),
+            log_disk: Some(1_702),
+            service_binary_disk: None,
+            entries: Some(574_455),
+            windows_search_memory: Some(19 * 1024 * 1024),
+            windows_search_disk: Some(34 * 1024 * 1024),
+        };
+        let mut buf = Vec::new();
+        reply.encode(&mut buf);
+        assert_eq!(buf.len(), STATS_REPLY_BYTES);
+        assert_eq!(StatsReply::decode(&buf), Some(reply));
+        // A zero is a real measurement, and must not read back as "not available".
+        assert_eq!(
+            StatsReply::decode(&buf).unwrap().service_working_set,
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_sizes_replies() {
+        let mut buf = Vec::new();
+        StatsReply::unavailable(Status::Loading).encode(&mut buf);
+        for len in 0..buf.len() {
+            assert_eq!(StatsReply::decode(&buf[..len]), None, "length {len}");
+        }
+        let mut long = buf.clone();
+        long.push(0);
+        assert_eq!(StatsReply::decode(&long), None);
+        let mut wrong_version = buf.clone();
+        wrong_version[0] = VERSION + 1;
+        assert_eq!(StatsReply::decode(&wrong_version), None);
+        let mut bad_status = buf.clone();
+        bad_status[1] = 9;
+        assert_eq!(StatsReply::decode(&bad_status), None);
+        // A sizes reply of the full length with every field unknown is valid.
+        let mut all_unknown = [u64::MAX.to_le_bytes(); 9].concat();
+        all_unknown.insert(0, Status::Ok.code());
+        all_unknown.insert(0, VERSION);
+        assert_eq!(all_unknown.len(), STATS_REPLY_BYTES);
+        assert_eq!(
+            StatsReply::decode(&all_unknown),
+            Some(StatsReply::unavailable(Status::Ok))
+        );
+        assert_eq!(StatsReply::decode(&[VERSION, 0]), None);
     }
 }

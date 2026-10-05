@@ -9,6 +9,7 @@
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::thread;
@@ -25,8 +26,8 @@ use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPE
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, WriteConsoleW};
 use windows_sys::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegDeleteTreeW,
-    RegGetValueW, RegSetKeyValueW,
+    HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegDeleteKeyValueW,
+    RegDeleteTreeW, RegGetValueW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Services::{
     CloseServiceHandle, ControlService, CreateServiceW, DeleteService, OpenSCManagerW,
@@ -53,6 +54,18 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const ERROR_CANCELLED: i32 = 1223;
 
 const SERVICE: &str = "better_search";
+/// Windows' own search, which better_search offers to turn off. An uninstall has to give
+/// it back: otherwise the machine is left with search disabled and nothing left on it to
+/// turn search on again.
+const SEARCH_POLICY_KEY: &str = r"SOFTWARE\Policies\Microsoft\Windows\Windows Search";
+const SEARCH_POLICY_VALUE: &str = "DisableSearch";
+const INDEXER_SERVICE: &str = "WSearch";
+/// Keeps a console program from flashing a window when a GUI program starts it.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// How long to wait for the panel's window after asking for it to start: a cold start
+/// takes well under a second, and the wait is what turns "asked" into "running".
+const PANEL_WAIT: Duration = Duration::from_millis(200);
+const PANEL_WAIT_TRIES: usize = 50;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\better_search";
 const FILES: [(&str, &[u8]); 3] = [
@@ -102,6 +115,13 @@ fn data_dir() -> io::Result<PathBuf> {
     Ok(known_folder(&FOLDERID_ProgramData)?.join("better_search"))
 }
 
+/// This account's settings and open history. Per user, unlike the index, so an uninstall
+/// removes only the account that ran it. Leaving it behind would keep the "already asked
+/// about Windows search" answer, and a fresh install would never offer again.
+fn user_data_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|dir| PathBuf::from(dir).join("better_search"))
+}
+
 fn elevated() -> io::Result<bool> {
     let mut token: HANDLE = null_mut();
     // SAFETY: the process handle is a pseudo handle; `token` receives an owned handle.
@@ -144,8 +164,9 @@ fn note(title: &str, text: &str, icon: u32) {
 }
 
 /// Re-runs this program elevated and waits for it, so the elevated half is the only thing
-/// that reports an outcome. A dismissed elevation prompt is not a failure to report: the
-/// user chose not to continue, and a message box would only nag.
+/// that reports an outcome. A dismissed elevation prompt is not an error, but it is not
+/// nothing either: the install did not happen, and saying so is the difference between a
+/// program that stopped for a reason and one that seemed to stop for no reason.
 fn request_elevation(mode: &str) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let file = wide_path(&exe);
@@ -164,7 +185,13 @@ fn request_elevation(mode: &str) -> io::Result<()> {
     if unsafe { ShellExecuteExW(&mut info) } == 0 {
         let err = io::Error::last_os_error();
         if err.raw_os_error() == Some(ERROR_CANCELLED) {
-            return Ok(());
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Windows asked for administrator rights and the prompt was dismissed, so \
+                 nothing was changed. Run this again and choose Yes on the prompt: \
+                 better_search installs a service and writes to Program Files, which needs \
+                 administrator rights.",
+            ));
         }
         return Err(err);
     }
@@ -183,26 +210,54 @@ fn request_elevation(mode: &str) -> io::Result<()> {
 ///
 /// The panel must not carry this program's administrator rights, and which way to start it
 /// depends on who this process is: the ordinary double-click path reaches here unelevated,
-/// after the elevated half has finished, and can start the panel directly. Only a setup
-/// program that is itself elevated has to borrow the shell's token, and that can be refused.
+/// after the elevated half has finished, and can start the panel directly. A setup program
+/// that is itself elevated (right-click, "Run as administrator") has to hand the job to the
+/// signed-in shell, and there is more than one way to do that, so each is tried in turn.
+/// Nothing is reported as started until its window is actually there.
 fn start_panel(dir: &Path) {
-    let result = if elevated().unwrap_or(false) {
-        launch_panel_with_shell_token(dir)
-    } else {
-        launch_panel_here(dir)
-    };
-    if let Err(err) = result {
-        note(
-            "better_search",
-            &format!(
-                "better_search is installed, but the search panel could not be started \
-                 ({err}).\n\nStart it yourself with:\n{}\n\nIt also starts by itself at \
-                 your next sign-in.",
-                dir.join("bs-window.exe").display()
-            ),
-            MB_ICONINFORMATION,
-        );
+    if panel_running() {
+        return;
     }
+    let mut refusals: Vec<String> = Vec::new();
+    if elevated().unwrap_or(false) {
+        // Borrowing the shell's token is the direct way, and Windows can refuse it.
+        match launch_panel_with_shell_token(dir) {
+            Ok(()) => {}
+            Err(err) => refusals.push(err.to_string()),
+        }
+        if !wait_for_panel() {
+            // Asking the shell to open the program is the older way, and it works
+            // because the running shell is what starts it, at the user's own level.
+            if let Err(err) = launch_panel_through_shell(dir) {
+                refusals.push(err.to_string());
+            }
+        }
+    } else if let Err(err) = launch_panel_here(dir) {
+        refusals.push(err.to_string());
+    }
+    if wait_for_panel() {
+        return;
+    }
+    let mut text = format!(
+        "better_search is installed, but the search panel could not be started. Start it \
+         yourself with:\n\n{}\n\nIt also starts by itself at your next sign-in.",
+        dir.join("bs-window.exe").display()
+    );
+    if !refusals.is_empty() {
+        text.push_str(&format!("\n\nWhat Windows said: {}", refusals.join("; ")));
+    }
+    note("better_search", &text, MB_ICONINFORMATION);
+}
+
+/// Waits for the panel's window, so "started" means it is really there.
+fn wait_for_panel() -> bool {
+    for _ in 0..PANEL_WAIT_TRIES {
+        if panel_running() {
+            return true;
+        }
+        thread::sleep(PANEL_WAIT);
+    }
+    false
 }
 
 /// True when a panel is already running, so it must not be started twice.
@@ -219,6 +274,21 @@ fn launch_panel_here(dir: &Path) -> io::Result<()> {
         return Ok(());
     }
     std::process::Command::new(dir.join("bs-window.exe"))
+        .spawn()
+        .map(|_| ())
+}
+
+/// Asks the signed-in shell to open the panel. The shell is running at the user's own
+/// level, so the program it starts is too, which is what an elevated setup program cannot
+/// do for itself. Nothing is returned about the result: the shell answers at once and the
+/// panel's window is what tells whether it worked.
+fn launch_panel_through_shell(dir: &Path) -> io::Result<()> {
+    if unsafe { GetShellWindow() }.is_null() {
+        return Err(io::Error::other("no signed-in desktop is available"));
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(dir.join("bs-window.exe"))
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
 }
@@ -500,6 +570,49 @@ fn reg_text_value(subkey: &str, name: &str) -> io::Result<Option<String>> {
     Ok(Some(String::from_utf16_lossy(&buffer[..end])))
 }
 
+/// Gives Windows search back, if better_search is what turned it off. Without this an
+/// uninstall would leave search disabled with no program left on the machine to undo it.
+/// Best effort: the app is going away either way, and a failure here is not a reason to
+/// leave it half-removed.
+fn restore_windows_search() {
+    let mut data = 0u32;
+    let mut bytes = size_of::<u32>() as u32;
+    // SAFETY: NUL-terminated names and an output buffer sized in bytes.
+    let code = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(SEARCH_POLICY_KEY).as_ptr(),
+            wide(SEARCH_POLICY_VALUE).as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&raw mut data).cast(),
+            &mut bytes,
+        )
+    };
+    if code != 0 || data != 1 {
+        return;
+    }
+    // SAFETY: NUL-terminated names; deleting a value that exists is safe.
+    unsafe {
+        RegDeleteKeyValueW(
+            HKEY_LOCAL_MACHINE,
+            wide(SEARCH_POLICY_KEY).as_ptr(),
+            wide(SEARCH_POLICY_VALUE).as_ptr(),
+        )
+    };
+    // Delayed-auto is how Windows ships the indexer; `sc` is used instead of the service
+    // API because only the start type changes and nothing waits on the result.
+    for args in [
+        ["config", INDEXER_SERVICE, "start=", "delayed-auto"],
+        ["start", INDEXER_SERVICE, "", ""],
+    ] {
+        let _ = std::process::Command::new("sc.exe")
+            .args(args.iter().filter(|arg| !arg.is_empty()))
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+}
+
 fn registered_install(dir: &Path) -> io::Result<bool> {
     Ok(reg_text_value(UNINSTALL_KEY, "InstallLocation")?
         .is_some_and(|location| location.eq_ignore_ascii_case(&dir.display().to_string())))
@@ -679,6 +792,10 @@ fn upgrade(scm: &Sc, dir: &Path) -> io::Result<()> {
     if let Some(service) = &service {
         stop_service(service)?;
     }
+    // The panel is running from the file about to be replaced. Ask it to exit first, so
+    // the new version is the one that ends up running: otherwise the old copy stays on
+    // screen until the next sign-in, still running from a renamed file.
+    close_panel();
     let swapped = (|| {
         for &(name, bytes) in &FILES {
             replace_file(&dir.join(name), bytes)?;
@@ -700,8 +817,8 @@ fn upgrade(scm: &Sc, dir: &Path) -> io::Result<()> {
     } else {
         swapped?;
     }
-    // The renamed images go now: the service is stopped, and the panel's copy is moved
-    // out of the folder even though the panel keeps running from it.
+    // Nothing is running from the renamed images now: the service is stopped and the
+    // panel has exited, so they can go.
     clear_upgrade_leftovers(dir);
     Ok(())
 }
@@ -847,6 +964,7 @@ fn uninstall() -> io::Result<()> {
         }
     }
     remove_registration()?;
+    restore_windows_search();
     // The panel is usually running, and Windows will not delete a running image. Ask it to
     // exit first; if it does not (an older version, or another user's session), the copy
     // is moved out of the folder and deleted at the next reboot instead of blocking the
@@ -867,7 +985,11 @@ fn uninstall() -> io::Result<()> {
     {
         stuck = Some(leftover);
     }
-    let question = wide("Delete the saved index and service logs? Choose No to keep them.");
+    let question = wide(
+        "Delete the saved index, the service logs, and this account's settings and open \
+         history?\n\nChoose No to keep them, for example to reinstall later with your \
+         settings as they are.",
+    );
     let title = wide("better_search uninstall");
     let erase = unsafe {
         MessageBoxW(
@@ -886,6 +1008,16 @@ fn uninstall() -> io::Result<()> {
             }
         }
         let _ = std::fs::remove_dir(data); // Never recursively delete unknown content.
+        // The settings and history this account holds, which are ours and small.
+        if let Some(user) = user_data_dir() {
+            for name in ["window.cfg", "history.tsv"] {
+                let path = user.join(name);
+                if path.is_file() {
+                    std::fs::remove_file(path)?;
+                }
+            }
+            let _ = std::fs::remove_dir(user);
+        }
     }
     // The uninstaller is running from this folder too, so it is moved out the same way.
     let self_file = dir.join("better-search-setup.exe");

@@ -8,6 +8,7 @@ mod frecency;
 mod rows;
 mod search;
 mod settings;
+mod stats;
 mod thumbs;
 mod update;
 mod winkey;
@@ -121,6 +122,10 @@ const SETTINGS_BACK: usize = 306;
 const SETTINGS_HISTORY: usize = 307;
 const SETTINGS_WIN_S: usize = 320;
 const SETTINGS_WINDOWS_SEARCH: usize = 321;
+/// The "what this costs" line, by position in `App::controls`.
+const SETTINGS_SIZES_ROW: usize = 9;
+/// Settings rows that need two lines: the skipped-folder note and the footprint.
+const SETTINGS_TALL_ROWS: [usize; 2] = [8, SETTINGS_SIZES_ROW];
 /// The "check for updates" button, at the end of the Settings list.
 const SETTINGS_UPDATE: usize = 322;
 const SETTINGS_CLEAR: usize = 308;
@@ -134,21 +139,117 @@ const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const KEY_HINTS: &str = "Ctrl+Enter  show in folder";
-/// Shown once, the first time the panel opens while Windows search is still on.
-const WINDOWS_SEARCH_OFFER: &str = "\
-better_search can replace Windows Start and Explorer search.
+/// Shown once, the first time the panel opens after the first scan has finished.
+const OFFER_TITLE: &str = "Replace Windows search?";
 
-Windows search keeps a background indexer running, maintains its own index database
-on disk, re-indexes your drives after changes, and is machine-wide: other accounts
-on this PC and apps that use it (Outlook and Photos search, for example) depend on
-it.
+/// The first-run offer. Short, plain, and only numbers that were measured: what Windows
+/// search is using right now, and what better_search costs beside it. Every number is
+/// optional, and a sentence is left out rather than filled with a guess.
+fn offer_text(reading: &stats::Reading) -> String {
+    let sizes = match reading {
+        stats::Reading::Sizes(sizes) => Some(sizes),
+        stats::Reading::Scanning | stats::Reading::Unavailable => None,
+    };
+    let (windows_memory, windows_disk) = sizes.map_or((None, None), |s| {
+        (s.windows_search_memory, s.windows_search_disk)
+    });
+    let entries = sizes.and_then(|s| s.entries);
+    let our_memory = sizes.and_then(|s| s.service_working_set);
+    let our_index = sizes.and_then(our_index_disk);
+    let mut text = String::new();
+    text.push_str("Windows search is still on. ");
+    match (windows_memory, windows_disk) {
+        (Some(memory), Some(disk)) => text.push_str(&format!(
+            "Right now it is using {} of memory and keeping {} of index files on disk, and it \
+             keeps indexing in the background while you use your PC.\n\n",
+            stats::size(memory),
+            stats::size(disk)
+        )),
+        (Some(memory), None) => text.push_str(&format!(
+            "Right now it is using {} of memory, and it keeps indexing in the background \
+             while you use your PC.\n\n",
+            stats::size(memory)
+        )),
+        _ => {
+            text.push_str("It keeps indexing in the background the whole time you use your PC.\n\n")
+        }
+    }
+    match (entries, our_memory, our_index) {
+        (Some(entries), Some(memory), Some(index)) => text.push_str(&format!(
+            "better_search already searches every file and folder on this PC - {} of them - and \
+             answers as you type. It keeps a {} index and uses {} of memory.\n\n",
+            stats::count(entries),
+            stats::size(index),
+            stats::size(memory)
+        )),
+        (_, Some(memory), Some(index)) => text.push_str(&format!(
+            "better_search already searches every file and folder on this PC, and answers as you \
+             type. It keeps a {} index and uses {} of memory.\n\n",
+            stats::size(index),
+            stats::size(memory)
+        )),
+        _ => text.push_str(
+            "better_search already searches every file and folder on this PC, and answers as you \
+             type.\n\n",
+        ),
+    }
+    match windows_disk {
+        Some(disk) => text.push_str(&format!(
+            "Turning Windows search off stops it and frees that memory and its {} of index \
+             files. Win+S and Start already open better_search, so you lose nothing, and you \
+             can turn Windows search back on any time in Settings.\n\n",
+            stats::size(disk)
+        )),
+        None => text.push_str(
+            "Turning Windows search off stops it and frees its memory. Win+S and Start \
+             already open better_search, so you lose nothing, and you can turn Windows \
+             search back on any time in Settings.\n\n",
+        ),
+    }
+    text.push_str("Turn Windows search off now?");
+    text
+}
 
-better_search reads the file list from the drives directly: about 13 MB of memory,
-nothing at all while idle, and 1-3 milliseconds to answer each keystroke.
+/// What better_search keeps on disk: the saved index and its log. Not the size of the
+/// programs, because Windows search's figure is its index too, and those are the two that
+/// grow with the number of files.
+fn our_index_disk(sizes: &bs_pipe::StatsReply) -> Option<u64> {
+    let parts = [sizes.snapshot_disk, sizes.log_disk];
+    parts
+        .iter()
+        .all(Option::is_some)
+        .then(|| parts.into_iter().flatten().sum())
+}
 
-Turn Windows search off now? That stops the indexer and frees its memory and disk
-space; Windows can rebuild the index later if you ever turn it back on. The change
-asks for administrator rights.";
+/// The Settings line: what this PC costs, and where the space goes.
+fn sizes_text(reading: Option<&stats::Reading>) -> String {
+    let Some(stats::Reading::Sizes(sizes)) = reading else {
+        return match reading {
+            Some(_) => "Measuring once the first scan finishes…".into(),
+            None => "Measuring…".into(),
+        };
+    };
+    let Some(index) = our_index_disk(sizes) else {
+        return "Measuring…".into();
+    };
+    let mut text = format!(
+        "Using {} of memory and keeping a {} index",
+        sizes
+            .service_working_set
+            .map_or_else(|| "?".into(), stats::size),
+        stats::size(index)
+    );
+    match sizes.entries {
+        Some(entries) => {
+            text.push_str(&format!(" for {} files and folders", stats::count(entries)))
+        }
+        None => text.push_str(" for the files and folders on your drives"),
+    }
+    text.push_str(
+        ". The index lives in C:\\ProgramData\\better_search and grows with the number of files.",
+    );
+    text
+}
 
 /// Default panel geometry: a square whose side is 70% of the work area height,
 /// centred vertically and flush with the right screen edge.
@@ -225,6 +326,14 @@ struct App {
     gear: RECT,
     /// When a letter typed in Start last arrived.
     start_typed_at: Option<std::time::Instant>,
+    /// The last sizes the service reported. `None` until it has been asked.
+    sizes: Option<stats::Reading>,
+    /// The sizes worker, kept so a result is never read from a dead channel.
+    sizes_results: Option<Receiver<stats::Reading>>,
+    sizes_stop: Option<Sender<()>>,
+    /// An offer to replace Windows search that is owed, but not yet shown: the first scan
+    /// had not finished, or the panel was not on screen and idle when it did.
+    offer_pending: bool,
 }
 
 impl App {
@@ -277,6 +386,10 @@ impl App {
             chip: RECT::default(),
             gear: RECT::default(),
             start_typed_at: None,
+            sizes: None,
+            sizes_results: None,
+            sizes_stop: None,
+            offer_pending: false,
         }
     }
 
@@ -1028,6 +1141,7 @@ impl App {
         }
         let hotkey = encode_hotkey(self.settings.modifiers, self.settings.key);
         self.update_search_button();
+        self.update_sizes_label();
         unsafe {
             SendMessageW(self.controls[1], HKM_SETHOTKEY, hotkey, 0);
             SendMessageW(
@@ -1148,14 +1262,34 @@ impl App {
     /// One click switches Windows search; the button label says what the next press does.
     fn toggle_windows_search(&mut self, hwnd: HWND) {
         let off = !winsearch::is_off();
-        if !winsearch::request(hwnd, off) {
+        let outcome = winsearch::request(hwnd, off);
+        winkey::set_search_off(winsearch::is_off());
+        self.update_search_button();
+        if !outcome.changed {
             message(
                 hwnd,
                 "Windows search was not changed. Approve the administrator prompt to change it.",
             );
+        } else if off && !outcome.index_cleared {
+            message(
+                hwnd,
+                "Windows search is off, but its index files could not be removed, so its disk \
+                 space was not freed. They are still in C:\\ProgramData\\Microsoft\\Search.",
+            );
+        } else if off {
+            self.show_notice(hwnd, "Windows search is off, and its index files are gone");
+        } else if !outcome.restored {
+            message(
+                hwnd,
+                "Windows search is on again, but Windows would not put its background indexer \
+                 back to starting automatically. If search does not work, set the \"Windows \
+                 Search\" service to Automatic in Windows' Services app.",
+            );
+        } else {
+            self.show_notice(hwnd, "Windows search is on again");
         }
-        winkey::set_search_off(winsearch::is_off());
-        self.update_search_button();
+        // Its footprint changed either way, so what the panel holds is now out of date.
+        self.refresh_sizes(hwnd);
     }
 
     fn update_search_button(&self) {
@@ -1166,7 +1300,8 @@ impl App {
         unsafe { SetWindowTextW(button, text.as_ptr()) };
     }
 
-    /// The first-run offer: one explanation, then the user decides. Asked once only.
+    /// The first-run offer: one short explanation, then the user decides. Asked once only,
+    /// and only after the first scan, so the numbers in it are measured rather than claimed.
     fn offer_windows_search(&mut self, hwnd: HWND) {
         if self.settings.windows_search_asked {
             return;
@@ -1175,11 +1310,17 @@ impl App {
             self.remember_windows_search(hwnd);
             return;
         }
+        let Some(reading) = &self.sizes else {
+            // Nothing measured yet. Ask, and come back when the answer arrives.
+            self.start_sizes(hwnd);
+            self.offer_pending = true;
+            return;
+        };
         let answer = unsafe {
             windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
                 hwnd,
-                wide(WINDOWS_SEARCH_OFFER).as_ptr(),
-                wide("Replace Windows search?").as_ptr(),
+                wide(&offer_text(reading)).as_ptr(),
+                wide(OFFER_TITLE).as_ptr(),
                 MB_YESNO | MB_ICONQUESTION,
             )
         };
@@ -1187,6 +1328,47 @@ impl App {
         if answer == IDYES {
             self.toggle_windows_search(hwnd);
         }
+    }
+
+    /// Starts the one sizes request the panel ever needs.
+    fn start_sizes(&mut self, hwnd: HWND) {
+        if self.sizes_results.is_some() {
+            return;
+        }
+        let (results, stop) = stats::start(hwnd);
+        self.sizes_results = Some(results);
+        self.sizes_stop = Some(stop);
+    }
+
+    /// Asks again from scratch, after something changed what the numbers describe.
+    fn refresh_sizes(&mut self, hwnd: HWND) {
+        self.sizes = None;
+        self.sizes_results = None;
+        self.sizes_stop = None;
+        self.start_sizes(hwnd);
+    }
+
+    /// A sizes reading arrived. It gates the offer, and fills in the Settings line.
+    fn apply_sizes(&mut self, hwnd: HWND, reading: stats::Reading) {
+        self.sizes = Some(reading);
+        if self.settings_open {
+            self.update_sizes_label();
+        }
+        // The offer waits for the panel to be on screen and idle: a dialog that appears
+        // over a search the user is typing would be in the way.
+        let idle = self.last_text.trim().is_empty();
+        if self.offer_pending && idle && unsafe { IsWindowVisible(hwnd) } != 0 {
+            self.offer_pending = false;
+            self.offer_windows_search(hwnd);
+        }
+    }
+
+    /// What better_search costs, and where the disk space goes.
+    fn update_sizes_label(&self) {
+        let Some(&label) = self.controls.get(SETTINGS_SIZES_ROW) else {
+            return;
+        };
+        unsafe { SetWindowTextW(label, wide(&sizes_text(self.sizes.as_ref())).as_ptr()) };
     }
 
     fn remember_windows_search(&mut self, hwnd: HWND) {
@@ -1209,7 +1391,7 @@ impl App {
             let top = scale(hwnd, 20);
             let mut y = top;
             for (i, &control) in self.controls.iter().enumerate() {
-                let height = if i == 8 {
+                let height = if SETTINGS_TALL_ROWS.contains(&i) {
                     line * 2
                 } else {
                     line - scale(hwnd, 3)
@@ -2039,6 +2221,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     0,
                     0,
                 ),
+                control(hwnd, &static_class, &sizes_text(None), 0, 0),
                 control(
                     hwnd,
                     &button_class,
@@ -2417,6 +2600,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
+        stats::WM_SIZES_RESULT => {
+            if let Some(results) = &app.sizes_results {
+                let pending: Vec<_> = results.try_iter().collect();
+                for reading in pending {
+                    app.apply_sizes(hwnd, reading);
+                }
+            }
+            0
+        }
         WM_NOTIFY => {
             let hdr = unsafe { &*(l as *const NMHDR) };
             if hdr.hwndFrom == app.list {
@@ -2500,6 +2692,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             unsafe { Shell_NotifyIconW(NIM_DELETE, &tray_data(hwnd)) };
             app.sender.take();
             app.results.take();
+            // Dropping the stop end tells the workers the window is gone.
+            app.sizes_results.take();
+            app.sizes_stop.take();
             unsafe { PostQuitMessage(0) };
             0
         }
@@ -2567,8 +2762,13 @@ fn run(start_hidden: bool) -> Result<(), String> {
             SetFocus((*app).edit);
         }
     }
-    if !start_hidden {
-        unsafe { (*app).offer_windows_search(hwnd) };
+    // What this costs is asked for on every start, so Settings can show it even when the
+    // offer was answered long ago. The offer itself waits for the answer.
+    unsafe {
+        (*app).start_sizes(hwnd);
+        if !start_hidden {
+            (*app).offer_windows_search(hwnd);
+        }
     }
     let mut msg = MSG::default();
     while unsafe { GetMessageW(&mut msg, null_mut(), 0, 0) } > 0 {
@@ -2611,8 +2811,8 @@ fn main() {
     if let [flag, state] = args.as_slice()
         && flag == winsearch::ARGUMENT
     {
-        winsearch::apply(state == "off");
-        return;
+        // The exit code is how the window that asked hears what happened.
+        std::process::exit(winsearch::apply(state == "off") as i32);
     }
     if args.iter().any(|arg| arg == "--check-updates") {
         std::process::exit(check_updates_here());
@@ -2711,5 +2911,110 @@ mod tests {
         }
         assert_eq!(decode_hotkey(32), None);
         assert_eq!(decode_hotkey(4 << 8), None);
+    }
+
+    fn sizes(
+        entries: Option<u64>,
+        memory: Option<u64>,
+        windows_memory: Option<u64>,
+        windows_disk: Option<u64>,
+    ) -> bs_pipe::StatsReply {
+        bs_pipe::StatsReply {
+            status: Status::Ok,
+            service_private: memory,
+            service_working_set: Some(15 * 1024 * 1024),
+            index_heap: Some(18 * 1024 * 1024),
+            snapshot_disk: Some(4_500_000),
+            log_disk: Some(1_702),
+            service_binary_disk: Some(2_000_000),
+            entries,
+            windows_search_memory: windows_memory,
+            windows_search_disk: windows_disk,
+        }
+    }
+
+    #[test]
+    fn the_offer_quotes_only_what_was_measured() {
+        let text = offer_text(&stats::Reading::Sizes(sizes(
+            Some(574_455),
+            Some(21 * 1024 * 1024),
+            Some(19 * 1024 * 1024),
+            Some(34 * 1024 * 1024),
+        )));
+        assert!(
+            text.contains("using 19 MB of memory and keeping 34 MB of index files on disk"),
+            "{text}"
+        );
+        assert!(text.contains("574,455 of them"), "{text}");
+        assert!(
+            text.contains("keeps a 4 MB index and uses 15 MB of memory"),
+            "{text}"
+        );
+        assert!(text.contains("frees that memory and its 34 MB"), "{text}");
+        // The point of the offer: nothing becomes unsearchable.
+        assert!(
+            text.contains("Win+S and Start already open better_search"),
+            "{text}"
+        );
+        assert!(
+            text.contains("turn Windows search back on any time in Settings"),
+            "{text}"
+        );
+        assert!(text.ends_with("Turn Windows search off now?"));
+    }
+
+    #[test]
+    fn the_offer_leaves_out_a_number_it_does_not_have() {
+        // Still scanning: no numbers at all, but the offer is still made.
+        let scanning = offer_text(&stats::Reading::Scanning);
+        assert!(
+            scanning.contains("keeps indexing in the background"),
+            "{scanning}"
+        );
+        assert!(
+            scanning.contains("searches every file and folder on this PC"),
+            "{scanning}"
+        );
+        assert!(!scanning.contains("MB"), "{scanning}");
+
+        // No service: the same shape, so the offer never shows an invented figure.
+        let unavailable = offer_text(&stats::Reading::Unavailable);
+        assert_eq!(unavailable, scanning);
+
+        // Measured, but Windows search's own index could not be read.
+        let partial = offer_text(&stats::Reading::Sizes(sizes(
+            Some(10),
+            Some(21 * 1024 * 1024),
+            Some(19 * 1024 * 1024),
+            None,
+        )));
+        assert!(
+            partial.contains("using 19 MB of memory, and it keeps indexing"),
+            "{partial}"
+        );
+        assert!(partial.contains("frees its memory. Win+S"), "{partial}");
+        assert!(!partial.contains("34 MB"), "{partial}");
+    }
+
+    #[test]
+    fn the_settings_line_says_what_it_costs_and_where_the_index_is() {
+        let ready = sizes_text(Some(&stats::Reading::Sizes(sizes(
+            Some(574_455),
+            Some(21 * 1024 * 1024),
+            None,
+            None,
+        ))));
+        assert!(
+            ready.contains("Using 15 MB of memory and keeping a 4 MB index"),
+            "{ready}"
+        );
+        assert!(ready.contains("for 574,455 files and folders"), "{ready}");
+        assert!(ready.contains(r"C:\ProgramData\better_search"), "{ready}");
+        // Before the first scan there is nothing to quote, and it says so.
+        assert_eq!(sizes_text(None), "Measuring…");
+        assert_eq!(
+            sizes_text(Some(&stats::Reading::Scanning)),
+            "Measuring once the first scan finishes…"
+        );
     }
 }

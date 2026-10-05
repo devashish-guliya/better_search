@@ -8,9 +8,10 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.4` (2026-10-05). The tree is clean,
-126 workspace tests and 8 installer tests pass, and the code is on GitHub with five
-releases published.
+State at writing: branch `main`, released as `v0.2.5` (2026-10-05). The tree is clean,
+137 workspace tests and 8 installer tests pass, and the code is on GitHub with six
+releases published. Nothing of better_search is installed on this machine; see
+"Current installed state" below.
 
 ---
 
@@ -50,20 +51,22 @@ Ask before big or machine-wide decisions.
 
 ### Current installed state (important)
 
-- better_search **is installed** on this machine (2026-10-05), version 0.2.4, from a fresh
-  install run the way a user runs it (setup started unelevated, one approval prompt). The
-  files are in `C:\Program Files\better_search` (`bs-service.exe`, `bs-window.exe`,
-  `bs.exe`, `better-search-setup.exe`), the `better_search` service runs as LocalSystem,
-  the panel runs unelevated, and it auto-starts with `--hidden` from an HKLM `Run` entry.
-  Alt+Space and Win+S were both verified to bring the panel forward.
+- better_search is **not installed** on this machine (2026-10-05). The 0.2.5 install was
+  removed with its own uninstaller, which was the last end-to-end test of the removal:
+  the folder in `C:\Program Files`, the service, the `Run` value, the Apps & Features
+  entry, `%ProgramData%\better_search` (index and log) and `%LOCALAPPDATA%\better_search`
+  (settings and history) are all gone, and nothing of better_search is left in the
+  registry or on disk.
+- **Windows search is ON on this PC**, which is the state an uninstall must always leave
+  behind: the `DisableSearch` policy is absent, `WSearch` runs as delayed-auto and its
+  indexer is rebuilding its index. It was off (and its index removed) just before the
+  uninstall, so the uninstaller's restore was exercised for real. Turning it off is one
+  click in Settings, or Yes on the first-run offer.
 - Releases so far: 0.2.0 (first public), 0.2.1 (leftover cleanup), 0.2.2 (clean
   uninstall), 0.2.3 (quit the panel so its image is released), 0.2.4 (start the panel
-  after install). The installed copy was
-  upgraded in place by hand and through the panel's Check for updates button;
-  `bs-window.exe --check-updates` prints whether a newer release exists.
-- **Windows search is ON on this PC** (the `DisableSearch` policy is not set and `WSearch`
-  is running), so the first-run offer appears while the panel is up. Turning it off is one
-  click in Settings, or Yes on that offer.
+  after install), 0.2.5 (the offer quotes measured numbers, and turning Windows search off
+  frees its index). An installed copy upgrades in place through the panel's Check for
+  updates button; `bs-window.exe --check-updates` prints whether a newer release exists.
 - Settings for the window live at `%LOCALAPPDATA%\better_search\window.cfg`. Open
   history: `%LOCALAPPDATA%\better_search\history.tsv`. Service data (index and log):
   `%ProgramData%\better_search` (protected; only SYSTEM and Administrators can read it).
@@ -267,7 +270,8 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 | `frecency.rs` | Open history (`history.tsv`), seeded from Windows Recent |
 | `settings.rs` | Loads and saves `window.cfg` |
 | `winkey.rs` | Low-level keyboard hook (Win+S, typing in Start), foreground watcher for SearchHost, Explorer folder lookup |
-| `winsearch.rs` | Turns Windows search off or on (elevated) |
+| `winsearch.rs` | Turns Windows search off or on (elevated), and frees its index when off |
+| `stats.rs` | One read-only sizes request, off the UI thread, so the panel can quote real numbers |
 | `update.rs` | Update check, download, SHA-256 check and running the installer |
 
 ### 5.1 Look and behaviour
@@ -351,25 +355,70 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   `SOFTWARE\Policies\Microsoft\Windows\Windows Search\DisableSearch`.
 - `request(hwnd, off)` re-runs `bs-window.exe` elevated through `runas` with
   `--windows-search on|off` and waits. `main()` handles that argument before anything
-  else.
-- `apply()` sets or deletes the policy, runs `sc config` and `sc stop WSearch`
-  (disabled, or delayed-auto plus start), and ends `SearchHost.exe`. Killing it alone
-  is not enough, because it restarts within seconds.
+  else and exits with the elevated copy's code.
+- `apply(off)` returns that exit code, which is the only way the elevated half can report:
+  `0` off and its index files removed, `1` off but the index files stayed, `2` on and its
+  settings restored, `3` on but Windows would not take its indexer back, `4` the policy
+  could not be written. `read_code` turns the code into the `Outcome` the panel shows, and
+  a test pins every mapping so a wrong code cannot be read as a success.
+- Turning it off: the policy, then `stop_indexer()` (start type `SERVICE_DISABLED`, stop,
+  and **wait up to 10 s** for `SERVICE_STOPPED`, because the index files stay locked while
+  the process runs), then `taskkill SearchHost.exe` (killing it alone is not enough, it
+  restarts within seconds), then `clear_index()`.
+- **`clear_index()` is what frees the disk space**, not the policy: it removes the contents
+  of `C:\ProgramData\Microsoft\Search\Data` and keeps the folders, so Windows' own
+  permissions stay. Windows rebuilds the index by itself if search runs again, so nothing
+  is lost. Measured on this PC: 10.9 MB and 17 files before, 0 MB and 0 files after, and
+  Windows rebuilt 8.3 MB within 30 s of being turned back on.
+- Turning it on: delete the policy, `ChangeServiceConfigW` to `SERVICE_AUTO_START`,
+  `ChangeServiceConfig2W` for delayed auto start (as Windows ships it), and
+  `StartServiceW`. It does **not** wait for the indexer: Windows brings it up in its own
+  time, the panel is blocked while this runs, and a wait long enough to see it would freeze
+  the window. What is reported is the setting that makes search work again.
 - **First-run offer:** the first time the panel opens (or is launched visible) while
-  Windows search is still on, `offer_windows_search` shows one `MessageBoxW` Yes/No
-  explaining the saving; `windows_search_asked=true` in `window.cfg` records the answer,
-  and Yes runs the elevated switch. If Windows search is already off, the flag is set
-  without a dialog.
+  Windows search is still on, `offer_windows_search` shows one `MessageBoxW` Yes/No;
+  `windows_search_asked=true` in `window.cfg` records the answer, and Yes runs the elevated
+  switch. If Windows search is already off, the flag is set without a dialog.
+- The offer **waits for the first scan**, so the numbers in it are measured rather than
+  claimed: `stats::start` asks the service for sizes every 3 s (up to 60 tries), the panel
+  remembers the last reading, and the dialog opens on the first `Status::Ok`. A machine
+  where the service never becomes ready still gets the offer, just without numbers. Every
+  number in the text is optional and a sentence is left out rather than filled with a
+  guess (`offer_text` tests cover the full, partial and absent cases).
 - One-click button: the label says what the press will do ("Turn Windows search off (asks
   for admin)" or "Turn Windows search back on (asks for admin)"), depending on the current
   state (control id `SETTINGS_WINDOWS_SEARCH` 321, `controls[2]`, the first control under
   the hotkey field). A press calls `winsearch::request` at once and then
-  `winkey::set_search_off`; nothing about it goes through Save. The double-height control
-  index is 8.
+  `winkey::set_search_off`; nothing about it goes through Save. A press that freed the disk
+  space shows "Windows search is off, and its index files are gone"; one that did not says
+  so and names the folder. Both settings rows that need two lines are listed in
+  `SETTINGS_TALL_ROWS` (`8` and the footprint row `9`).
 - **Watcher:** an `EVENT_SYSTEM_FOREGROUND` WinEvent hook (`foreground_changed`). If
   `SearchHost.exe` comes to the front while search is off, the hook ends it and opens
   better_search (`WM_WIN_S`).
-- The first elevated run took over 120 s, probably in `sc stop`, but it completed.
+
+### 5.6a Showing what each one costs (`stats.rs`, `bs_pipe::StatsReply`)
+
+- The service answers a read-only sizes request: `version u8 · kind u8 (2)` in, and
+  `version u8 · status u8` plus nine `u64` sizes out (`u64::MAX` for one that is not known
+  yet, which is not the same as zero). It needs no viewer lookup: it says nothing about any
+  file, so a window that may not search may still ask what things cost.
+- The service measures Windows search's footprint, because it is the only part of
+  better_search with the rights to read `C:\ProgramData\Microsoft\Search`: `winsearch.rs` in
+  the service walks that folder and sums the **working set** of every `SearchIndexer.exe`
+  (the number Task Manager's Memory column shows, so a user can check it). A figure it
+  cannot get is reported as unknown, never as a zero.
+- The panel shows it in Settings as "Using 25 MB of memory and keeping a 4 MB index for
+  574,000 files and folders", measured once per start (`start_sizes` in `run()`) and again
+  after a Windows search switch. The panel's own memory is not in the reply: the service
+  cannot measure the panel, and the text does not need it.
+- Measured on this PC (2026-10-05, 574 K entries): our service 20-21 MB private, 25-29 MB
+  working set after a scan, trimmed to 0.8 MB when idle, index 4.2 MB on disk and 17.6 MB
+  in memory. Windows search: `SearchIndexer` 8.6 MB private and 19.3 MB working set while
+  idle with a fresh index, 29 MB while rebuilding, and 34.3 MB of index files for a full
+  index (10-11.5 MB after a rebuild). The disk comparison is index against index, which is
+  what grows with the number of files.
+
 
 ### 5.7 Updates (`update.rs`) and releases
 
@@ -471,6 +520,26 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   during and after the upgrade.
 - `--inspect` is read-only and safe to run. **Do not run install, upgrade or uninstall
   without asking the user.** The binary is not code signed, so SmartScreen will warn.
+- **It starts the panel** when the install finishes, so Alt+Space and Win+S work at once
+  instead of after the next sign-in. Which way depends on who the setup program is: the
+  ordinary double-click path reaches `start_panel` unelevated, after the elevated half has
+  finished, and starts `bs-window.exe` directly, so the panel gets normal user rights. A
+  setup program that is itself elevated (right-click, "Run as administrator") borrows the
+  shell's token with `CreateProcessWithTokenW`, and if Windows refuses that (it did:
+  `ERROR_ACCESS_DENIED`, 5) it asks the running shell to open the program
+  (`explorer.exe <path>`), which starts it at the user's own level. Nothing is reported as
+  started until `FindWindowW` finds the panel's window, up to 10 s. Both paths were
+  verified on this machine.
+- **It reports in message boxes and has no console.** A console window that flashed and
+  closed made a finished install and a failed one look identical. The elevated half is
+  waited for, so the outcome is real, and a dismissed UAC prompt says so instead of
+  exiting silently.
+- **An uninstall turns Windows search back on** if better_search had turned it off
+  (policy, indexer start type, start), and removes this account's settings and history
+  along with the index and logs when the user says Yes. Without the first, removing the
+  app would leave search disabled with nothing left to undo it; without the second, a
+  fresh install would never offer again because `windows_search_asked` would still be
+  `true`.
 - Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`
   (eight tests: payloads are executables, a file swap writes through cleanly, a file
   without delete sharing is refused without damage, renamed-old images are cleared, only
@@ -524,8 +593,8 @@ cargo test --workspace
 cargo build --release
 ```
 
-126 tests: index 37, query 35, engine 9, service 10, pipe 6, ntfs 3, cli 4, window 22.
-The installer crate has 3 more (its own `--manifest-path`).
+141 tests: index 37, query 35, window 30, service 14, engine 9, pipe 9, cli 4, ntfs 3.
+The installer crate has 8 more (its own `--manifest-path`).
 
 ### Updating the installed window after a change
 
@@ -553,6 +622,13 @@ it again.
   ignored by git.
 - Elevated measurement scripts live in `target\admin_run\` (ignored), and the user
   approves each UAC prompt.
+- `target\ui_probe.ps1` (ignored) drives and reads the real UI from outside: `-Mode list`
+  (visible top-level windows), `dialogs` (every visible `#32770` with all its child texts,
+  which is how a message box's wording and buttons are read), `dialog` / `click`
+  (screenshot a dialog, or click a named button in it), `panel`, `show-panel`, `settings`.
+- PowerShell does not set `$LASTEXITCODE` for a windows-subsystem program, and does not
+  wait for it. To read an exit code from `bs-window.exe`, use
+  `Start-Process -Wait -PassThru` and read `.ExitCode`.
 
 ### Tooling gotchas
 
@@ -588,6 +664,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| (this commit) | The offer quotes measured numbers, and turning Windows search off frees its index; version 0.2.5 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |

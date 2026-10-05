@@ -102,14 +102,21 @@ search field; Backspace at the start of the field removes the chip and searches
 everything again. Letters and digits typed while Start is open close Start and go to
 better_search instead.
 
-The first time the panel opens while Windows search is still on, it explains what the
-change saves (a background indexer, its database on disk, and machine-wide reach into
-other accounts and apps) and offers to turn it off once; the answer is remembered. The
-gear's one-click switch does the same thing later: it asks for admin, sets the
-`DisableSearch` policy, disables the `WSearch` service and closes `SearchHost.exe`; if
-Windows search still comes to the front, better_search closes it and opens itself. A
-press in the other direction (or `bs-window --windows-search on`, elevated) turns it
-back on.
+The first time the panel opens after the first scan finishes, while Windows search is still
+on, it shows what the change saves. The numbers are measured on your PC at that moment,
+not claimed: what Windows search is using in memory and keeping as index files on disk,
+and what better_search costs beside it (its index, its memory, and how many files and
+folders it already searches). A number that cannot be measured is left out of the sentence
+rather than guessed. The answer is remembered, and Settings shows the same figures later.
+
+The gear's one-click switch does the same thing: it asks for admin, sets the
+`DisableSearch` policy, disables the `WSearch` service, closes `SearchHost.exe` and
+**deletes the index files Windows search kept**, which is what actually frees the disk
+space (Windows rebuilds the index by itself if search is ever turned back on). If Windows
+search still comes to the front, better_search closes it and opens itself. A press in the
+other direction (or `bs-window --windows-search on`, elevated) turns it back on and puts
+its settings back. Uninstalling better_search turns Windows search back on as well, so
+removing the app never leaves search disabled with nothing left to undo it.
 
 Windows Settings pages (Display, Sound, Wi-Fi, Background, Installed apps, ...) are
 found by name and by common words (`wallpaper`, `uninstall`, `volume`), and Shut down,
@@ -151,9 +158,10 @@ service. Settings can turn it off or clear it.
 
 Settings let you change the hotkey, switch Windows search off or back on with one click
 (the button says which way it will go, and it asks for admin), and explicitly enable
-per-user start at sign-in (HKCU only). Settings also has a **Check for updates** button
-(the same entry is in the tray menu), which is the only network access better_search
-makes; see [Updates](#updates). Window settings are saved at
+per-user start at sign-in (HKCU only). Settings also shows what better_search costs on
+this PC (memory, index size, and the number of files and folders it holds) and has a
+**Check for updates** button (the same entry is in the tray menu), which is the only
+network access better_search makes; see [Updates](#updates). Window settings are saved at
 `%LOCALAPPDATA%\better_search\window.cfg`. At sign-in it starts hidden in the tray;
 run `bs-window.exe --hidden` to do that manually. The drives shown in Settings are the fixed
 NTFS drives eligible for the service; changing the indexed drives is deferred because
@@ -230,24 +238,29 @@ What the draft does if it is run:
   nothing but our own files) is cleared and reused, so a reinstall does not need a
   restart.
 - Running it again on an installed machine **upgrades in place**: it stops the service,
-  replaces the three programs and itself, refreshes the registry entries and starts the
-  service again. A running search window keeps working and is replaced by renaming its
-  file aside, so no step needs the window to be closed first. Settings, the snapshot and
-  the log are left alone.
+  asks the search panel to exit, replaces the three programs and itself, refreshes the
+  registry entries and starts the service again, then starts the panel from the new file.
+  Settings, the snapshot and the log are left alone.
 - Registers an entry in Apps & Features. Its Uninstall string runs
   `better-search-setup.exe --uninstall`, which stops and deletes the service, removes
-  the files and registry entries, and asks (default No) before deleting the saved
-  snapshot and logs. It refuses to uninstall unless the install registration matches.
+  the files and registry entries, **turns Windows search back on if better_search had
+  turned it off** (policy, indexer start type and a start), and asks (default No) before
+  deleting the saved snapshot, the logs and this account's settings and history. It
+  refuses to uninstall unless the install registration matches.
   A running search panel is asked to exit first, so its program file can be deleted; a
   copy that is still locked (an older panel, another user's panel, and the uninstaller
   itself) is moved to the temp folder and deleted at the next reboot. The install folder
   itself is removed at once, so nothing is left in `Program Files`.
+- A dismissed UAC prompt is reported, not swallowed: the install did not happen, and
+  saying so is the difference between a program that stopped for a reason and one that
+  seemed to stop for no reason.
 
 Verified end to end on this machine: install started the service and the unelevated
 window showed "1674 matches" for `readme`; an upgrade over the running window kept it
-working; and an uninstall removed the service, the files and the registry entries while
-keeping the snapshot (when asked to). The install folder is gone as soon as the uninstall
-finishes. The binary is not code signed, so SmartScreen will warn.
+working; turning Windows search off freed its index (10.9 MB to 0) and turning it back on
+restored it and its rebuild; and an uninstall removed the service, the files, the registry
+entries, the machine-wide data and this account's settings, leaving Windows search on and
+nothing of better_search anywhere. The binary is not code signed, so SmartScreen will warn.
 
 Registering the service can also still be done by hand (`sc.exe create`) or with a
 temporary development test.
