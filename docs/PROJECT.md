@@ -4,9 +4,8 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `9227386` ("GitHub releases, in-place upgrades, and a Check for
-updates button"). `docs/HANDOFF.md` is a shorter, self-contained summary of this record
-for starting a new chat.
+Last updated with release `v0.2.1`. `docs/HANDOFF.md` is a shorter, self-contained summary
+of this record for starting a new chat.
 
 Current state, in short:
 
@@ -110,7 +109,10 @@ Out of scope: searching file **contents**. Only names are searched.
 | `21b0540` | Drop the legacy hover/left keys from the settings test |
 | `c79bc7a` | Settings gear, one-click Windows search switch, indexing wait, one panel per session |
 | `d9b81c6` | First-run offer to turn Windows search off, with the reasoning |
-| `9227386` | GitHub releases, in-place upgrades, and a Check for updates button |
+| `9227386` | GitHub releases, in-place upgrades, and a Check for updates button (v0.2.0) |
+| `02d0b37` | Record the release and update work in the project docs |
+| `85669b7` | Run cargo and gh through `cmd.exe` in the release script |
+| `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
 
 ## 4. Current results on the development machine
 
@@ -1116,8 +1118,9 @@ that fails because the program is running, the old image is renamed to `.old` fi
 the new file takes its place, which Windows allows because a running image keeps delete
 sharing. A failure puts the original back, so an installed program is never left
 missing. `remove_leftovers` deletes renamed-old images afterwards, best effort: the
-service's copy goes because the service is stopped, and a running window's copy goes
-when that window exits, or at the next upgrade or uninstall. The window keeps running
+service's copy goes immediately because the service is stopped, while a running window's
+copy cannot be deleted at all (Windows denies deleting a running image) and goes at the
+next upgrade or uninstall. The window keeps running
 the old code until it restarts; settings, snapshot and log are untouched. Files that
 exist without a registration are still refused, so a half-removed install is not
 silently adopted.
@@ -1126,7 +1129,8 @@ Verified twice on the development machine (2026-10-05) with the released install
 both the service and the window were running: the service stopped and started again,
 `bs-service.exe.old` and `bs-window.exe.old` appeared, the running 0.1.0 window kept
 answering searches through the service during and after the upgrade, and a fresh window
-started from the replaced file.
+started from the replaced file. A third run confirmed the cleanup: with no window
+running from the renamed image, the leftover `.old` file was gone afterwards.
 
 Uninstall behaviour: refuses unless the installer's own `InstallLocation` matches the
 expected folder (so it never deletes a service someone else registered), stops and
@@ -1237,5 +1241,10 @@ Still open after the test:
   and the manifest as a GitHub release. The manifest address is compiled into every
   release, so the repository name must not change without a plan for installed copies
   (GitHub redirects renamed repositories, but the address is still worth keeping).
+- **Versioning:** one version for the whole project, `version` in the workspace
+  `Cargo.toml`. The window compares it with the released manifest, and the installer
+  crate (built outside the workspace, so it cannot inherit) must carry the same number;
+  `tools\release.ps1` sets it and refuses to publish a mismatch. Every release therefore
+  raises both numbers and gets its own commit, and `release` tags are `v<version>`.
 - **Style:** match existing code; comments only where the reason is not obvious; plain,
   direct explanations for the user, including trade-offs, before big decisions.

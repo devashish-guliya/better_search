@@ -8,9 +8,9 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: commit `9227386` on branch `main` (2026-10-05). The tree is clean,
+State at writing: branch `main`, released as `v0.2.1` (2026-10-05). The tree is clean,
 126 workspace tests and 4 installer tests pass, and the code is on GitHub with the
-first release published.
+first two releases published.
 
 ---
 
@@ -51,9 +51,14 @@ Ask before big or machine-wide decisions.
 ### Current installed state (important)
 
 - better_search is **installed** in `C:\Program Files\better_search` (`bs-service.exe`,
-  `bs-window.exe`, `bs.exe`, `better-search-setup.exe`). The `better_search` service runs
+  `bs-window.exe`, `bs.exe`, `better-search-setup.exe`), at version 0.2.1. The
+  `better_search` service runs
   as LocalSystem and starts automatically. The window auto-starts with `--hidden` from an
   HKLM `Run` entry.
+- Version 0.2.0 was the first published release and 0.2.1 is the newest; the installed
+  copy has been upgraded in place with the released installer, both by hand and through
+  the panel's Check for updates button. `bs-window.exe --check-updates` prints whether a
+  newer release exists.
 - **Windows search is turned OFF on this PC.** The `DisableSearch=1` policy is set, the
   `WSearch` service is stopped and disabled, and `SearchHost.exe` is closed. To turn it
   back on, uncheck the Settings box or run `bs-window.exe --windows-search on` elevated.
@@ -435,13 +440,14 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   starts the service again. Each file is written as `.new` and renamed over the target;
   when the program is running (rename refused) the old image is renamed to `.old` first,
   which Windows allows for a running image, and the new file takes its name. The renamed
-  copy is deleted afterwards when it is free (the service's always, the window's when it
-  exits, or at the next upgrade or uninstall). The running window keeps the old code
+  copy is deleted afterwards when it can be (the service's always, because it is stopped
+  for the swap; a running window's image cannot be deleted at all, so it goes at the next
+  upgrade or uninstall). The running window keeps the old code
   until it restarts. A failure restores the original, and a folder that exists without a
   registration is still refused. Verified on this machine with the released installer
   while the service and the window were running: the service stopped and started, the
   `.old` copies appeared, and the old window kept answering searches during and after the
-  upgrade.
+  upgrade. A later run cleared a leftover `.old` file once no window was running from it.
 - `--inspect` is read-only and safe to run. **Do not run install, upgrade or uninstall
   without asking the user.** The binary is not code signed, so SmartScreen will warn.
 - Separate crate: run its checks with `--manifest-path tools\installer\Cargo.toml`
@@ -542,7 +548,8 @@ it again.
 - Never change the git identity.
 - `origin` is the public GitHub repository `devashish-guliya/better_search`; `main` is
   pushed there. To publish a release, raise the version in the workspace `Cargo.toml`
-  and run `.\tools\release.ps1 -Version <version>`. The manifest address compiled into
+  and run `.\tools\release.ps1 -Version <version>`; the script also sets the installer
+  crate's version and refuses a mismatch. The manifest address compiled into
   the window uses the repository name, so do not rename the repository casually.
 - Update `README.md` and `docs/PROJECT.md` (and this file) when behaviour changes.
 
@@ -557,7 +564,10 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
+| `85669b7` | Run cargo and gh through `cmd.exe` in the release script |
 | `9227386` | GitHub releases, in-place installer upgrades, and a Check for updates button |
+| `02d0b37` | Record the release and update work in the project docs |
 | `d9b81c6` | First-run offer to turn Windows search off, with the reasoning |
 | `c79bc7a` | Settings gear, one-click Windows search switch, indexing wait, one panel per session |
 | `21b0540` | Drop the legacy hover/left keys from the settings test |
