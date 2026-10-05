@@ -664,7 +664,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
-| (this commit) | The offer quotes measured numbers, and turning Windows search off frees its index; version 0.2.5 |
+| `3021d1a` | The offer quotes measured numbers, and turning Windows search off frees its index; version 0.2.5 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |

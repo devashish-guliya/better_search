@@ -122,7 +122,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
-| (this commit) | The first-run offer quotes measured numbers, turning Windows search off frees its index, the uninstall restores search and removes per-user data; version 0.2.5 |
+| `3021d1a` | The first-run offer quotes measured numbers, turning Windows search off frees its index, the uninstall restores search and removes per-user data; version 0.2.5 |
 
 ## 4. Current results on the development machine
 
