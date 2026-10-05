@@ -8,8 +8,8 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.3` (2026-10-05). The tree is clean,
-126 workspace tests and 8 installer tests pass, and the code is on GitHub with four
+State at writing: branch `main`, released as `v0.2.4` (2026-10-05). The tree is clean,
+126 workspace tests and 8 installer tests pass, and the code is on GitHub with five
 releases published.
 
 ---
@@ -50,25 +50,20 @@ Ask before big or machine-wide decisions.
 
 ### Current installed state (important)
 
-- better_search is **not installed** on this machine (2026-10-05). It was removed with
-  the 0.2.3 setup program to test the removal end to end and to leave the machine clean
-  for a fresh manual install; before that it lived in
-  `C:\Program Files\better_search` (`bs-service.exe`, `bs-window.exe`, `bs.exe`,
-  `better-search-setup.exe`) with the `better_search` service running as LocalSystem and
-  the window auto-starting with `--hidden` from an HKLM `Run` entry.
+- better_search **is installed** on this machine (2026-10-05), version 0.2.4, from a fresh
+  install run the way a user runs it (setup started unelevated, one approval prompt). The
+  files are in `C:\Program Files\better_search` (`bs-service.exe`, `bs-window.exe`,
+  `bs.exe`, `better-search-setup.exe`), the `better_search` service runs as LocalSystem,
+  the panel runs unelevated, and it auto-starts with `--hidden` from an HKLM `Run` entry.
+  Alt+Space and Win+S were both verified to bring the panel forward.
 - Releases so far: 0.2.0 (first public), 0.2.1 (leftover cleanup), 0.2.2 (clean
-  uninstall), 0.2.3 (quit the panel so its image is released). The installed copy was
+  uninstall), 0.2.3 (quit the panel so its image is released), 0.2.4 (start the panel
+  after install). The installed copy was
   upgraded in place by hand and through the panel's Check for updates button;
   `bs-window.exe --check-updates` prints whether a newer release exists.
-- **Windows search is turned back ON on this PC** (the `DisableSearch` policy was
-  removed and `WSearch` set to delayed-auto and started), so the first-run offer in
-  better_search will appear during a fresh install.
-- **Nothing of better_search remains:** the folder, the service, the `Run` value, the
-  Apps & Features entry, `%LOCALAPPDATA%\better_search` (settings and open history) and
-  `%ProgramData%\better_search` (index and logs) were all removed, and the temp copies
-  the uninstall queued were deleted too. The only trace of the removal that can remain on
-  a machine is a queued `PendingFileRenameOperations` entry for a file that is already
-  gone, which Windows skips.
+- **Windows search is ON on this PC** (the `DisableSearch` policy is not set and `WSearch`
+  is running), so the first-run offer appears while the panel is up. Turning it off is one
+  click in Settings, or Yes on that offer.
 - Settings for the window live at `%LOCALAPPDATA%\better_search\window.cfg`. Open
   history: `%LOCALAPPDATA%\better_search\history.tsv`. Service data (index and log):
   `%ProgramData%\better_search` (protected; only SYSTEM and Administrators can read it).
@@ -433,12 +428,20 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 
 - A Rust program that embeds the three release binaries with `include_bytes!`;
   `build.rs` refuses to build if they are missing. It shows one UAC prompt, because it
-  re-launches itself with `runas`.
+  re-launches itself with `runas`, and it **waits for that elevated copy to finish**, so
+  the outcome it reports is real.
+- It is built with `windows_subsystem = "windows"` and has no console: everything the user
+  sees is a message box. `--inspect` borrows the console it was started from and falls back
+  to a message box when there is none.
 - **Install:**
   - copies the files into `%ProgramFiles%\better_search`;
   - creates and starts the `better_search` service (auto start, LocalSystem);
   - adds an HKLM Run entry for `bs-window.exe --hidden` and an Apps & Features
     uninstall entry;
+  - **starts the search panel**, unelevated, so Alt+Space and Win+S work at once instead of
+    after the next sign-in (the unelevated half of the double-click does this directly; an
+    already-elevated setup program borrows the shell's token, which can be refused, and then
+    says so in a message box);
   - rolls back fully if any step fails;
   - refuses a folder that exists, **unless** it holds nothing but our own leftovers (the
     setup program and `.old` images), which it clears and takes over, so a reinstall
@@ -585,6 +588,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| (this commit) | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |

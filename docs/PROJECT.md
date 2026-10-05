@@ -115,6 +115,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `ddbf755` | Clear renamed-old images after an upgrade; version 0.2.1 |
 | `9c91fdf` | Leave Program Files clean on uninstall; adopt a folder of our own leftovers (v0.2.2) |
 | `2c447e0` | Quit the panel on uninstall so its image is released; version 0.2.3 |
+| (this commit) | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 
 ## 4. Current results on the development machine
 
@@ -1097,10 +1098,29 @@ Modes:
 - No argument: install. `--inspect`: print versions, install folder and payload sizes
   without touching the machine (read-only; safe to run).
 - `--install-elevated` / `--uninstall-elevated`: the internal steps an elevated copy
-  runs. A non-elevated start re-launches itself through `ShellExecuteW` `runas`, so the
-  user sees exactly one UAC prompt. The elevated step re-checks the token is elevated
-  and refuses otherwise.
+  runs. A non-elevated start re-launches itself through `ShellExecuteExW` `runas`, **waits
+  for that copy to finish**, and then starts the search panel as the user. The elevated
+  step re-checks the token is elevated and refuses otherwise.
 - `--uninstall`: the Apps & Features entry runs this; it elevates the same way.
+
+The program is built with `windows_subsystem = "windows"` and has no console. It was a
+console program, which meant a double-click flashed a window, printed nothing the user
+could read, and gave no sign of whether anything had happened. Everything the user needs
+to see is now a message box (a failure, or the note that the panel could not be started),
+and `--inspect` borrows the console it was started from (`AttachConsole` plus `CONOUT$`,
+because a program without a console subsystem has no working standard output) and falls
+back to a message box when there is none.
+
+**Starting the panel.** The window is registered to start at sign-in, so a fresh install
+used to leave nothing to press Alt+Space in until the next sign-in. The install path now
+starts it: the ordinary double-click reaches `install_entry` unelevated, waits for the
+elevated copy, and then starts `bs-window.exe` directly, so the panel runs with normal
+user rights. A setup program that is itself elevated has no such parent, so it borrows the
+shell's token (`GetShellWindow`, `OpenProcess`, `DuplicateTokenEx`,
+`CreateProcessWithTokenW`); that call can be refused with ERROR_ACCESS_DENIED, which is
+why the ordinary path avoids it. If neither works, a message box says so and names the
+program to start by hand. A panel that is already running is left alone, so an upgrade
+does not open a second one.
 
 Install behaviour: requires the registry entries and the service to be absent, then copies
 the three binaries plus
@@ -1163,7 +1183,7 @@ Because the panel quits on request and an upgrade moves the renamed image out of
 folder, `%ProgramFiles%\better_search` is gone as soon as the uninstall finishes, with
 nothing left inside it for a reboot to clear.
 
-Verified on the development machine (2026-10-05) with release 0.2.3 and one elevated
+Verified on the development machine (2026-10-05) with release 0.2.4 and one elevated
 script: it installed over a folder that held only a leftover `bs-window.exe.old` (adopted
 and cleared), started the panel, upgraded over that running panel (the renamed image was
 moved out of the folder during the upgrade, and the panel kept working), then uninstalled
@@ -1171,6 +1191,12 @@ while the panel ran. Afterwards the install folder, the service, the `Run` value
 Apps & Features entry, `%ProgramData%\better_search` and `%LOCALAPPDATA%\better_search`
 were all gone, and the only trace was the uninstaller's own copy in the temp folder,
 scheduled for deletion at the next reboot.
+
+A fresh install was then run the way a user runs it, by starting the setup program
+unelevated and approving one prompt: it installed 0.2.4, started the service, started the
+panel **unelevated** (the token reports `TokenIsElevated = 0`), and both Alt+Space and
+Win+S brought the panel to the front afterwards. Before that run the panel had to be
+started by hand, which is what prompted the change.
 
 An earlier version left a `bs-window.exe.old` in the folder, because the uninstall's
 leftover cleanup used a plain delete that Windows refuses for a running image; that is

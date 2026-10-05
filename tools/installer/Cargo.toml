@@ -1,6 +1,6 @@
 [package]
 name = "better-search-setup"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 publish = false
 
@@ -15,6 +15,7 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_System_Registry",
     "Win32_System_Services",
     "Win32_System_Threading",

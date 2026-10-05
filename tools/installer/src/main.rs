@@ -1,6 +1,11 @@
 //! Self-contained Windows setup. Building this binary is read-only; install and
 //! uninstall are explicit, elevated operations and are never run by the build.
 //! Running it on a machine where better_search is installed upgrades in place.
+//!
+//! The program has no console of its own: a console window that flashed and closed gave
+//! no idea whether anything had happened, so everything the user needs to see is a message
+//! box, and a fresh install starts the search panel so the hotkey works at once.
+#![windows_subsystem = "windows"]
 
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -9,11 +14,16 @@ use std::ptr::{null, null_mut};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SERVICE_DOES_NOT_EXIST, HANDLE};
-use windows_sys::Win32::Security::{
-    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_SERVICE_DOES_NOT_EXIST, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Security::{
+    DuplicateTokenEx, GetTokenInformation, SecurityImpersonation, TOKEN_ASSIGN_PRIMARY,
+    TOKEN_DUPLICATE, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation, TokenPrimary,
+};
+use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_WRITE, OPEN_EXISTING};
 use windows_sys::Win32::System::Com::CoTaskMemFree;
+use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, WriteConsoleW};
 use windows_sys::Win32::System::Registry::{
     HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RRF_RT_REG_SZ, RegDeleteKeyValueW, RegDeleteTreeW,
     RegGetValueW, RegSetKeyValueW,
@@ -25,13 +35,22 @@ use windows_sys::Win32::System::Services::{
     SERVICE_ERROR_NORMAL, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
     SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessWithTokenW, GetCurrentProcess, INFINITE, LOGON_WITH_PROFILE, OpenProcess,
+    OpenProcessToken, PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    WaitForSingleObject,
+};
 use windows_sys::Win32::UI::Shell::{
-    FOLDERID_ProgramData, FOLDERID_ProgramFiles, SHGetKnownFolderPath, ShellExecuteW,
+    FOLDERID_ProgramData, FOLDERID_ProgramFiles, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    SHGetKnownFolderPath, ShellExecuteExW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MessageBoxW, PostMessageW, SW_SHOWNORMAL,
+    FindWindowW, GetShellWindow, GetWindowThreadProcessId, MB_DEFBUTTON2, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MessageBoxW, PostMessageW, SW_SHOWNORMAL,
 };
+
+/// The error `ShellExecuteW` reports when the user dismisses the elevation prompt.
+const ERROR_CANCELLED: i32 = 1223;
 
 const SERVICE: &str = "better_search";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -110,29 +129,191 @@ fn elevated() -> io::Result<bool> {
     }
 }
 
-fn request_elevation(mode: &str) -> io::Result<()> {
-    let exe = std::env::current_exe()?;
-    let path = wide_path(&exe);
-    let verb = wide("runas");
-    let args = wide(mode);
-    // SAFETY: all strings are NUL-terminated; ShellExecute does not retain them.
-    let result = unsafe {
-        ShellExecuteW(
+/// Shows a message box. This program has no console of its own, so a message box is the
+/// only way the user can see anything it has to say.
+fn note(title: &str, text: &str, icon: u32) {
+    // SAFETY: both strings are NUL-terminated, and the box belongs to no window.
+    unsafe {
+        MessageBoxW(
             null_mut(),
-            verb.as_ptr(),
-            path.as_ptr(),
-            args.as_ptr(),
-            null(),
-            SW_SHOWNORMAL,
+            wide(text).as_ptr(),
+            wide(title).as_ptr(),
+            MB_OK | icon,
         )
     };
-    if result as isize <= 32 {
-        Err(io::Error::other(
-            "elevation was cancelled or could not start",
-        ))
-    } else {
-        Ok(())
+}
+
+/// Re-runs this program elevated and waits for it, so the elevated half is the only thing
+/// that reports an outcome. A dismissed elevation prompt is not a failure to report: the
+/// user chose not to continue, and a message box would only nag.
+fn request_elevation(mode: &str) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let file = wide_path(&exe);
+    let verb = wide("runas");
+    let args = wide(mode);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: verb.as_ptr(),
+        lpFile: file.as_ptr(),
+        lpParameters: args.as_ptr(),
+        nShow: SW_SHOWNORMAL,
+        ..Default::default()
+    };
+    // SAFETY: the struct is initialised with its size and NUL-terminated strings.
+    if unsafe { ShellExecuteExW(&mut info) } == 0 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_CANCELLED) {
+            return Ok(());
+        }
+        return Err(err);
     }
+    if !info.hProcess.is_null() {
+        // SAFETY: the handle is owned by this call, waited on and then closed once.
+        unsafe {
+            WaitForSingleObject(info.hProcess, INFINITE);
+            CloseHandle(info.hProcess);
+        }
+    }
+    Ok(())
+}
+
+/// Starts the search panel so Alt+Space and Win+S work straight after installing, instead
+/// of waiting for the next sign-in. A panel that is already running is left alone.
+///
+/// The panel must not carry this program's administrator rights, and which way to start it
+/// depends on who this process is: the ordinary double-click path reaches here unelevated,
+/// after the elevated half has finished, and can start the panel directly. Only a setup
+/// program that is itself elevated has to borrow the shell's token, and that can be refused.
+fn start_panel(dir: &Path) {
+    let result = if elevated().unwrap_or(false) {
+        launch_panel_with_shell_token(dir)
+    } else {
+        launch_panel_here(dir)
+    };
+    if let Err(err) = result {
+        note(
+            "better_search",
+            &format!(
+                "better_search is installed, but the search panel could not be started \
+                 ({err}).\n\nStart it yourself with:\n{}\n\nIt also starts by itself at \
+                 your next sign-in.",
+                dir.join("bs-window.exe").display()
+            ),
+            MB_ICONINFORMATION,
+        );
+    }
+}
+
+/// True when a panel is already running, so it must not be started twice.
+fn panel_running() -> bool {
+    let class = wide("BetterSearchWindow");
+    // SAFETY: NUL-terminated class name; a null title matches any window of that class.
+    !unsafe { FindWindowW(class.as_ptr(), null()) }.is_null()
+}
+
+/// Starts the panel as this process's own user, which is what the unelevated setup path
+/// does. The panel inherits the normal user rights, so no token work is needed.
+fn launch_panel_here(dir: &Path) -> io::Result<()> {
+    if panel_running() {
+        return Ok(());
+    }
+    std::process::Command::new(dir.join("bs-window.exe"))
+        .spawn()
+        .map(|_| ())
+}
+
+/// Starts the panel with the signed-in user's token, for the case where the setup program
+/// itself is elevated. `CreateProcessWithTokenW` can refuse a shell token with
+/// ERROR_ACCESS_DENIED, which is why the ordinary path above avoids it.
+fn launch_panel_with_shell_token(dir: &Path) -> io::Result<()> {
+    if panel_running() {
+        return Ok(());
+    }
+    let shell = unsafe { GetShellWindow() };
+    if shell.is_null() {
+        return Err(io::Error::other("no signed-in desktop is available"));
+    }
+    let mut pid = 0u32;
+    // SAFETY: the window handle came from GetShellWindow; `pid` is a valid out pointer.
+    unsafe { GetWindowThreadProcessId(shell, &mut pid) };
+    if pid == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the id is a live process and the access right only allows reading about it.
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let outcome = (|| {
+        let mut token: HANDLE = null_mut();
+        // SAFETY: `process` is a live handle; the token is closed below.
+        if unsafe { OpenProcessToken(process, TOKEN_DUPLICATE | TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut primary: HANDLE = null_mut();
+        // SAFETY: the token is live, and `primary` receives a duplicate closed below.
+        let duplicated = unsafe {
+            DuplicateTokenEx(
+                token,
+                TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY,
+                null(),
+                SecurityImpersonation,
+                TokenPrimary,
+                &mut primary,
+            )
+        };
+        // SAFETY: the token came from OpenProcessToken and is closed once.
+        unsafe { CloseHandle(token) };
+        if duplicated == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = start_as_user(primary, dir);
+        // SAFETY: the duplicate token is closed once.
+        unsafe { CloseHandle(primary) };
+        result
+    })();
+    // SAFETY: the process handle came from OpenProcess and is closed once.
+    unsafe { CloseHandle(process) };
+    outcome
+}
+
+fn start_as_user(token: HANDLE, dir: &Path) -> io::Result<()> {
+    let program = dir.join("bs-window.exe");
+    let application = wide_path(&program);
+    // CreateProcessWithTokenW may write to the command line, so it needs its own buffer.
+    let mut command = wide_path(&program);
+    let desktop = wide("winsta0\\default");
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        lpDesktop: desktop.as_ptr() as *mut u16,
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: the token is a live primary token, both strings are NUL-terminated and
+    // outlive the call, and the two handles it fills in are closed below.
+    let started = unsafe {
+        CreateProcessWithTokenW(
+            token,
+            LOGON_WITH_PROFILE,
+            application.as_ptr(),
+            command.as_mut_ptr(),
+            0,
+            null(),
+            null(),
+            &startup,
+            &mut info,
+        )
+    };
+    if started == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both handles were filled in by the successful call and are closed once.
+    unsafe {
+        CloseHandle(info.hThread);
+        CloseHandle(info.hProcess);
+    }
+    Ok(())
 }
 
 struct Sc(windows_sys::Win32::System::Services::SC_HANDLE);
@@ -605,13 +786,14 @@ fn install() -> io::Result<()> {
         }
         registered
     })();
-    if outcome.is_err() {
+    if let Err(err) = outcome {
         for file in created.into_iter().rev() {
             let _ = std::fs::remove_file(file);
         }
         let _ = std::fs::remove_dir(&dir);
+        return Err(err);
     }
-    outcome
+    Ok(())
 }
 
 /// Asks a running search panel to exit before the files are removed, so its program image
@@ -721,25 +903,89 @@ fn uninstall() -> io::Result<()> {
     }
 }
 
+/// Prints to the console this program was started from, if there is one. A program built
+/// without a console subsystem has no working standard output even after attaching, so the
+/// console is opened by name. Returns false when there is no console to print to.
+fn print_console(text: &str) -> bool {
+    // SAFETY: asks for the console of the program that started this one.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        return false;
+    }
+    let name = wide("CONOUT$");
+    // SAFETY: the name is NUL-terminated; the handle is closed below.
+    let console = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_WRITE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if console.is_null() || console == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let mut written = 0u32;
+    // SAFETY: the buffer holds `utf16.len()` code units and the handle is live.
+    unsafe {
+        WriteConsoleW(
+            console,
+            utf16.as_ptr(),
+            utf16.len() as u32,
+            &mut written,
+            null(),
+        )
+    };
+    // SAFETY: the handle came from CreateFileW and is closed once.
+    unsafe { CloseHandle(console) };
+    true
+}
+
+/// `--inspect` says what the setup program would install and changes nothing. It borrows
+/// the console it was started from; with none (a double-click) the same text is shown in a
+/// message box, because this program has no console of its own.
+fn inspect() {
+    let mut text = format!("better_search setup {}\n", env!("CARGO_PKG_VERSION"));
+    match install_dir() {
+        Ok(dir) => text.push_str(&format!("Install folder: {}\n", dir.display())),
+        Err(err) => text.push_str(&format!("Install folder: unavailable ({err})\n")),
+    }
+    for &(name, bytes) in &FILES {
+        text.push_str(&format!("{name}: {} bytes\n", bytes.len()));
+    }
+    text.push_str("Inspect does not install, elevate or modify the machine.\n");
+    if !print_console(&text) {
+        note("better_search setup", &text, MB_ICONINFORMATION);
+    }
+}
+
+/// The ordinary double-click path. The machine changes need an administrator, so they run
+/// in an elevated copy of this program; this copy stays unelevated, waits for that to
+/// finish, and then starts the search panel as the user. The panel is registered to start
+/// at sign-in, which on its own would leave a fresh install with nothing to press Alt+Space
+/// in until then. A setup program that is already elevated does the install itself and
+/// falls back to borrowing the shell's token for the panel.
+fn install_entry() -> io::Result<()> {
+    if elevated().unwrap_or(false) {
+        install()?;
+    } else {
+        request_elevation("--install-elevated")?;
+    }
+    start_panel(&install_dir()?);
+    Ok(())
+}
+
 fn main() {
     let command = std::env::args().nth(1);
+    if command.as_deref() == Some("--inspect") {
+        inspect();
+        return;
+    }
     let result = match command.as_deref() {
-        Some("--inspect") => {
-            println!("better_search setup {}", env!("CARGO_PKG_VERSION"));
-            println!("Install folder: {:?}", install_dir());
-            for &(name, bytes) in &FILES {
-                println!("{name}: {} bytes", bytes.len());
-            }
-            println!("Inspect does not install, elevate or modify the machine.");
-            Ok(())
-        }
-        None => {
-            if elevated().unwrap_or(false) {
-                install()
-            } else {
-                request_elevation("--install-elevated")
-            }
-        }
+        None => install_entry(),
         Some("--install-elevated") => {
             if elevated().unwrap_or(false) {
                 install()
@@ -773,7 +1019,11 @@ fn main() {
         )),
     };
     if let Err(err) = result {
-        eprintln!("better_search setup: {err}");
+        note(
+            "better_search setup",
+            &format!("better_search setup could not finish.\n\n{err}"),
+            MB_ICONERROR,
+        );
         std::process::exit(1);
     }
 }

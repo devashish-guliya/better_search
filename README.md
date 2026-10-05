@@ -220,6 +220,11 @@ What the draft does if it is run:
   `%ProgramFiles%\better_search`, and copies itself there as the uninstaller.
 - Registers and starts `better_search` as an auto-start service running as LocalSystem,
   and adds a machine-wide `Run` entry that starts `bs-window.exe --hidden` at sign-in.
+- **Starts the search panel at the end of the install**, unelevated, so Alt+Space and Win+S
+  work immediately rather than after the next sign-in. If that cannot be done it says so
+  and names the program to start by hand.
+- The setup program has no console: it reports a failure in a message box instead of
+  printing to a window that closes.
 - Refuses to install when the registration exists, and rolls back files, service and
   registry entries if any step fails. A leftover folder from an uninstall (which holds
   nothing but our own files) is cleared and reused, so a reinstall does not need a
