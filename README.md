@@ -277,10 +277,12 @@ local HTTP server is accepted for `localhost` only).
 To publish a release, raise `version` in the workspace `Cargo.toml`, then:
 
 ```powershell
-.\tools\release.ps1 -Version 0.2.0
+.\tools\release.ps1 -Version 0.3.0
 ```
 
-The script builds the release binaries and the setup program, writes `latest.txt` with
+The script sets the setup program's version to match (it is built outside the workspace,
+so it cannot inherit), builds the release binaries and the setup program, writes
+`latest.txt` with
 the new installer's digest, and creates the GitHub release with both files attached.
 Because the manifest URL uses `releases/latest`, no address has to change between
 releases. Nothing is code signed, so the installer still triggers a SmartScreen warning,

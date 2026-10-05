@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated with release `v0.2.1`. `docs/HANDOFF.md` is a shorter, self-contained summary
+Last updated with release `v0.2.3`. `docs/HANDOFF.md` is a shorter, self-contained summary
 of this record for starting a new chat.
 
 Current state, in short:
