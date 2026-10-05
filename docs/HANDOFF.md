@@ -519,8 +519,6 @@ Run `git log --oneline` for the full list of 36 commits.
 - **Installer:** code signing, and a version or update check.
 - Showing results during the very first scan (about a minute): not decided.
 - More filters (for example folders only). `ext:` and `in:` already exist.
-- The header of `docs/PROJECT.md` still describes the state at `06ce1f7`. Its body is
-  current up to `438c7da`.
 - Watch in daily use:
   - typing in Start on slower machines (the 500 ms wait for Start to close);
   - the Explorer scope with virtual folders (they give no scope);

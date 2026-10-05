@@ -4,17 +4,35 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated after commit `06ce1f7` ("Show live resource stats in the search window"). The
-working tree then removed that temporary stats display (back to protocol v1 only) and
-added the Phase 5 installer (section 8), which was installed, searched with and
-uninstalled once end to end on the development machine with the user's approval.
+Last updated after commit `438c7da` ("Fix typing crash on empty text; turn off Windows
+search; typing in Start opens better_search"). `docs/HANDOFF.md` is a shorter,
+self-contained summary of this record for starting a new chat.
 
-The temporary live resource display added at `06ce1f7` was removed at the
-user's request before packaging. Its isolated test measured 24.1 MiB combined
-private memory (21.8 MiB service + 2.3 MiB UI) and 6.9 MiB for the snapshot,
-log and three release binaries (`target/admin_run/stats_client.txt`). That test
-did not alter the user's existing snapshot in `C:\ProgramData\better_search`.
-The service and window once again use only the version 1 search protocol.
+Current state, in short:
+
+- Phases 1–5 are done. These are the index, live updates, the background service with
+  its pipe and privacy rules, the native search window, and the installer.
+- Since the installer, the work has gone into the window. better_search now replaces
+  Windows Start and Explorer search:
+  - app-first ranking and open history;
+  - Microsoft Store apps, real icons and thumbnails;
+  - a redesigned two-line results list;
+  - the `ext:` and `in:` filters;
+  - Settings pages and power commands;
+  - Win+S, scoped to the Explorer folder in front;
+  - typing in Start;
+  - turning Windows search off (section 5.11).
+- The pipe protocol is **version 2**. Version 2 adds the options byte and a hidden-match
+  count, so system and app-folder matches are hidden by default (`78efd7a`). The skip
+  rules are version 8.
+- On the development machine, better_search is installed in
+  `C:\Program Files\better_search` and its service is running. Windows search is
+  turned off there (`DisableSearch` policy set, `WSearch` disabled).
+
+The temporary live resource display added at `06ce1f7` was removed at the user's
+request before packaging (`f8bee52`). Its isolated test measured 24.1 MiB of combined
+private memory (21.8 MiB service, 2.3 MiB window) and 6.9 MiB on disk for the
+snapshot, the log and the three release binaries (`target/admin_run/stats_client.txt`).
 
 ---
 
@@ -28,6 +46,11 @@ The fastest and leanest file and folder **name** search for Windows:
 - One-click install, and instant access from anywhere: a tray icon, the **Alt+Space**
   hotkey, and a hover zone at the right screen edge that slides the search panel in.
 - Target users: ordinary people with 1–2 TB drives, not only developers.
+
+- Since Phase 5, it also replaces Windows Start and Explorer search. It finds apps
+  (Store apps too), Settings pages and power commands. It opens on Win+S, scoped to the
+  Explorer folder in front, and when the user types in Start. It can turn Windows
+  search off.
 
 Out of scope: searching file **contents**. Only names are searched.
 
@@ -60,6 +83,25 @@ Out of scope: searching file **contents**. Only names are searched.
 | `734b61b` | Memory-only removable FAT-family indexes, fixture tests, and final fixed-drive service measurements |
 | `ba13883` | Record the removable support commit in project history |
 | `06ce1f7` | Read-only version 2 stats request and temporary live memory/disk display in the search window |
+| `b316126` | Record the live stats commit |
+| `f8bee52` | Remove the temporary live stats display again |
+| `d7c94e5` | Phase 5 installer (`tools/installer`) and its docs |
+| `68a0707` | Record the Phase 5 install/uninstall end-to-end test |
+| `05564b7` | Modern look for the window, still pure Win32 (manifest, colours, fonts) |
+| `c1f59ac` | Rank app-like matches first and quiet developer clutter |
+| `aceea11` | Demote program internals and boost Start Menu shortcuts |
+| `58e16ad` | Open history (frecency): files the user opens rank higher |
+| `7663a83` | Word-initial (acronym) matching for short searches |
+| `03a2ecb` | Start Menu and installer ranking tuned on the real index |
+| `78efd7a` | Pipe protocol v2: system and app-folder matches hidden by default (Ctrl+H); history seeded from Windows Recent |
+| `841e4dc` | Rank by kind (apps, documents, media, folders, code); exact names win |
+| `a66bb7a` | Folder-word matching, `ext:` filter, ranking fixes |
+| `334c87b` | App display names, real icons and thumbnails |
+| `890f744` | Microsoft Store apps through `shell:AppsFolder`; WindowsApps counted as app files |
+| `3fef8b5` | Window redesign: two-line owner-drawn rows, sections, highlights, `draw.rs` |
+| `0310085` | Win+S hook, `in:` folder scope from Explorer, Settings pages and power commands |
+| `438c7da` | Typing crash fix, Windows search off/on with a SearchHost watcher, typing in Start |
+| `ec30dde` | `docs/HANDOFF.md` |
 
 ## 4. Current results on the development machine
 
@@ -237,7 +279,7 @@ number, so each volume needs "record number → entry":
 - `Normal`: everything else.
 
 The class is stored in three flag bits (two at bits 2–3, one at bit 6) so older saved
-indexes read the same. `SKIP_RULES_VERSION` is 5, which triggers one rescan.
+indexes read the same. `SKIP_RULES_VERSION` is 8; each change to it triggers one rescan.
 
 A child inherits its parent's class unless its own name changes it. The classes are
 recomputed when folders move.
@@ -296,7 +338,7 @@ snapshot size, start time and search time several times over.
 stays searchable (you can still find `node_modules` or `WinSxS`). A skipped folder has
 the `SKIPPED` flag; nothing below it is in the index.
 
-**Rules** (all in `crates/index/src/lib.rs`), current version `SKIP_RULES_VERSION = 3`:
+**Rules** (all in `crates/index/src/lib.rs`), current version `SKIP_RULES_VERSION = 8` (versions 4–8 added the location and app-file rules described in 5.2 and 5.11):
 
 1. **Drive roots:** folders starting with `$` (like `$Recycle.Bin`) and
    `System Volume Information`.
@@ -715,11 +757,12 @@ and reports a clear message when the service is not running.
   current user's `HKCU\...\Run` value, starts the panel hidden in the tray, and requires
   no admin rights. The current service
   drives are listed as fixed NTFS candidates, not presented as an editable filter.
-- The clutter safety net is **deferred by user decision**. The v1 index has no entries
+- The clutter safety net is **deferred by user decision**. The index has no entries
   inside skipped folders, so neither a per-query skipped-result count nor a per-folder
   unskip toggle can honestly work without more backend state. The settings page explains
-  this instead of displaying invented counts. Pipe version 1, the index arrays, flags,
-  snapshot format and clutter rules are unchanged.
+  this instead of displaying invented counts. The window features above did not change
+  the index arrays, flags or snapshot format. The pipe moved to version 2 only for the
+  hidden-match option (`78efd7a`).
 
 ---
 
@@ -766,7 +809,7 @@ and reports a clear message when the service is not running.
 | One persistent window connection and a worker thread | Type-ahead narrowing works across keystrokes, and blocking pipe I/O cannot freeze input or painting |
 | Virtual list and cached shell system icons | Only visible rows request text/icons; an extension-level cache avoids filesystem I/O and a per-result icon allocation |
 | Per-user settings, not service configuration | Hotkey/hover/startup need no admin rights; changing service-wide indexed drives requires a separate backend design |
-| No fake skipped-folder count or drive filtering in the UI | Protocol v1 cannot return skipped contents or search a subset of drives accurately; the user explicitly deferred the locked protocol/index changes |
+| No fake skipped-folder count or drive filtering in the UI | The protocol cannot return skipped contents or search a subset of drives accurately; the user explicitly deferred the locked protocol/index changes |
 
 ## 7. Locked in (do not change without discussing)
 
@@ -788,7 +831,7 @@ and reports a clear message when the service is not running.
 - The service runtime: LocalSystem, started by the SCM, machine-wide data folder,
   log file at 1 MB with one old copy, `--console` for testing, "loading" replies while
   the index is not ready, save on stop and no save on shutdown.
-- The pipe: `\\.\pipe\better_search`, message-mode protocol version 1, limit capped at
+- The pipe: `\\.\pipe\better_search`, message-mode protocol version 2 (bump `VERSION` on change), limit capped at
   1000 hits, remote clients rejected, `INTERACTIVE` users may read and write but not
   create instances, the pipe is owned by Administrators and clients refuse any other
   owner than SYSTEM or Administrators.
@@ -945,7 +988,7 @@ but remain untested end to end.
 
 **Deferred by user decision:** the skipped-folder result count and per-folder
 overrides. Neither the pipe protocol nor index model may change for this increment.
-The current v1 index knows the skipped folder names, but not the names/counts under
+The current index knows the skipped folder names, but not the names/counts under
 them. A correct on-demand option needs a versioned request/reply, bounded subtree
 indexing or traversal outside the keystroke path, per-user override state, live
 change handling, snapshot compatibility, and the same privacy filtering for both
