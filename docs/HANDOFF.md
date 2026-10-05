@@ -8,10 +8,10 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.6` (2026-10-05). The tree is clean, 143
-workspace tests and 8 installer tests pass, and the code is on GitHub with seven
-releases published. Nothing of better_search is installed on this machine; see
-"Current installed state" below.
+State at writing: branch `main`, released as `v0.2.6` (2026-10-05). The settings page was
+redesigned after the release (`bc202d8`): 147 workspace tests and 8 installer tests pass,
+and the code is on GitHub with seven releases published. better_search 0.2.6 is installed
+and running on this machine; see "Current installed state" below.
 
 ---
 
@@ -51,17 +51,18 @@ Ask before big or machine-wide decisions.
 
 ### Current installed state (important)
 
-- better_search is **not installed** on this machine (2026-10-05). The 0.2.5 install was
-  removed with its own uninstaller, which was the last end-to-end test of the removal:
-  the folder in `C:\Program Files`, the service, the `Run` value, the Apps & Features
-  entry, `%ProgramData%\better_search` (index and log) and `%LOCALAPPDATA%\better_search`
-  (settings and history) are all gone, and nothing of better_search is left in the
-  registry or on disk.
-- **Windows search is ON on this PC**, which is the state an uninstall must always leave
-  behind: the `DisableSearch` policy is absent, `WSearch` runs as delayed-auto and its
-  indexer is rebuilding its index. It was off (and its index removed) just before the
-  uninstall, so the uninstaller's restore was exercised for real. Turning it off is one
-  click in Settings, or Yes on the first-run offer.
+- better_search **0.2.6 is installed and running** on this machine (the user installed the
+  release built earlier on 2026-10-05). The service answers searches (about 15 MB working
+  set, a 4 MB index for about 573,000 files) and **Windows search was turned off through
+  the panel** (the `DisableSearch` policy is set and `windows_search_asked=true`). The
+  installed copy is the released 0.2.6, not the working tree; upgrades go through the
+  panel's Check for updates button or by running the new installer.
+- The 0.2.5 install had earlier been removed with its own uninstaller, which was the last
+  end-to-end test of the removal: the folder in `C:\Program Files`, the service, the `Run`
+  value, the Apps & Features entry, `%ProgramData%\better_search` (index and log) and
+  `%LOCALAPPDATA%\better_search` (settings and history) are all gone, and nothing of
+  better_search is left in the registry or on disk. The uninstaller also returned Windows
+  search to on, so the restore path was exercised for real.
 - Releases so far: 0.2.0 (first public), 0.2.1 (leftover cleanup), 0.2.2 (clean
   uninstall), 0.2.3 (quit the panel so its image is released), 0.2.4 (start the panel
   after install), 0.2.5 (the offer quoted measured numbers, and turning Windows search off
@@ -267,7 +268,8 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 
 | File | What it does |
 |---|---|
-| `main.rs` (about 2,550 lines) | The `App` struct, window procedure, layout, settings page, tray, hotkey, scope chip, message handlers, opening results, `main()` arguments |
+| `main.rs` (about 3,100 lines) | The `App` struct, window procedure, layout, tray, hotkeys, scope chip, message handlers, opening results, `main()` arguments |
+| `settings_page.rs` | The settings page's layout and painting: rows, cards, switches, chevrons, notes, the hotkey band and its capture state |
 | `search.rs` | Worker thread with a persistent `bs_pipe::Client`; coalesces edits and drops stale replies with a serial number |
 | `draw.rs` | Visual system: spacing and type scales, Segoe UI Variable, Fluent icon glyphs, light/dark colour roles, accent colour, the safe `text()`/`text_width()` helpers |
 | `rows.rs` | Row model: `Kind` (App, Folder, Document, Media, Settings, Other...), sections and grouping, match highlighting |
@@ -395,14 +397,12 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   postponed until the sizes reading for Settings arrives. **"No" is the default button**
   (`MB_DEFBUTTON2`): the change is machine-wide, so not choosing is not choosing yes. A
   test pins that the wording has no numbers in it.
-- One-click button: the label says what the press will do ("Turn Windows search off (asks
+- One-click row: the label says what the press will do ("Turn Windows search off (asks
   for admin)" or "Turn Windows search back on (asks for admin)"), depending on the current
-  state (control id `SETTINGS_WINDOWS_SEARCH` 321, `controls[2]`, the first control under
-  the hotkey field). A press calls `winsearch::request` at once and then
-  `winkey::set_search_off`; nothing about it goes through Save. A press that freed the disk
-  space shows "Windows search is off, and its index files are gone"; one that did not says
-  so and names the folder. Both settings rows that need two lines are listed in
-  `SETTINGS_TALL_ROWS` (`8` and the footprint row `9`).
+  state, with a chevron instead of a button. A press calls `winsearch::request` at once and
+  then `winkey::set_search_off`; nothing about it goes through Save. A press that freed the
+  disk space shows "Windows search is off, and its index files are gone"; one that did not
+  says so and names the folder.
 - **Watcher:** an `EVENT_SYSTEM_FOREGROUND` WinEvent hook (`foreground_changed`). If
   `SearchHost.exe` comes to the front while search is off, the hook ends it and opens
   better_search (`WM_WIN_S`).
@@ -428,6 +428,39 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   idle with a fresh index, 29 MB while rebuilding, and 34.3 MB of index files for a full
   index (10-11.5 MB after a rebuild). The disk comparison is index against index, which is
   what grows with the number of files.
+
+### 5.10 The settings page (`settings_page.rs`, redesigned 2026-10-05)
+
+- The page is **fully parent-drawn** in the search panel's design language; there are no
+  native controls on it any more. `build()` lays out `Line`s top to bottom (headings,
+  toggle rows, action rows, wrapped notes), measures wrapped notes with the caller's
+  device context, and records the hotkey band's rect, the back button and the title.
+- `paint()` draws rounded cards (edge outside, surface inside), the section headings in
+  the small caps font, Windows 11-style switches (accent pill with a white knob when on),
+  chevrons on action rows, the back arrow (`E72B`) and title, and the hotkey band drawn
+  like the search field. Everything shifts up by the scroll offset; lines that have
+  scrolled away are not drawn.
+- **Instant apply:** a toggle click or Enter applies at once (`apply_toggle`) and saves;
+  there is no Save button and nothing to lose.
+- **Hotkey capture is hand-written.** Clicking the band (or pressing Enter on it) starts
+  the capture: the band shows "Press the keys…", the keys held so far ("Ctrl + Shift"),
+  or a hint ("Use Ctrl, Alt, Shift or Win with another key." / "That hotkey is already in
+  use. Choose another."), with the search field's accent underline while capturing. The
+  main window's `WM_KEYDOWN` and `WM_SYSKEYDOWN` feed `capture_key`; Escape cancels;
+  modifiers only update the prompt. A final key applies at once
+  (`apply_captured_hotkey`): valid combos need a modifier or an F1-F24 alone
+  (`valid_combo`); a failed `RegisterHotKey` puts the old combination back and explains
+  in the band. `WM_SYSCHAR` and `WM_SYSCOMMAND SC_KEYMENU` are swallowed on the page, or
+  Alt+Space opens the window's system menu instead of finishing the capture.
+  `hotkey_name` writes the combination the way Windows does ("Ctrl + Shift + K"), and
+  Win-key combinations now work (the old `msctls_hotkey32` control could not capture
+  them and ignored the theme).
+- **Keyboard and wheel:** Up/Down move the cursor over rows (headings and notes are
+  skipped, and the view scrolls just enough to keep the row on screen), Enter or Space
+  activates, Escape goes back to the search field; the wheel scrolls by a row.
+- Three tests pin the layout: lines stack without gaps or overlap, every row is
+  reachable by hit-testing, and a switch holds its state in its row; two more pin
+  `hotkey_name` and `valid_combo`.
 
 
 ### 5.7 Updates (`update.rs`) and releases
@@ -603,7 +636,7 @@ cargo test --workspace
 cargo build --release
 ```
 
-143 tests: index 37, query 38 (3 drive-root tests included), window 29, service 14,
+147 tests: index 37, query 35 plus 3 drive-root tests, window 33, service 14,
 engine 9, pipe 9, cli 4, ntfs 3.
 The installer crate has 8 more (its own `--manifest-path`).
 
@@ -675,6 +708,7 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| `bc202d8` | Settings redesigned in the search panel's design language: parent-drawn page, switches, hand-written hotkey capture |
 | `e310679` | Search finds the drives by letter or `c:`; the first-run offer is short and plain; version 0.2.6 |
 | `3021d1a` | The offer quotes measured numbers, and turning Windows search off frees its index; version 0.2.5 |
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |

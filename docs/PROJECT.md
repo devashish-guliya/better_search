@@ -127,6 +127,7 @@ Out of scope: searching file **contents**. Only names are searched.
 | `16640cb` | Start the panel after install, wait for elevation, report in message boxes; version 0.2.4 |
 | `3021d1a` | The first-run offer quotes measured numbers, turning Windows search off frees its index, the uninstall restores search and removes per-user data; version 0.2.5 |
 | `e310679` | Search finds the drives by letter or `c:`, and the first-run offer is short and plain; version 0.2.6 |
+| `bc202d8` | Settings redesigned in the search panel's design language: parent-drawn page, switches, hand-written hotkey capture |
 
 ## 4. Current results on the development machine
 
@@ -873,6 +874,43 @@ live on in **Settings**, where the user can check them against Task Manager.
 - **A dismissed UAC prompt is reported.** It used to exit silently, which looked exactly
   like a program that had stopped for no reason. It now says the prompt was dismissed and
   nothing was changed.
+
+### 5.11b The settings page redesigned in the panel's language (2026-10-05)
+
+The settings page was a flat column of twelve native controls (statics, checkboxes, a
+`msctls_hotkey32` field and plain buttons) while the search panel above it is rounded,
+accented and dark. The page now draws itself with `draw.rs`'s visual system and has no
+native controls at all.
+
+- **Layout as data.** `settings_page.rs` builds a list of `Line`s (section headings,
+  toggle rows, action rows, wrapped notes) from the current settings, plus the hotkey
+  band's rect, the back button and the title. Notes are measured through a caller-supplied
+  closure, so the module stays free of device contexts; three tests pin the geometry
+  (no gaps or overlaps, every row reachable by hit-testing, switch state in its row).
+- **Painting.** Rounded cards (edge stroke outside, surface fill inside), small-caps
+  section headings, two-line rows, Windows 11-style switches (accent pill, white knob),
+  chevrons on action rows, a back arrow and title, and wrapped notes. The page scrolls
+  under the wheel, the keyboard and clicks, shifting every rect by the offset.
+- **Instant apply.** There is no Save button: a switch applies and saves the moment it is
+  pressed, like the old one-click Windows search row.
+- **The hotkey field is hand-written.** The old `msctls_hotkey32` control drew its own
+  white box that ignored the dark theme, and when the page scrolled it stayed behind at
+  its old position (native children do not move with parent-drawn content). The band now
+  draws itself like the search field and captures the combination in the main window's
+  `WM_KEYDOWN`/`WM_SYSKEYDOWN`: Escape cancels, modifiers only update the prompt, and a
+  final key either becomes the hotkey (registered and saved at once) or explains itself in
+  the band. A combo needs a modifier, or is one of F1-F24 alone; a failed
+  `RegisterHotKey` puts the old one back. `WM_SYSCHAR` and `WM_SYSCOMMAND SC_KEYMENU` are
+  swallowed on the page, or finishing an Alt+Space capture opened the window's system menu
+  instead. `hotkey_name` writes combos as Windows does ("Ctrl + Shift + K"), and Win-key
+  combinations now work, which the old control could not capture.
+- **Keyboard.** Up/Down move the cursor across rows (headings and notes are skipped, the
+  view scrolls just enough to keep it visible), Enter and Space activate, Escape goes back
+  to the search field.
+- **Verified live** on the development machine: the page renders in light and dark, scrolls
+  to the bottom (no stranded controls), the capture flow took Ctrl+Alt+L and restored
+  Alt+Space through the same path (`window.cfg` checked at each step, and no system menu),
+  and a posted click on the Win+S switch flipped it off and back on.
 
 ### 5.12 Updates (`crates/ui/src/update.rs`)
 
