@@ -89,6 +89,9 @@ search box and the result list, and a Segoe UI Variable font.
 Results include matching file and folder **names**, with their full location in the
 Path column. Enter opens the selected item, including an app's `.exe` or a shortcut
 when that file is indexed. Contents of skipped clutter folders are absent by design.
+Drives are results too: a letter, with or without the colon (`c`, `c:`), finds the
+drive itself, shown under its volume label with the shell's drive icon, and Enter
+opens it in Explorer.
 
 With several words, a word the name lacks may match a folder above it instead:
 `acme contract` finds `Clients\Acme\Contract.pdf` (below files whose own name holds both
@@ -102,12 +105,15 @@ search field; Backspace at the start of the field removes the chip and searches
 everything again. Letters and digits typed while Start is open close Start and go to
 better_search instead.
 
-The first time the panel opens after the first scan finishes, while Windows search is still
-on, it shows what the change saves. The numbers are measured on your PC at that moment,
-not claimed: what Windows search is using in memory and keeping as index files on disk,
-and what better_search costs beside it (its index, its memory, and how many files and
-folders it already searches). A number that cannot be measured is left out of the sentence
-rather than guessed. The answer is remembered, and Settings shows the same figures later.
+The first time the panel opens, while Windows search is still on, it asks one plain
+question: do you want to turn off the Windows indexing of your files? It explains in two
+sentences what indexing is (Windows keeps a list of your files so its search can find
+them; better_search already keeps its own, smaller and faster list), what saying yes
+would cost (programs that search inside documents, such as Outlook, would search more
+slowly), and that one click in Settings turns indexing back on. "No" is the default
+answer, and the question is asked once. Settings also shows what each side costs on this
+PC, measured live: what Windows search uses in memory and keeps as index files, beside
+better_search's own figures.
 
 The gear's one-click switch does the same thing: it asks for admin, sets the
 `DisableSearch` policy, disables the `WSearch` service, closes `SearchHost.exe` and

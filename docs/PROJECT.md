@@ -26,15 +26,18 @@ Current state, in short:
 - The pipe protocol is **version 2**. Version 2 adds the options byte and a hidden-match
   count, so system and app-folder matches are hidden by default (`78efd7a`). The skip
   rules are version 8.
+- Searching a letter or `c:` now finds the drive itself: pass 2 no longer drops volume
+  roots, and the window names them from the volume's label and opens them in Explorer.
 - On the development machine, better_search is **not installed** (2026-10-05). The last
   install (0.2.5) was removed with its own uninstaller to test the removal end to end, and
   the machine was left with **Windows search on** (`DisableSearch` policy absent,
   `WSearch` running and rebuilding its index), which is the state an uninstall must always
   leave behind.
 - Since 0.2.5, the panel shows what each side costs, measured live: the service answers a
-  read-only sizes request, and the first-run offer quotes Windows search's own memory and
-  index size next to better_search's, waiting for the first scan so the figures are real
-  (section 5.11a).
+  read-only sizes request, and Settings quotes Windows search's own memory and index size
+  next to better_search's (section 5.11a). The first-run offer itself no longer quotes
+  numbers: it is three plain sentences that explain what indexing is, ask the question,
+  and name the cost and the undo, with "No" as the default answer.
 
 The temporary live resource display added at `06ce1f7` was removed at the user's
 request before packaging (`f8bee52`). Its isolated test measured 24.1 MiB of combined
@@ -448,6 +451,13 @@ the `SKIPPED` flag; nothing below it is in the index.
   folders +3, hidden −20. Each thread keeps only the best `limit` hits in a small heap,
   so the full match list is never built, even for millions of matches. Ties go to the
   lower entry number, so results are deterministic.
+- **Drive roots are results.** A volume root (`C:`) has no parent entry, and pass 2 used
+  to drop every parentless entry ("not useful results"), so no drive could ever be found.
+  A root now passes like any folder when its own name carries every term (`c`, `c:`); it
+  never borrows folder words, because it has no folders above it, and it is not below its
+  own `in:` scope (`in:"D:\"` keeps entries below D:, not D: itself). The window shows the
+  volume's label ("Data (D:)", or "Local disk (C:)" when it has none), the shell's drive
+  icon, and a second line saying the drive kind; Enter opens the drive in Explorer.
 - **Acronym fallback:** a query of one ASCII word, 2–6 letters, with fewer than 5,000
   ordinary matches also finds names whose word initials spell it exactly (extension
   ignored; words split at non-alphanumeric characters and camelCase). `vsc` finds
@@ -807,9 +817,12 @@ elevated path at once instead of waiting for Save. An `EVENT_SYSTEM_FOREGROUND` 
 ### 5.11a Saying what each one costs, and freeing the disk space (0.2.5)
 
 The first-run offer used to explain Windows search's *architecture*: a background
-indexer, its own database, machine-wide reach. That was accurate and hard to act on. It
-now says what the change is worth **on this PC**, in numbers, and it takes the disk space
-seriously.
+indexer, its own database, machine-wide reach. That was accurate and hard to act on. So
+the offer next quoted what the change is worth **on this PC**, in measured numbers. Both
+editions were still too long, and the numbers made the dialog about us rather than about
+the question. The offer is now three plain sentences (see 5.6's "First-run offer" in the
+hand-off): what indexing is, the question, the cost and the undo. The measured numbers
+live on in **Settings**, where the user can check them against Task Manager.
 
 - **Measured, not claimed.** The service answers a read-only sizes request (section 5.8)
   and is the only part of better_search with the rights to read Windows' own search
@@ -817,12 +830,11 @@ seriously.
   Manager's Memory column shows, so a user can check it) and walks
   `C:\ProgramData\Microsoft\Search` for its index size. A figure it cannot get is reported
   as unknown, never as zero, and the panel's text leaves a sentence out rather than
-  filling it with a guess. `offer_text` has tests for the full, partial and absent cases.
-- **The offer waits for the first scan.** `stats::start` asks every 3 s (60 tries at most)
-  and the dialog opens on the first `Status::Ok`, so a machine still scanning shows the
-  offer with no numbers instead of numbers taken from a half-built index. The same reply
-  fills the Settings line, which is measured once per start and again after a Windows
-  search switch.
+  filling it with a guess.
+- **Settings waits for its numbers; the offer does not.** `stats::start` asks every 3 s
+  (60 tries at most) and fills the Settings line once per start and again after a Windows
+  search switch. The offer shows when the panel first opens visible and idle; it no
+  longer waits for a reading, because its text has no numbers in it.
 - **Measured on this PC** (2026-10-05, 574 K entries, Ryzen 5 3500U): the service uses
   20-21 MB private, 25-29 MB working set just after a scan, and Windows trims it to 0.8 MB
   when idle; its index is 4.2 MB on disk and 17.6 MB in memory. `SearchIndexer` uses
@@ -832,8 +844,8 @@ seriously.
   background indexing, and the disk space. The text therefore states both sets of numbers
   without a comparison it cannot support.
 - **The disk comparison is index against index**, because that is what grows with the
-  number of files. The offer says "keeping 34 MB of index files" for Windows search and
-  "keeps a 4 MB index" for better_search, and never claims the programs are free.
+  number of files. The Settings line quotes "34 MB of index files" for Windows search and
+  "a 4 MB index" for better_search, and never claims the programs are free.
 - **Turning Windows search off now frees the space.** The policy and the stopped service
   freed no disk: the index files stayed. `clear_index()` removes the contents of
   `C:\ProgramData\Microsoft\Search\Data` and keeps the folders, so Windows' own

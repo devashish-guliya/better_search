@@ -663,14 +663,19 @@ fn rank(
                         continue;
                     }
                     let entry = base + k as u32;
-                    // Volume roots ("C:") are not useful results.
-                    let Some(parent) = index.parent(entry) else {
-                        continue;
-                    };
+                    let parent = index.parent(entry);
                     // Terms missing from the name must appear in the folders above it.
+                    // A volume root ("C:") has none, so its own name must carry every
+                    // term; folder words deliberately never count the root itself.
                     if !masks.is_empty() {
                         let mask = masks[name_id as usize];
-                        if mask != full && mask | folders.get(index, masks, parent).mask != full {
+                        let complete = match parent {
+                            Some(p) => {
+                                mask == full || mask | folders.get(index, masks, p).mask == full
+                            }
+                            None => mask == full,
+                        };
+                        if !complete {
                             continue;
                         }
                     }
@@ -679,7 +684,9 @@ fn rank(
                             top.hidden += 1;
                         } else {
                             top.push(final_score(name_score, f), entry, || {
-                                folders.get(index, masks, parent).depth.saturating_add(1)
+                                parent
+                                    .map_or(0, |p| folders.get(index, masks, p).depth)
+                                    .saturating_add(1)
                             });
                         }
                     }

@@ -33,7 +33,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
     ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
 };
-use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, GetDriveTypeW, GetVolumeInformationW,
+};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
     DRAWITEMSTRUCT, EM_SETMARGINS, HKM_GETHOTKEY, HKM_SETHOTKEY, ICC_HOTKEY_CLASS,
@@ -69,17 +71,17 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW, EN_CHANGE,
     ES_AUTOHSCROLL, FindWindowW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMessageW, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW,
-    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_ICONQUESTION, MB_YESNO,
-    MF_STRING, MSG, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOWPOS,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE,
-    WM_SIZE, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    IDI_APPLICATION, IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2,
+    MB_ICONQUESTION, MB_YESNO, MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu,
+    TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT,
+    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY,
+    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS,
+    WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED,
+    WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 /// Sent when the user changes the Windows accent colour.
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
@@ -140,74 +142,20 @@ const EC_RIGHTMARGIN: usize = 0x0002;
 const EM_SETCUEBANNER: u32 = 0x1501;
 const KEY_HINTS: &str = "Ctrl+Enter  show in folder";
 /// Shown once, the first time the panel opens after the first scan has finished.
-const OFFER_TITLE: &str = "Replace Windows search?";
+const OFFER_TITLE: &str = "Turn off Windows indexing?";
 
-/// The first-run offer. Short, plain, and only numbers that were measured: what Windows
-/// search is using right now, and what better_search costs beside it. Every number is
-/// optional, and a sentence is left out rather than filled with a guess.
-fn offer_text(reading: &stats::Reading) -> String {
-    let sizes = match reading {
-        stats::Reading::Sizes(sizes) => Some(sizes),
-        stats::Reading::Scanning | stats::Reading::Unavailable => None,
-    };
-    let (windows_memory, windows_disk) = sizes.map_or((None, None), |s| {
-        (s.windows_search_memory, s.windows_search_disk)
-    });
-    let entries = sizes.and_then(|s| s.entries);
-    let our_memory = sizes.and_then(|s| s.service_working_set);
-    let our_index = sizes.and_then(our_index_disk);
-    let mut text = String::new();
-    text.push_str("Windows search is still on. ");
-    match (windows_memory, windows_disk) {
-        (Some(memory), Some(disk)) => text.push_str(&format!(
-            "Right now it is using {} of memory and keeping {} of index files on disk, and it \
-             keeps indexing in the background while you use your PC.\n\n",
-            stats::size(memory),
-            stats::size(disk)
-        )),
-        (Some(memory), None) => text.push_str(&format!(
-            "Right now it is using {} of memory, and it keeps indexing in the background \
-             while you use your PC.\n\n",
-            stats::size(memory)
-        )),
-        _ => {
-            text.push_str("It keeps indexing in the background the whole time you use your PC.\n\n")
-        }
-    }
-    match (entries, our_memory, our_index) {
-        (Some(entries), Some(memory), Some(index)) => text.push_str(&format!(
-            "better_search already searches every file and folder on this PC - {} of them - and \
-             answers as you type. It keeps a {} index and uses {} of memory.\n\n",
-            stats::count(entries),
-            stats::size(index),
-            stats::size(memory)
-        )),
-        (_, Some(memory), Some(index)) => text.push_str(&format!(
-            "better_search already searches every file and folder on this PC, and answers as you \
-             type. It keeps a {} index and uses {} of memory.\n\n",
-            stats::size(index),
-            stats::size(memory)
-        )),
-        _ => text.push_str(
-            "better_search already searches every file and folder on this PC, and answers as you \
-             type.\n\n",
-        ),
-    }
-    match windows_disk {
-        Some(disk) => text.push_str(&format!(
-            "Turning Windows search off stops it and frees that memory and its {} of index \
-             files. Win+S and Start already open better_search, so you lose nothing, and you \
-             can turn Windows search back on any time in Settings.\n\n",
-            stats::size(disk)
-        )),
-        None => text.push_str(
-            "Turning Windows search off stops it and frees its memory. Win+S and Start \
-             already open better_search, so you lose nothing, and you can turn Windows \
-             search back on any time in Settings.\n\n",
-        ),
-    }
-    text.push_str("Turn Windows search off now?");
-    text
+/// The one-time offer's wording: what Windows' file indexing is, in plain words, what
+/// better_search already does instead, and what turning it off would cost. No
+/// numbers: they belong in Settings, where the user can check them.
+fn offer_text() -> &'static str {
+    "Do you want to turn off the Windows indexing of your files?\n\n\
+     Windows search keeps a list of your files so it can find them by name, and it \
+     builds and stores that list in the background while you use your PC. \
+     better_search already keeps its own, much smaller and faster list - that is what \
+     you are searching right now.\n\n\
+     Turning indexing off frees that space and background work. Programs that search \
+     inside documents, such as Outlook, would search more slowly, and you can turn \
+     indexing back on any time in better_search Settings."
 }
 
 /// What better_search keeps on disk: the saved index and its log. Not the size of the
@@ -299,6 +247,8 @@ struct App {
     apps: apps::Apps,
     /// Names of the packaged apps in the current results, by path.
     app_names: HashMap<String, String>,
+    /// Row names of the drives seen so far (label and letter), by root path.
+    drive_names: HashMap<String, String>,
     settings: settings::Settings,
     history: frecency::History,
     paused: bool,
@@ -331,8 +281,8 @@ struct App {
     /// The sizes worker, kept so a result is never read from a dead channel.
     sizes_results: Option<Receiver<stats::Reading>>,
     sizes_stop: Option<Sender<()>>,
-    /// An offer to replace Windows search that is owed, but not yet shown: the first scan
-    /// had not finished, or the panel was not on screen and idle when it did.
+    /// An offer to replace Windows search that is owed, but not yet shown: the panel
+    /// was not on screen and idle when the offer was due.
     offer_pending: bool,
 }
 
@@ -366,6 +316,7 @@ impl App {
             thumb_generation: Arc::new(AtomicU64::new(0)),
             apps: apps::Apps::default(),
             app_names: HashMap::new(),
+            drive_names: HashMap::new(),
             settings: settings::Settings::load(),
             history: frecency::History::load(),
             paused: false,
@@ -496,6 +447,15 @@ impl App {
                         self.app_names.insert(hit.path.clone(), name);
                         reply.hits.push(hit);
                     }
+                    // Drives keep their names: the label of the volume, read once.
+                    for hit in &reply.hits {
+                        if let Some(letter) = drive_letter(&hit.path)
+                            && !self.drive_names.contains_key(&hit.path)
+                        {
+                            self.drive_names
+                                .insert(hit.path.clone(), drive_row_name(letter));
+                        }
+                    }
                     self.status = status_text(shown, hidden);
                     if self.include_system {
                         self.status.push_str(" · showing all");
@@ -575,6 +535,7 @@ impl App {
     fn name_of(&self, hit: &Hit) -> String {
         self.app_names
             .get(&hit.path)
+            .or_else(|| self.drive_names.get(&hit.path))
             .cloned()
             .unwrap_or_else(|| display_name(hit))
     }
@@ -954,7 +915,9 @@ impl App {
                 .then(|| name.rsplit_once('.').map(|(_, ext)| ext))
                 .flatten()
         };
-        let key = if hit.is_dir {
+        let key = if let Some(letter) = drive_letter(&hit.path) {
+            format!("<drive {letter}>")
+        } else if hit.is_dir {
             "<folder>".into()
         } else {
             extension.map_or_else(|| "<file>".into(), str::to_ascii_lowercase)
@@ -962,28 +925,43 @@ impl App {
         if let Some(&icon) = self.icon_cache.get(&key) {
             return icon;
         }
-        let fake = if hit.is_dir {
-            wide("folder")
-        } else if let Some(extension) = extension {
-            wide(&format!("file.{extension}"))
-        } else {
-            wide("file")
-        };
         let mut info = SHFILEINFOW::default();
-        let attrs = if hit.is_dir {
-            FILE_ATTRIBUTE_DIRECTORY
+        let flags = SHGFI_ICON | SHGFI_LARGEICON;
+        // A drive root shows the shell's own icon for it; other type icons come from
+        // attributes, not actual disk I/O.
+        let found = if let Some(letter) = drive_letter(&hit.path) {
+            let root: Vec<u16> = format!("{letter}\\").encode_utf16().chain([0]).collect();
+            unsafe {
+                SHGetFileInfoW(
+                    root.as_ptr(),
+                    0,
+                    &mut info,
+                    size_of::<SHFILEINFOW>() as u32,
+                    flags,
+                )
+            }
         } else {
-            FILE_ATTRIBUTE_NORMAL
-        };
-        // Use attributes, not actual disk I/O.
-        let found = unsafe {
-            SHGetFileInfoW(
-                fake.as_ptr(),
-                attrs,
-                &mut info,
-                size_of::<SHFILEINFOW>() as u32,
-                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
-            )
+            let fake = if hit.is_dir {
+                wide("folder")
+            } else if let Some(extension) = extension {
+                wide(&format!("file.{extension}"))
+            } else {
+                wide("file")
+            };
+            let attrs = if hit.is_dir {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            };
+            unsafe {
+                SHGetFileInfoW(
+                    fake.as_ptr(),
+                    attrs,
+                    &mut info,
+                    size_of::<SHFILEINFOW>() as u32,
+                    flags | SHGFI_USEFILEATTRIBUTES,
+                )
+            }
         };
         let slot = if found != 0 && !info.hIcon.is_null() {
             let slot = unsafe { ImageList_ReplaceIcon(self.image_list, -1, info.hIcon) };
@@ -1310,18 +1288,26 @@ impl App {
             self.remember_windows_search(hwnd);
             return;
         }
-        let Some(reading) = &self.sizes else {
-            // Nothing measured yet. Ask, and come back when the answer arrives.
-            self.start_sizes(hwnd);
+        // The offer waits for the panel to be on screen and idle: a dialog that
+        // appears over a search the user is typing would be in the way. A busy first
+        // open is asked again when the sizes reading for Settings arrives.
+        let idle = self.last_text.trim().is_empty();
+        if idle && unsafe { IsWindowVisible(hwnd) } != 0 {
+            self.show_windows_search_offer(hwnd);
+        } else {
             self.offer_pending = true;
-            return;
-        };
+        }
+    }
+
+    fn show_windows_search_offer(&mut self, hwnd: HWND) {
+        self.offer_pending = false;
+        // "No" is the default answer: turning search off is a machine-wide change.
         let answer = unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+            MessageBoxW(
                 hwnd,
-                wide(&offer_text(reading)).as_ptr(),
+                wide(offer_text()).as_ptr(),
                 wide(OFFER_TITLE).as_ptr(),
-                MB_YESNO | MB_ICONQUESTION,
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
             )
         };
         self.remember_windows_search(hwnd);
@@ -1348,18 +1334,16 @@ impl App {
         self.start_sizes(hwnd);
     }
 
-    /// A sizes reading arrived. It gates the offer, and fills in the Settings line.
+    /// A sizes reading arrived. It fills in the Settings line, and shows an offer that
+    /// was postponed because the panel was busy.
     fn apply_sizes(&mut self, hwnd: HWND, reading: stats::Reading) {
         self.sizes = Some(reading);
         if self.settings_open {
             self.update_sizes_label();
         }
-        // The offer waits for the panel to be on screen and idle: a dialog that appears
-        // over a search the user is typing would be in the way.
         let idle = self.last_text.trim().is_empty();
         if self.offer_pending && idle && unsafe { IsWindowVisible(hwnd) } != 0 {
-            self.offer_pending = false;
-            self.offer_windows_search(hwnd);
+            self.show_windows_search_offer(hwnd);
         }
     }
 
@@ -1987,8 +1971,54 @@ fn parent_folder(path: &str) -> &str {
     path.rsplit_once('\\').map_or(path, |(parent, _)| parent)
 }
 
+/// The letter part (`C:`) of a drive-root path (`C:` or `C:\`); None for anything else.
+fn drive_letter(path: &str) -> Option<&str> {
+    match path.as_bytes() {
+        [c, b':'] | [c, b':', b'\\'] if c.is_ascii_alphabetic() => Some(&path[..2]),
+        _ => None,
+    }
+}
+
+/// What the drive holds, from Windows' own idea of it (`GetDriveTypeW`).
+fn drive_kind(letter: &str) -> &'static str {
+    let root: Vec<u16> = format!("{letter}\\").encode_utf16().chain([0]).collect();
+    match unsafe { GetDriveTypeW(root.as_ptr()) } {
+        2 => "Removable drive",
+        3 => "Local disk",
+        4 => "Network drive",
+        5 => "Disc drive",
+        _ => "Drive",
+    }
+}
+
+/// The row name of a drive: the volume's label if it has one, with the letter.
+fn drive_row_name(letter: &str) -> String {
+    let root: Vec<u16> = format!("{letter}\\").encode_utf16().chain([0]).collect();
+    let mut label = [0u16; 256];
+    let named = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            label.len() as u32,
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            null_mut(),
+            0,
+        )
+    } != 0;
+    let end = label.iter().position(|&c| c == 0).unwrap_or(0);
+    match named && end > 0 {
+        true => format!("{} ({letter})", String::from_utf16_lossy(&label[..end])),
+        false => format!("{} ({letter})", drive_kind(letter)),
+    }
+}
+
 /// The second line: what an app or link is, in words, or the folder a file is in.
 fn describe(hit: &Hit) -> String {
+    if let Some(letter) = drive_letter(&hit.path) {
+        return drive_kind(letter).into();
+    }
     if hit.path.starts_with(apps::PREFIX) {
         return "App".into();
     }
@@ -2763,7 +2793,7 @@ fn run(start_hidden: bool) -> Result<(), String> {
         }
     }
     // What this costs is asked for on every start, so Settings can show it even when the
-    // offer was answered long ago. The offer itself waits for the answer.
+    // offer was answered long ago. A postponed offer is asked again when it arrives.
     unsafe {
         (*app).start_sizes(hwnd);
         if !start_hidden {
@@ -2934,66 +2964,25 @@ mod tests {
     }
 
     #[test]
-    fn the_offer_quotes_only_what_was_measured() {
-        let text = offer_text(&stats::Reading::Sizes(sizes(
-            Some(574_455),
-            Some(21 * 1024 * 1024),
-            Some(19 * 1024 * 1024),
-            Some(34 * 1024 * 1024),
-        )));
+    fn the_offer_is_short_and_plain() {
+        let text = offer_text();
+        // The question comes first, then what indexing is, in words a regular user
+        // knows. No numbers: those live in Settings, where they can be checked.
         assert!(
-            text.contains("using 19 MB of memory and keeping 34 MB of index files on disk"),
-            "{text}"
-        );
-        assert!(text.contains("574,455 of them"), "{text}");
-        assert!(
-            text.contains("keeps a 4 MB index and uses 15 MB of memory"),
-            "{text}"
-        );
-        assert!(text.contains("frees that memory and its 34 MB"), "{text}");
-        // The point of the offer: nothing becomes unsearchable.
-        assert!(
-            text.contains("Win+S and Start already open better_search"),
+            text.starts_with("Do you want to turn off the Windows indexing"),
             "{text}"
         );
         assert!(
-            text.contains("turn Windows search back on any time in Settings"),
+            text.contains("better_search already keeps its own"),
             "{text}"
         );
-        assert!(text.ends_with("Turn Windows search off now?"));
-    }
-
-    #[test]
-    fn the_offer_leaves_out_a_number_it_does_not_have() {
-        // Still scanning: no numbers at all, but the offer is still made.
-        let scanning = offer_text(&stats::Reading::Scanning);
         assert!(
-            scanning.contains("keeps indexing in the background"),
-            "{scanning}"
+            text.contains("you can turn indexing back on any time"),
+            "{text}"
         );
-        assert!(
-            scanning.contains("searches every file and folder on this PC"),
-            "{scanning}"
-        );
-        assert!(!scanning.contains("MB"), "{scanning}");
-
-        // No service: the same shape, so the offer never shows an invented figure.
-        let unavailable = offer_text(&stats::Reading::Unavailable);
-        assert_eq!(unavailable, scanning);
-
-        // Measured, but Windows search's own index could not be read.
-        let partial = offer_text(&stats::Reading::Sizes(sizes(
-            Some(10),
-            Some(21 * 1024 * 1024),
-            Some(19 * 1024 * 1024),
-            None,
-        )));
-        assert!(
-            partial.contains("using 19 MB of memory, and it keeps indexing"),
-            "{partial}"
-        );
-        assert!(partial.contains("frees its memory. Win+S"), "{partial}");
-        assert!(!partial.contains("34 MB"), "{partial}");
+        // The honest cost of saying yes: programs that search inside files.
+        assert!(text.contains("search inside documents"), "{text}");
+        assert!(!text.contains("MB"), "{text}");
     }
 
     #[test]

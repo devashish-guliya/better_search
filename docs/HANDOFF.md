@@ -8,8 +8,9 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.5` (2026-10-05). The tree is clean,
-137 workspace tests and 8 installer tests pass, and the code is on GitHub with six
+State at writing: branch `main`, released as `v0.2.5` (2026-10-05), with unreleased work
+on top: drives are searchable results, and the first-run offer is short and plain. 143
+workspace tests and 8 installer tests pass, and the code is on GitHub with six
 releases published. Nothing of better_search is installed on this machine; see
 "Current installed state" below.
 
@@ -189,6 +190,11 @@ skips the **contents** of such folders but keeps the folder itself searchable.
   - `in:"C:\Some Folder"` keeps only entries below that folder. Quotes are optional
     without spaces, `/` is accepted, and the last one wins. A search with it takes
     about 11 ms through the service.
+- **Drives are results:** searching `c`, `c:` (any letter) finds the volume root, which
+  pass 2 used to drop. A root must carry every term in its own name (it has no folders
+  above it for folder words) and is never below its own `in:` scope. The window shows the
+  volume's label ("Data (D:)", else "Local disk (C:)"), the shell's drive icon and a
+  "Local disk" second line; Enter opens the drive in Explorer.
 - Typical speed through the service: 1–3 ms per keystroke, and 9–11 ms for a single
   letter.
 
@@ -379,12 +385,15 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   Windows search is still on, `offer_windows_search` shows one `MessageBoxW` Yes/No;
   `windows_search_asked=true` in `window.cfg` records the answer, and Yes runs the elevated
   switch. If Windows search is already off, the flag is set without a dialog.
-- The offer **waits for the first scan**, so the numbers in it are measured rather than
-  claimed: `stats::start` asks the service for sizes every 3 s (up to 60 tries), the panel
-  remembers the last reading, and the dialog opens on the first `Status::Ok`. A machine
-  where the service never becomes ready still gets the offer, just without numbers. Every
-  number in the text is optional and a sentence is left out rather than filled with a
-  guess (`offer_text` tests cover the full, partial and absent cases).
+- The offer is **three plain sentences, no numbers**: the question ("Do you want to turn
+  off the Windows indexing of your files?"), what indexing is (Windows keeps a list of
+  your files so its search can find them; better_search already keeps its own, smaller and
+  faster list), and the honest cost with the undo (programs that search inside documents
+  such as Outlook would search more slowly; one click in Settings turns indexing back on).
+  It shows when the panel is visible and idle; if the user is typing, the ask is
+  postponed until the sizes reading for Settings arrives. **"No" is the default button**
+  (`MB_DEFBUTTON2`): the change is machine-wide, so not choosing is not choosing yes. A
+  test pins that the wording has no numbers in it.
 - One-click button: the label says what the press will do ("Turn Windows search off (asks
   for admin)" or "Turn Windows search back on (asks for admin)"), depending on the current
   state (control id `SETTINGS_WINDOWS_SEARCH` 321, `controls[2]`, the first control under
@@ -593,7 +602,8 @@ cargo test --workspace
 cargo build --release
 ```
 
-141 tests: index 37, query 35, window 30, service 14, engine 9, pipe 9, cli 4, ntfs 3.
+143 tests: index 37, query 38 (3 drive-root tests included), window 29, service 14,
+engine 9, pipe 9, cli 4, ntfs 3.
 The installer crate has 8 more (its own `--manifest-path`).
 
 ### Updating the installed window after a change
