@@ -4,7 +4,7 @@ This document records what has been built, how it works, why each decision was m
 what is settled, and what comes next. It is the hand-off point for anyone (or any new
 chat session) continuing the work. Keep it current when decisions change.
 
-Last updated with release `v0.2.6`. `docs/HANDOFF.md` is a shorter, self-contained summary
+Last updated with release `v0.2.8`. `docs/HANDOFF.md` is a shorter, self-contained summary
 of this record for starting a new chat.
 
 Current state, in short:
@@ -131,6 +131,9 @@ Out of scope: searching file **contents**. Only names are searched.
 | `bc202d8` | Settings redesigned in the search panel's design language: parent-drawn page, switches, hand-written hotkey capture |
 | `b995be5` | Settings redesign released; version 0.2.7 |
 | `00f43f0` | Installer version 0.2.7 |
+| `a691f26` | Win+S and typing-in-Start triggers removed; the panel opens from Alt+Space and the tray only |
+| `11d0fda` | Version 0.2.8 |
+| `daf246e` | Installer version 0.2.8 |
 
 ## 4. Current results on the development machine
 

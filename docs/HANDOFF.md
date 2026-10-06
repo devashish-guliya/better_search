@@ -8,11 +8,9 @@ development machine, and how to keep working on it safely.
 the security audit and per-phase notes). This file is the condensed, self-contained
 version. If the two disagree, check the code, then fix the doc that is wrong.
 
-State at writing: branch `main`, released as `v0.2.7` (2026-10-05). The settings page was
-redesigned in `bc202d8` and shipped in v0.2.7; 147 workspace tests and 8 installer tests
-pass, and the code is on GitHub with eight releases published. After v0.2.7, Win+S and
-typing in Start were removed as panel triggers by user decision (section 5.4); the
-version is still 0.2.7 until the next release. better_search 0.2.6 is
+State at writing: branch `main`, released as `v0.2.8` (2026-10-06). 147 workspace tests
+and 8 installer tests pass, and the code is on GitHub with nine releases published.
+v0.2.8 removed the Win+S and typing-in-Start triggers by user decision (section 5.4). better_search 0.2.6 is
 installed and running on this machine; see "Current installed state" below.
 
 ---
@@ -70,7 +68,8 @@ Ask before big or machine-wide decisions.
   after install), 0.2.5 (the offer quoted measured numbers, and turning Windows search off
   frees its index), 0.2.6 (drives are search results; the offer is short and plain, with
   no numbers, and No is the default answer), 0.2.7 (the settings page redesigned in the
-  panel's design language). An installed copy upgrades in place through the panel's Check
+  panel's design language), 0.2.8 (Win+S and typing-in-Start triggers removed; the
+  panel opens from Alt+Space and the tray only). An installed copy upgrades in place through the panel's Check
   for updates button; `bs-window.exe --check-updates` prints whether a newer release
   exists.
 - Settings for the window live at `%LOCALAPPDATA%\better_search\window.cfg`. Open
@@ -685,6 +684,9 @@ it again.
 
 | Commit | What it added |
 |---|---|
+| `daf246e` | Installer version 0.2.8 |
+| `11d0fda` | Version 0.2.8 |
+| `a691f26` | Win+S and typing-in-Start triggers removed; the panel opens from Alt+Space and the tray only |
 | `00f43f0` | Installer version 0.2.7 |
 | `b995be5` | Settings redesign released; version 0.2.7 |
 | `152b75e` | Record the settings redesign in the project docs |
@@ -717,7 +719,7 @@ it again.
 | `58e16ad` | Frecency: rank what the user opens higher |
 | earlier | Installer (Phase 5), live stats (later removed), removable FAT drives, Phase 4 window, security audit fixes, Phase 3 service/pipe/privacy, clutter rules, snapshot, Phase 1 index (`d0c31f2`) |
 
-Run `git log --oneline` for the full list of 36 commits.
+Run `git log --oneline` for the full list of 39 commits.
 
 ## 10. Open items and ideas
 
