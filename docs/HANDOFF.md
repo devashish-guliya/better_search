@@ -10,7 +10,9 @@ version. If the two disagree, check the code, then fix the doc that is wrong.
 
 State at writing: branch `main`, released as `v0.2.7` (2026-10-05). The settings page was
 redesigned in `bc202d8` and shipped in v0.2.7; 147 workspace tests and 8 installer tests
-pass, and the code is on GitHub with eight releases published. better_search 0.2.6 is
+pass, and the code is on GitHub with eight releases published. After v0.2.7, Win+S and
+typing in Start were removed as panel triggers by user decision (section 5.4); the
+version is still 0.2.7 until the next release. better_search 0.2.6 is
 installed and running on this machine; see "Current installed state" below.
 
 ---
@@ -26,8 +28,8 @@ replacement for **Windows Start search and Explorer search**.
 - Local only. Nothing about your files or this PC leaves the machine, and no query is
   ever logged. Names only, not file contents (by design). The single exception is the
   update check, which the user starts and which only fetches a public file (section 5.7).
-- Opens from a tray icon, the **Alt+Space** hotkey, **Win+S**, or by **typing while
-  Start is open**.
+- Opens from a tray icon and the **Alt+Space** hotkey. (Win+S and typing in Start used
+  to open it too; both were removed by user decision after v0.2.7, section 5.4.)
 - Target users are ordinary people with 1–2 TB drives, not only developers.
 
 The user (Devashish Guliya) wants plain, direct explanations and minimal token use.
@@ -279,7 +281,7 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 | `commands.rs` | About 50 `ms-settings:` pages with keywords, plus power commands |
 | `frecency.rs` | Open history (`history.tsv`), seeded from Windows Recent |
 | `settings.rs` | Loads and saves `window.cfg` |
-| `winkey.rs` | Low-level keyboard hook (Win+S, typing in Start), foreground watcher for SearchHost, Explorer folder lookup |
+| `winkey.rs` | Foreground watcher: ends `SearchHost.exe` while Windows search is off |
 | `winsearch.rs` | Turns Windows search off or on (elevated), and frees its index when off |
 | `stats.rs` | One read-only sizes request, off the UI thread, so the panel can quote real numbers |
 | `update.rs` | Update check, download, SHA-256 check and running the installer |
@@ -322,42 +324,17 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
 - `command:` entries: Shut down, Restart and Sign out ask first in a MessageBox. Sleep
   uses `SetSuspendState`, and Lock uses `LockWorkStation`.
 
-### 5.4 Win+S and Explorer folder scope (`winkey.rs`)
+### 5.4 Win+S and typing in Start (removed after v0.2.7)
 
-- A `WH_KEYBOARD_LL` hook runs **on its own thread**, because Windows drops slow
-  low-level hooks.
-- Win+S is swallowed, but Win+Shift+S is not, so the screenshot tool still works. The
-  hook taps the unassigned key `0xE8` so releasing Win does not open Start, then posts
-  `WM_WIN_S` (`WM_APP+5`). Injected keys pass through, so remapping tools work too.
-- If an Explorer window is in front, its active tab's folder is read through
-  hand-written COM vtables: `IShellWindows` → `IServiceProvider` → `IShellBrowser` →
-  `IFolderView` → `IPersistFolder2`. The window then shows an **"In <folder>" chip**,
-  and requests are sent as `in:"<folder>" <text>`, without Store apps or Settings.
-  Backspace at the start of the field removes the chip. Alt+Space always opens
-  unscoped.
-- Foreground rights are borrowed with `AttachThreadInput` to the front window's thread
-  (`open_from_hook` in `main.rs`).
-- Setting: `win_s=` in `window.cfg`, default on. The checkbox reads "Win+S and typing
-  in Start open better_search".
-
-### 5.5 Typing in Start opens better_search
-
-- While `StartMenuExperienceHost.exe` is in front, the hook swallows letters and digits
-  (Shift and Caps Lock are handled in `typed_char`) and posts `WM_START_TYPED`
-  (`WM_APP+6`, the character in `wParam`).
-- The foreground check runs at each key press (`start_in_front`) and is cached per
-  foreground window (`LAST_FRONT`, `LAST_FRONT_IS_START`). The foreground event arrives
-  too late for the first letters.
-- **Start refuses to give up the foreground.** Alt-tap tricks failed. The window
-  therefore checks `is_start(GetForegroundWindow())`, injects **Escape** to close Start
-  (`close_start`), waits up to 500 ms until Start has left the front (so the Escape
-  cannot reach our own window, which would hide it), then taps `0xE8` and takes the
-  foreground.
-- Letters that arrive within 1.5 s (`start_typed_at`) are appended to the **edit's
-  current text** (`App::edit_text()`). `last_text` lags because search is debounced,
-  and using it once lost a letter.
-- Verified: typing "notepad" and "calc" in Start arrived in full in the better_search
-  field.
+By user decision (2026-10-06) better_search no longer touches Win+S or typing in
+Start: the low-level keyboard hook, the Explorer scope chip, and the `win_s=` setting
+are gone, and the panel opens from Alt+Space, the tray, or launching it again. Win+S
+does what Windows does with it, which never starts indexing: the WSearch indexer runs,
+or is off, regardless, and opening the search UI cannot re-enable a service the panel
+turned off. `in:"<folder>"` still works when typed by hand. What remains of
+`winkey.rs` is the `EVENT_SYSTEM_FOREGROUND` watcher: while Windows search is off, a
+`SearchHost.exe` that still comes to the front is ended at once (it no longer opens
+the panel).
 
 ### 5.6 Turning Windows search off (`winsearch.rs`)
 
@@ -405,8 +382,7 @@ Per-monitor v2 DPI awareness and common controls v6 come from an embedded manife
   disk space shows "Windows search is off, and its index files are gone"; one that did not
   says so and names the folder.
 - **Watcher:** an `EVENT_SYSTEM_FOREGROUND` WinEvent hook (`foreground_changed`). If
-  `SearchHost.exe` comes to the front while search is off, the hook ends it and opens
-  better_search (`WM_WIN_S`).
+  `SearchHost.exe` comes to the front while search is off, the hook ends it.
 
 ### 5.6a Showing what each one costs (`stats.rs`, `bs_pipe::StatsReply`)
 
@@ -753,6 +729,4 @@ Run `git log --oneline` for the full list of 36 commits.
 - Showing results during the very first scan (about a minute): not decided.
 - More filters (for example folders only). `ext:` and `in:` already exist.
 - Watch in daily use:
-  - typing in Start on slower machines (the 500 ms wait for Start to close);
-  - the Explorer scope with virtual folders (they give no scope);
   - `sc stop WSearch` taking a long time.

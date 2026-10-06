@@ -23,8 +23,6 @@ pub struct Settings {
     pub start_with_windows: bool,
     /// Rank results the user opened before higher (see `frecency`).
     pub history: bool,
-    /// Win+S opens this window instead of Windows search.
-    pub win_s: bool,
     /// The first-run offer to turn Windows search off has been shown (yes or no).
     pub windows_search_asked: bool,
 }
@@ -36,7 +34,6 @@ impl Default for Settings {
             key: u32::from(b' '),
             start_with_windows: false,
             history: true,
-            win_s: true,
             windows_search_asked: false,
         }
     }
@@ -75,7 +72,6 @@ impl Settings {
                     }
                     "start_with_windows" => settings.start_with_windows = value == "true",
                     "history" => settings.history = value != "false",
-                    "win_s" => settings.win_s = value != "false",
                     "windows_search_asked" => settings.windows_search_asked = value == "true",
                     _ => {}
                 }
@@ -100,12 +96,11 @@ impl Settings {
         fs::write(
             &tmp,
             format!(
-                "modifiers={}\nkey={}\nstart_with_windows={}\nhistory={}\nwin_s={}\nwindows_search_asked={}\n",
+                "modifiers={}\nkey={}\nstart_with_windows={}\nhistory={}\nwindows_search_asked={}\n",
                 self.modifiers,
                 self.key,
                 self.start_with_windows,
                 self.history,
-                self.win_s,
                 self.windows_search_asked
             ),
         )?;

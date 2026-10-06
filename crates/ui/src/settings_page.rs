@@ -12,7 +12,6 @@ use crate::draw;
 pub enum Toggle {
     StartWithWindows,
     History,
-    WinS,
 }
 
 /// Which action a row runs.
@@ -80,7 +79,6 @@ impl Page {
 pub struct Inputs {
     pub start_with_windows: bool,
     pub history: bool,
-    pub win_s: bool,
     /// What the Windows search row says now, and the state under it.
     pub windows_search: (String, String),
     /// The footprint note under the Windows search section.
@@ -194,16 +192,6 @@ pub fn build(
         bottom: y + s(HOTKEY_BAND),
     };
     y = hotkey.bottom + s(draw::SPACE_M);
-    push(
-        Row::Toggle {
-            kind: Toggle::WinS,
-            title: "Win+S and typing in Start",
-            detail: "Open better_search from Windows' own places",
-            on: inputs.win_s,
-        },
-        &mut y,
-        s(ROW),
-    );
 
     // BEHAVIOR
     push(Row::Heading("BEHAVIOR"), &mut y, s(HEADING));
@@ -578,7 +566,6 @@ mod tests {
         Inputs {
             start_with_windows: false,
             history: true,
-            win_s: true,
             windows_search: (
                 "Turn Windows search off (asks for admin)".into(),
                 "Windows search is on".into(),
@@ -613,7 +600,7 @@ mod tests {
     fn every_row_is_reachable_and_typed() {
         let page = page(400);
         assert!(matches!(page.lines[0].row, Row::Heading("OPEN WITH")));
-        // The hotkey band sits between its heading and the Win+S switch.
+        // The next interactive line comes after the hotkey band.
         let hotkey_at = page
             .lines
             .iter()

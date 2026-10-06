@@ -18,11 +18,14 @@ Current state, in short:
   - a redesigned two-line results list;
   - the `ext:` and `in:` filters;
   - Settings pages and power commands;
-  - Win+S, scoped to the Explorer folder in front;
-  - typing in Start;
   - turning Windows search off (section 5.11);
   - updates from GitHub releases, with one button that checks, verifies and installs
     (section 5.12).
+- After v0.2.7, **Win+S and typing in Start were removed as triggers** by user
+  decision (2026-10-06): no keyboard hook, no Explorer scope chip, no `win_s=` setting.
+  The panel opens from Alt+Space, the tray, or launching it again. Win+S now does what
+  Windows does with it, which never starts indexing; the SearchHost watcher that keeps
+  Windows search off remains.
 - The pipe protocol is **version 2**. Version 2 adds the options byte and a hidden-match
   count, so system and app-folder matches are hidden by default (`78efd7a`). The skip
   rules are version 8.
@@ -53,14 +56,12 @@ The fastest and leanest file and folder **name** search for Windows:
 - Finds files and folders by name as you type, in a few milliseconds.
 - Uses as little RAM, CPU and disk as possible. Idle CPU should be zero.
 - Local only. Nothing leaves the PC.
-- One-click install, and instant access from anywhere: a tray icon, the **Alt+Space**
-  hotkey, and Win+S. The panel opens as a square at the right screen edge.
+- One-click install, and instant access from anywhere: a tray icon and the
+  **Alt+Space** hotkey. The panel opens as a square at the right screen edge.
 - Target users: ordinary people with 1–2 TB drives, not only developers.
 
 - Since Phase 5, it also replaces Windows Start and Explorer search. It finds apps
-  (Store apps too), Settings pages and power commands. It opens on Win+S, scoped to the
-  Explorer folder in front, and when the user types in Start. It can turn Windows
-  search off.
+  (Store apps too), Settings pages and power commands. It can turn Windows search off.
 
 Out of scope: searching file **contents**. Only names are searched.
 
@@ -775,7 +776,8 @@ and reports a clear message when the service is not running.
   A gear button at the right end of the search field opens the same Settings page, and only
   one panel runs per session (a second launch posts `WM_SHOW_PANEL` to the running window
   and exits). The screen-edge hover pop-in and its slide animation were removed by user
-  decision (2026-10-05); Win+S, Alt+Space and the tray open the panel. Window positioning
+  decision (2026-10-05), and Win+S and typing in Start followed on 2026-10-06 (section
+  5.11's `in:` bullet): Alt+Space and the tray open the panel. Window positioning
   and child layout scale with the monitor DPI.
 - **Open history (frecency).** The window records the path of each file it opens (not
   "open folder") in `%LOCALAPPDATA%\better_search\history.tsv` as `weight`, `last-open
@@ -788,14 +790,14 @@ and reports a clear message when the service is not running.
   checkbox (`history=` in `window.cfg`, default on) and a "Clear open history" button.
 - **Kind ranking.** Name-score nudges by extension: launchable +15 (installers -20), documents +14, media +9, source/config -8, generated (`.class`, `.o`, `.map`, `.lock`...) -10; folders +6; Start Menu shortcuts +60; a name equal to the query (stem or whole) gets +40 (files only, not launchable stems that already score 120). Exact stems skip the length penalty. Frecency now adds `min(60, 16 ln(1+w))`. Start Menu shortcuts with the same name in equally named parent folders collapse to the best one. `SKIP_RULES_VERSION` 6 adds `.idea`, `.eggs`, `.sass-cache`; the service rescans when the stored version differs.
 - **Folder words, `ext:` and ranking fixes.** With 2 to 8 terms, pass 1 scans for each term and keeps a per-name term mask; a term missing from the name may be found in a parent folder name (volume root excluded) and counts 20 instead of its match score. Pass 2 resolves folder masks and depths through a small per-thread folder cache. Narrowing for such queries requires each new term to contain an old one. `ext:a,b` filters by extension (alone it lists that type). Exact stems with a demoted extension (`notes.log`) score 60 without the exact bonus; `.lnk`/`.url` vendor extras (`Readme`, `Help`, `<App> Website`) are capped at 20 before the Start Menu boost; word starts score 56; documents and media pay half the length penalty; ties go to fewer folders. `key`, `pages`, `numbers` left the document list; `xlsm`, `docm`, `msg`, `eml`, `one`, `vsdx`, RAW photo and more media types joined. Locations (`SKIP_RULES_VERSION` 7): `OneDrive - <org>`, Dropbox, `my drive`, iCloud, `source`, `repos`, `projects` count as user content; `certs`, `bun`, `vcpkg` are noisy only outside user content; listed `Windows` and `System32` tools rank as Start Menu entries; non-launchable files directly in `Program Files\<app>` are app files. The window imports Windows Recent opens newer than its history file on every start and records Ctrl+Enter. Measured on a 1.27M-entry profile walk: single-term searches unchanged (`readme` 2.0 ms), two-term searches 1.1 → 2.3 ms; the synthetic benchmark, whose folders are random, is about twice as slow.
-- **`in:` folder scope, Win+S, Settings pages.** `in:"<path>"` (quotes optional without spaces, `/` accepted, last one wins) limits matches to entries below that folder: pass 2 finds the folder's entries once per query (name table scan plus a full-path check) and walks each candidate's parents; an unindexed folder gives no results. About 11 ms through the service on the development machine. The window installs a `WH_KEYBOARD_LL` hook on its own thread (Windows drops slow low-level hooks), swallows Win+S (not with Shift, Ctrl or Alt, so Win+Shift+S still screenshots), taps the unassigned key 0xE8 so releasing Win does not open Start, and posts `WM_APP+5`. The handler reads the folder of the foreground Explorer window's active tab through `IShellWindows` → `IServiceProvider` → `IShellBrowser` → `IFolderView` → `IPersistFolder2` (hand-written vtables; virtual folders give no scope), borrows foreground rights with `AttachThreadInput`, and shows the folder as a chip; requests are then sent as `in:"<folder>" <text>` and Store apps and Settings are left out. Backspace at the start of the field drops the chip; Alt+Space always opens unscoped. `win_s=` in `window.cfg`, default on. `commands.rs` lists about 50 `ms-settings:` pages and `windowsdefender:` with search words, plus `command:` power entries (shut down, restart, sign out ask first; sleep via `SetSuspendState`, lock via `LockWorkStation`); names score like Store apps minus 12, a keyword prefix (3+ letters) scores 120 minus 12. They form a Settings section with the Settings app's icon. Store apps and Settings rows are no longer cut by the result limit.
+- **`in:` folder scope, Win+S, Settings pages.** `in:"<path>"` (quotes optional without spaces, `/` accepted, last one wins) limits matches to entries below that folder: pass 2 finds the folder's entries once per query (name table scan plus a full-path check) and walks each candidate's parents; an unindexed folder gives no results. About 11 ms through the service on the development machine. The hook half of this was **removed by user decision (2026-10-06)**: the window no longer hooks Win+S, no longer shows an Explorer scope chip, and `win_s=` is gone from `window.cfg`; `in:"<path>"` still works when typed by hand. (The removed hook had swallowed Win+S on its own thread, read the foreground Explorer folder through `IShellWindows` → `IServiceProvider` → `IShellBrowser` → `IFolderView` → `IPersistFolder2` hand-written vtables, borrowed foreground rights with `AttachThreadInput`, and sent requests as `in:"<folder>" <text>`.) `commands.rs` lists about 50 `ms-settings:` pages and `windowsdefender:` with search words, plus `command:` power entries (shut down, restart, sign out ask first; sleep via `SetSuspendState`, lock via `LockWorkStation`); names score like Store apps minus 12, a keyword prefix (3+ letters) scores 120 minus 12. They form a Settings section with the Settings app's icon. Store apps and Settings rows are no longer cut by the result limit.
 - **Typing crash, Windows search off, typing in Start.** The window crashed in `USER32!DrawTextExWorker` when typing fast: a bold name run cut to nothing passed `DrawTextW` a count of 0 with a dangling empty-`Vec` pointer. `draw::text` now returns early on empty text and passes a NUL-terminated buffer; `text_width("")` is 0 (test `drawing_empty_text_is_safe`). `winsearch.rs` turns Windows search off or on: the window re-runs itself elevated (`runas`) with `--windows-search off|on`, which sets or deletes the HKLM policy `SOFTWARE\Policies\Microsoft\Windows\Windows Search\DisableSearch`, runs `sc config`/`sc stop WSearch` (disabled, or delayed-auto plus start) and ends `SearchHost.exe` (it restarts within seconds when only killed). The first time the panel opens while Windows
 search is still on, a one-time Yes/No dialog explains what the change saves (a background
 indexer, its database on disk, machine-wide effects on other accounts and apps) and
 offers it; the answer is stored as `windows_search_asked` in `window.cfg`. A one-click
 Settings button drives it later: the
 label says whether the press turns Windows search off or back on, and the press runs the
-elevated path at once instead of waiting for Save. An `EVENT_SYSTEM_FOREGROUND` WinEvent hook ends `SearchHost.exe` if it still comes to the front while search is off and opens the window instead. The keyboard hook also swallows letters and digits typed while `StartMenuExperienceHost.exe` is in front (checked at the key press, cached per foreground window) and posts them as `WM_APP+6`; Start refuses to give up the foreground, so the window closes it with an injected Escape (only after confirming Start is in front, then waiting until it has left), takes the foreground like Win+S and appends letters that arrive within 1.5 s to the edit's current text.
+elevated path at once instead of waiting for Save. An `EVENT_SYSTEM_FOREGROUND` WinEvent hook ends `SearchHost.exe` if it still comes to the front while search is off. (It used to open the panel as well, and a keyboard hook also routed letters typed in Start to the panel; both were removed by user decision on 2026-10-06, see the hand-off's section 5.4.)
 - **Hidden system matches.** A measurement of the real index (`bs report <index.bin>`)
   found 94% of entries in system, app-data or program folders and 3.8% in ordinary
   locations. The window therefore asks the service to hide those by default and shows
@@ -995,6 +997,7 @@ address never changes between releases.
 | Virtual list and cached shell system icons | Only visible rows request text/icons; an extension-level cache avoids filesystem I/O and a per-result icon allocation |
 | Per-user settings, not service configuration | Hotkey/startup need no admin rights; changing service-wide indexed drives requires a separate backend design |
 | No fake skipped-folder count or drive filtering in the UI | The protocol cannot return skipped contents or search a subset of drives accurately; the user explicitly deferred the locked protocol/index changes |
+| No Win+S or typing-in-Start triggers (removed 2026-10-06, after v0.2.7) | The user found the extra triggers confusing and wanted only Alt+Space and the tray. Opening Windows' search never starts indexing (the WSearch indexer runs, or is off, on its own; the policy and disabled service cannot be undone by pressing keys), so no swallow shim was kept |
 
 ## 7. Locked in (do not change without discussing)
 
@@ -1024,7 +1027,8 @@ address never changes between releases.
   and any other `ProfileImagePath` in the registry, service accounts excepted)
   from results **and** match counts, for administrators too; the profile folder itself
   stays visible only under its current name; `C:\Users\Public` is shared.
-- UI requirements: tray icon, Alt+Space hotkey, right-edge hover zone with a slide-in panel.
+- UI requirements: tray icon, Alt+Space hotkey. (The right-edge hover zone, Win+S and
+  typing in Start were all removed by user decision.)
 - Decided for Phase 3 (see below): background service first; hide other users' private
   folders from each user; include removable non-NTFS drives (as the last step of
   Phase 3); exclude network drives.

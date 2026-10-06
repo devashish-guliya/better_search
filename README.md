@@ -68,7 +68,8 @@ cargo build --release
 .\target\release\bs.exe --synthetic 5000000 --bench
 ```
 
-The window starts with Alt+Space (if Windows has not reserved it) or Win+S. It opens as a
+The window starts with Alt+Space (if Windows has not reserved it) or from the tray. It
+opens as a
 square panel whose side is 70% of the screen height, centred vertically against the right
 edge, and only one panel runs: launching it again brings the open one forward. A gear
 button at the right end of the search box opens Settings. Double-click its tray icon to
@@ -98,12 +99,9 @@ With several words, a word the name lacks may match a folder above it instead:
 words). `ext:pdf` keeps only that type, `ext:xlsx,docx` several, and `ext:pdf` alone
 lists every PDF. `in:"C:\Some Folder"` keeps only what is below that folder.
 
-Win+S opens better_search instead of Windows search (Win+Shift+S still takes a
-screenshot; turn it off in the tray's Settings). Pressed over an Explorer window, it
-searches only the folder that window shows, marked by an "In <folder>" chip in the
-search field; Backspace at the start of the field removes the chip and searches
-everything again. Letters and digits typed while Start is open close Start and go to
-better_search instead.
+The panel does not touch Win+S or typing in Start: Windows keeps both to itself, so Win+S
+opens Windows' own search (which does not start any indexing; the indexer runs, or not,
+regardless). `in:"C:\Some Folder"` typed by hand still scopes a search to one folder.
 
 The first time the panel opens, while Windows search is still on, it asks one plain
 question: do you want to turn off the Windows indexing of your files? It explains in two
@@ -234,8 +232,8 @@ What the draft does if it is run:
   `%ProgramFiles%\better_search`, and copies itself there as the uninstaller.
 - Registers and starts `better_search` as an auto-start service running as LocalSystem,
   and adds a machine-wide `Run` entry that starts `bs-window.exe --hidden` at sign-in.
-- **Starts the search panel at the end of the install**, unelevated, so Alt+Space and Win+S
-  work immediately rather than after the next sign-in. If that cannot be done it says so
+- **Starts the search panel at the end of the install**, unelevated, so Alt+Space works
+  immediately rather than after the next sign-in. If that cannot be done it says so
   and names the program to start by hand.
 - The setup program has no console: it reports a failure in a message box instead of
   printing to a window that closes.

@@ -29,10 +29,10 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush,
-    DEFAULT_GUI_FONT, DT_CENTER, DT_END_ELLIPSIS, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC,
-    DeleteObject, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT,
-    InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT,
-    ReleaseDC, SRCCOPY, SelectObject, SetBkColor, SetTextColor,
+    DEFAULT_GUI_FONT, DT_CENTER, DT_PATH_ELLIPSIS, DT_RIGHT, DeleteDC, DeleteObject, EndPaint,
+    FillRect, GetDC, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, PAINTSTRUCT, ReleaseDC, SRCCOPY,
+    SelectObject, SetBkColor, SetTextColor,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, GetDriveTypeW, GetVolumeInformationW,
@@ -55,42 +55,38 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, RegisterHotKey, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    UnregisterHotKey, VK_BACK, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN,
-    VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    UnregisterHotKey, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LWIN, VK_MENU, VK_RETURN, VK_RWIN,
+    VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 
 use draw::scale;
-use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows_sys::Win32::UI::Shell::{
     DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
     RemoveWindowSubclass, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
     SHGetFileInfoW, SetWindowSubclass, Shell_NotifyIconW, ShellExecuteW,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, DispatchMessageW, EN_CHANGE, ES_AUTOHSCROLL, FindWindowW, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION,
-    IsWindowVisible, KillTimer, LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO,
-    MF_STRING, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOWPOS,
-    WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC,
-    WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT,
-    WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER,
-    WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
+    GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IDI_APPLICATION, IsWindowVisible, KillTimer,
+    LoadCursorW, LoadIconW, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO, MF_STRING, MSG, MessageBoxW,
+    MoveWindow, PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SW_HIDE,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOWPOS, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_CTLCOLORBTN,
+    WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND,
+    WM_HOTKEY, WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_MEASUREITEM,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NOTIFY, WM_PAINT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETFOCUS, WM_SETFONT, WM_SETTINGCHANGE, WM_SIZE, WM_SYSCHAR, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_THEMECHANGED, WM_TIMER, WM_WINDOWPOSCHANGED, WNDCLASSW, WS_CHILD,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
 };
 /// `WM_SYSCOMMAND`'s menu-open command, sent for Alt+Space and F10.
 const SC_KEYMENU: usize = 0xf100;
 /// Sent when the user changes the Windows accent colour.
 const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
 const WM_MOUSELEAVE: u32 = 0x02a3;
-const EM_GETSEL: u32 = 0x00b0;
-const EM_SETSEL: u32 = 0x00b1;
 /// Static control styles: vertically centred, single-line text cut with an ellipsis.
 const SS_CENTERIMAGE: u32 = 0x0200;
 const SS_ENDELLIPSIS: u32 = 0x4000;
@@ -266,14 +262,8 @@ struct App {
     footer: RECT,
     show_hints: std::cell::Cell<bool>,
     taskbar_message: u32,
-    /// Folder the search is limited to (Win+S over an Explorer window), shown as a
-    /// chip in the field; Backspace at the start of the field removes it.
-    scope: Option<String>,
-    chip: RECT,
     /// The settings button drawn at the right end of the search field.
     gear: RECT,
-    /// When a letter typed in Start last arrived.
-    start_typed_at: Option<std::time::Instant>,
     /// The last sizes the service reported. `None` until it has been asked.
     sizes: Option<stats::Reading>,
     /// The sizes worker, kept so a result is never read from a dead channel.
@@ -342,38 +332,12 @@ impl App {
             footer: RECT::default(),
             show_hints: std::cell::Cell::new(true),
             taskbar_message: unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) },
-            scope: None,
-            chip: RECT::default(),
             gear: RECT::default(),
-            start_typed_at: None,
             sizes: None,
             sizes_results: None,
             sizes_stop: None,
             offer_pending: false,
         }
-    }
-
-    /// What is sent to the service: the typed text, limited to the scope folder.
-    fn request_text(&self) -> String {
-        match &self.scope {
-            Some(folder) => format!("in:\"{folder}\" {}", self.last_text),
-            None => self.last_text.clone(),
-        }
-    }
-
-    fn set_scope(&mut self, hwnd: HWND, scope: Option<String>) {
-        if self.scope == scope {
-            return;
-        }
-        self.scope = scope;
-        let cue = wide(if self.scope.is_some() {
-            "Search this folder"
-        } else {
-            "Search apps, files and folders"
-        });
-        unsafe { SendMessageW(self.edit, EM_SETCUEBANNER, 1, cue.as_ptr() as isize) };
-        self.layout(hwnd);
-        self.query(hwnd);
     }
 
     fn edit_text(&self) -> String {
@@ -392,7 +356,7 @@ impl App {
         self.clear_results();
         if query.trim().is_empty() {
             self.status = String::new();
-        } else if self.request_text().len() + 4 > bs_pipe::MAX_REQUEST {
+        } else if self.last_text.len() + 4 > bs_pipe::MAX_REQUEST {
             self.status = "The search is too long".into();
         } else if self.paused {
             self.status = "Search paused from the tray".into();
@@ -401,7 +365,7 @@ impl App {
             if let Some(sender) = &self.sender {
                 let _ = sender.send(search::Request {
                     serial: self.serial,
-                    text: self.request_text(),
+                    text: self.last_text.clone(),
                     include_system: self.include_system,
                 });
             }
@@ -439,16 +403,13 @@ impl App {
                         .map(|hit| display_name(hit).to_lowercase())
                         .collect();
                     // A packaged app that also has a Start Menu shortcut is shown once.
-                    let store: Vec<(Hit, String)> = if self.scope.is_some() {
-                        Vec::new()
-                    } else {
-                        self.apps
-                            .matches(&self.last_text)
-                            .into_iter()
-                            .filter(|(_, name)| !shortcut_names.contains(&name.to_lowercase()))
-                            .chain(commands::matching(&self.last_text))
-                            .collect()
-                    };
+                    let store: Vec<(Hit, String)> = self
+                        .apps
+                        .matches(&self.last_text)
+                        .into_iter()
+                        .filter(|(_, name)| !shortcut_names.contains(&name.to_lowercase()))
+                        .chain(commands::matching(&self.last_text))
+                        .collect();
                     let shown = reply.total_matches + store.len() as u32;
                     let hidden = reply.hidden_matches;
                     self.app_names.clear();
@@ -557,10 +518,7 @@ impl App {
             "better_search"
         };
         unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(
-                hwnd,
-                wide(title).as_ptr(),
-            )
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowTextW(hwnd, wide(title).as_ptr())
         };
         self.refresh_status();
     }
@@ -1194,7 +1152,6 @@ impl App {
         let inputs = settings_page::Inputs {
             start_with_windows: self.settings.start_with_windows,
             history: self.settings.history,
-            win_s: self.settings.win_s,
             windows_search: windows_search_row(),
             sizes: sizes_text(self.sizes.as_ref()),
             drives: settings::indexed_drives(),
@@ -1225,7 +1182,6 @@ impl App {
                 next.start_with_windows = !next.start_with_windows
             }
             settings_page::Toggle::History => next.history = !next.history,
-            settings_page::Toggle::WinS => next.win_s = !next.win_s,
         }
         if next.start_with_windows != self.settings.start_with_windows
             && let Err(err) = next.apply_startup()
@@ -1238,9 +1194,6 @@ impl App {
             return;
         }
         self.settings = next;
-        if kind == settings_page::Toggle::WinS {
-            winkey::set_enabled(self.settings.win_s);
-        }
         self.rebuild_page(hwnd);
     }
 
@@ -1496,24 +1449,7 @@ impl App {
             bottom: pad + s(40),
         };
         let edit_height = s(24);
-        let mut edit_left = self.field.left + s(40);
-        self.chip = RECT::default();
-        if let (Some(scope), Some(fonts)) = (&self.scope, &self.fonts) {
-            let label: Vec<u16> = scope_label(scope).encode_utf16().collect();
-            let dc = unsafe { GetDC(hwnd) };
-            let text_width = draw::text_width(dc, fonts.detail, &label);
-            unsafe { ReleaseDC(hwnd, dc) };
-            let width = (text_width + 2 * s(draw::SPACE_M)).min(width / 2);
-            let height = s(26);
-            let top = self.field.top + (s(40) - height) / 2;
-            self.chip = RECT {
-                left: edit_left,
-                top,
-                right: edit_left + width,
-                bottom: top + height,
-            };
-            edit_left = self.chip.right + s(draw::SPACE_S);
-        }
+        let edit_left = self.field.left + s(40);
         // The settings button sits at the right end of the field.
         let gear = s(36);
         self.gear = RECT {
@@ -1945,21 +1881,6 @@ unsafe extern "system" fn child_proc(
                 unsafe { SetFocus(if id == EDIT_ID { app.list } else { app.edit }) };
                 return 0;
             }
-            VK_BACK if id == EDIT_ID && app.scope.is_some() => {
-                let (mut start, mut end) = (0u32, 0u32);
-                unsafe {
-                    SendMessageW(
-                        hwnd,
-                        EM_GETSEL,
-                        (&raw mut start) as usize,
-                        (&raw mut end) as isize,
-                    )
-                };
-                if start == 0 && end == 0 {
-                    app.set_scope(main, None);
-                    return 0;
-                }
-            }
             0x48 if unsafe { GetKeyState(VK_CONTROL as i32) } < 0 => {
                 app.include_system = !app.include_system;
                 app.query(main);
@@ -1973,26 +1894,6 @@ unsafe extern "system" fn child_proc(
         }
     }
     unsafe { DefSubclassProc(hwnd, msg, w, l) }
-}
-
-/// Shows the window for a key the hook caught. Unlike a registered hotkey, a hook
-/// does not give the right to take the foreground, so it is borrowed from `front`.
-fn open_from_hook(app: &mut App, hwnd: HWND, front: HWND, over_start: bool) {
-    let mut front = front;
-    // Start keeps the foreground against every other program, so it is closed first.
-    if over_start && winkey::is_start(unsafe { GetForegroundWindow() }) {
-        winkey::close_start();
-        front = unsafe { GetForegroundWindow() };
-    }
-    winkey::tap_unassigned_key();
-    let front_thread = unsafe { GetWindowThreadProcessId(front, null_mut()) };
-    let own_thread = unsafe { GetCurrentThreadId() };
-    let attached = front_thread != own_thread
-        && unsafe { AttachThreadInput(own_thread, front_thread, 1) } != 0;
-    app.open_panel(hwnd);
-    if attached {
-        unsafe { AttachThreadInput(own_thread, front_thread, 0) };
-    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -2062,12 +1963,6 @@ fn windows_search_row() -> (String, String) {
         "Windows search is on, and indexes in the background".into()
     };
     (title, detail)
-}
-
-/// The scope chip's text: the folder's own name, or the drive for a root.
-fn scope_label(folder: &str) -> String {
-    let folder = folder.trim_end_matches('\\');
-    format!("In {}", folder.rsplit('\\').next().unwrap_or(folder))
 }
 
 /// The folder holding `path`, or the path itself for a drive root.
@@ -2332,7 +2227,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             app.apps.refresh_if_stale();
             app.theme(hwnd);
             app.register_hotkey(hwnd);
-            winkey::install(hwnd, app.settings.win_s, winsearch::is_off());
+            winkey::install(winsearch::is_off());
             unsafe { Shell_NotifyIconW(NIM_ADD, &tray_data(hwnd)) };
             app.update_title(hwnd);
             0
@@ -2493,25 +2388,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     colors.secondary,
                     DT_CENTER,
                 );
-                if let Some(scope) = &app.scope
-                    && app.chip.right > app.chip.left
-                {
-                    let chip = app.chip;
-                    draw::fill_round(device, &chip, chip.bottom - chip.top, colors.selected);
-                    let text = RECT {
-                        left: chip.left + s(draw::SPACE_M),
-                        right: chip.right - s(draw::SPACE_M),
-                        ..chip
-                    };
-                    draw::text(
-                        device,
-                        &scope_label(scope),
-                        &text,
-                        fonts.detail,
-                        colors.text,
-                        DT_CENTER | DT_END_ELLIPSIS,
-                    );
-                }
                 if app.gear.right > app.gear.left {
                     draw::text(
                         device,
@@ -2640,7 +2516,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             0
         }
         WM_HOTKEY if w as i32 == HOTKEY_ID => {
-            app.set_scope(hwnd, None);
             app.open_panel(hwnd);
             0
         }
@@ -2657,46 +2532,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             unsafe { DestroyWindow(hwnd) };
             0
         }
-        winkey::WM_WIN_S => {
-            // Still the window the user was in: this one has not been activated yet.
-            let front = unsafe { GetForegroundWindow() };
-            let scope = if front == hwnd {
-                app.scope.clone()
-            } else {
-                winkey::explorer_folder(front)
-            };
-            if scope.is_some() {
-                unsafe { SetWindowTextW(app.edit, wide("").as_ptr()) };
-            }
-            app.set_scope(hwnd, scope);
-            open_from_hook(app, hwnd, front, false);
-            0
-        }
-        winkey::WM_START_TYPED => {
-            let front = unsafe { GetForegroundWindow() };
-            let typed = char::from_u32(w as u32).unwrap_or(' ');
-            // Letters typed before this window took over from Start follow the first.
-            let continuing = front == hwnd
-                || app
-                    .start_typed_at
-                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(1500));
-            app.start_typed_at = Some(std::time::Instant::now());
-            let text = if continuing {
-                format!("{}{typed}", app.edit_text())
-            } else {
-                app.set_scope(hwnd, None);
-                typed.to_string()
-            };
-            unsafe {
-                SetWindowTextW(app.edit, wide(&text).as_ptr());
-                let end = text.encode_utf16().count();
-                SendMessageW(app.edit, EM_SETSEL, end, end as isize);
-            }
-            if front != hwnd {
-                open_from_hook(app, hwnd, front, true);
-            }
-            0
-        }
         WM_TIMER if w == RETRY_TIMER => {
             unsafe { KillTimer(hwnd, RETRY_TIMER) };
             if !app.paused
@@ -2707,7 +2542,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 if let Some(sender) = &app.sender {
                     let _ = sender.send(search::Request {
                         serial: app.serial,
-                        text: app.request_text(),
+                        text: app.last_text.clone(),
                         include_system: app.include_system,
                     });
                 }
